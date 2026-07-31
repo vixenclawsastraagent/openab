@@ -2606,6 +2606,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "openab-kubernetes-session"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "openab-mcp"
 version = "0.1.0"
 dependencies = [
@@ -4518,6 +4531,7 @@ checksum = "144d6b123cef80b301b8f72a9e2ca4370ddec21950d0a103dd22c437006d2db7"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 
