@@ -18,3 +18,6 @@ pub enum SessionContextMode {
 }
 
 pub(crate) const SESSION_KEY_ENV: &str = "OPENAB_SESSION_KEY";
+pub(crate) const SESSION_ATTEMPT_ID_ENV: &str = "OPENAB_SESSION_ATTEMPT_ID";
+
+pub(crate) const RESERVED_SESSION_ENV: [&str; 2] = [SESSION_KEY_ENV, SESSION_ATTEMPT_ID_ENV];

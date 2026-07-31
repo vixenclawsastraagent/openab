@@ -335,9 +335,9 @@ scope = "team-a-openab-codex"
 ```
 
 `[kubernetes_session]` is mutually exclusive with `[agentcore]` and an
-explicit `[agent].command`. The internal `OPENAB_SESSION_KEY` environment name
-is reserved in this mode and cannot appear in `[agent.env]` or
-`agent.inherit_env`.
+explicit `[agent].command`. The internal `OPENAB_SESSION_KEY` and
+`OPENAB_SESSION_ATTEMPT_ID` environment names are broker-owned in this mode
+and cannot appear in `[agent.env]` or `agent.inherit_env`.
 
 ---
 

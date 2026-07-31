@@ -2206,12 +2206,17 @@ fn is_kubernetes_dns_label(value: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
 }
 
-fn has_reserved_session_env(agent: &AgentConfig) -> bool {
-    agent
-        .env
-        .keys()
-        .chain(agent.inherit_env.iter())
-        .any(|key| key.eq_ignore_ascii_case(crate::acp::SESSION_KEY_ENV))
+fn configured_reserved_session_env(agent: &AgentConfig) -> Option<&'static str> {
+    crate::acp::RESERVED_SESSION_ENV
+        .iter()
+        .copied()
+        .find(|reserved| {
+            agent
+                .env
+                .keys()
+                .chain(agent.inherit_env.iter())
+                .any(|key| key.eq_ignore_ascii_case(reserved))
+        })
 }
 
 fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
@@ -2243,11 +2248,11 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
             !ks.credential_file.trim().is_empty(),
             "kubernetes_session.credential_file must not be empty"
         );
-        anyhow::ensure!(
-            !has_reserved_session_env(&config.agent),
-            "[kubernetes_session] reserves {}; remove it from agent.env and agent.inherit_env",
-            crate::acp::SESSION_KEY_ENV
-        );
+        if let Some(reserved) = configured_reserved_session_env(&config.agent) {
+            anyhow::bail!(
+                "[kubernetes_session] reserves {reserved}; remove it from agent.env and agent.inherit_env"
+            );
+        }
 
         config.agent = AgentConfig {
             command: "openab-kubernetes-session".to_string(),
@@ -2641,6 +2646,48 @@ inherit_env = ["OPENAB_SESSION_KEY"]
         )
         .unwrap_err();
         assert!(err.to_string().contains("OPENAB_SESSION_KEY"));
+    }
+
+    #[test]
+    fn kubernetes_session_rejects_configured_attempt_id_case_insensitively() {
+        let err = parse_config_str(
+            r#"
+[discord]
+bot_token = "x"
+
+[kubernetes_session]
+controller_url = "wss://session-controller.openab-system.svc/relay"
+profile = "codex-strict"
+scope = "team-a"
+
+[agent.env]
+openab_session_attempt_id = "spoofed"
+"#,
+            "test",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("OPENAB_SESSION_ATTEMPT_ID"));
+    }
+
+    #[test]
+    fn kubernetes_session_rejects_inherited_attempt_id() {
+        let err = parse_config_str(
+            r#"
+[discord]
+bot_token = "x"
+
+[kubernetes_session]
+controller_url = "wss://session-controller.openab-system.svc/relay"
+profile = "codex-strict"
+scope = "team-a"
+
+[agent]
+inherit_env = ["OPENAB_SESSION_ATTEMPT_ID"]
+"#,
+            "test",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("OPENAB_SESSION_ATTEMPT_ID"));
     }
 
     #[test]

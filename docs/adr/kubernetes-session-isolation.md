@@ -266,10 +266,11 @@ configuration and a working directory.
 
 The opt-in seam will:
 
-- pass the logical session key to the bridge through a reserved child-process
-  environment variable;
-- prevent `[agent].env` from overriding that reserved value;
-- keep a per-spawn attempt identifier in the bridge/controller handshake; and
+- pass the logical session key and a newly generated per-spawn attempt ID to
+  the bridge through reserved child-process environment variables;
+- prevent `[agent].env` and `agent.inherit_env` from overriding either
+  broker-owned value;
+- bind the attempt identifier into the bridge/controller handshake; and
 - expose explicit lifecycle actions before the connection is dropped.
 
 The core seam will use stable standard ACP lifecycle methods where available:

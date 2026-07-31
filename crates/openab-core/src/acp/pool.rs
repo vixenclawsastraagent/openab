@@ -835,7 +835,7 @@ mod tests {
         better_candidate, classify_hung, classify_idle, get_or_insert_gate, purge_session_entries,
         remove_if_same_handle, session_spawn_context, PoolState,
     };
-    use crate::acp::connection::{SessionActivity, SessionSpawnContext};
+    use crate::acp::connection::SessionActivity;
     use crate::acp::SessionContextMode;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -852,10 +852,21 @@ mod tests {
 
     #[test]
     fn session_context_openab_v1_preserves_exact_logical_key() {
-        assert_eq!(
-            session_spawn_context(SessionContextMode::OpenabV1, "discord:thread-123"),
-            Some(SessionSpawnContext::new("discord:thread-123"))
-        );
+        let context = session_spawn_context(SessionContextMode::OpenabV1, "discord:thread-123")
+            .expect("OpenAB v1 should create broker-owned context");
+
+        assert_eq!(context.logical_session_key(), "discord:thread-123");
+        assert!(uuid::Uuid::parse_str(context.attempt_id()).is_ok());
+    }
+
+    #[test]
+    fn session_context_openab_v1_mints_a_fresh_attempt_per_spawn() {
+        let first = session_spawn_context(SessionContextMode::OpenabV1, "discord:thread-123")
+            .expect("first context");
+        let second = session_spawn_context(SessionContextMode::OpenabV1, "discord:thread-123")
+            .expect("second context");
+
+        assert_ne!(first.attempt_id(), second.attempt_id());
     }
 
     #[test]

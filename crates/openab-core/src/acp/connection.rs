@@ -197,25 +197,39 @@ pub struct AcpConnection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SessionSpawnContext {
     logical_session_key: String,
+    attempt_id: String,
 }
 
 impl SessionSpawnContext {
     pub(crate) fn new(logical_session_key: impl Into<String>) -> Self {
+        Self::from_parts(logical_session_key, uuid::Uuid::new_v4().to_string())
+    }
+
+    fn from_parts(logical_session_key: impl Into<String>, attempt_id: impl Into<String>) -> Self {
         Self {
             logical_session_key: logical_session_key.into(),
+            attempt_id: attempt_id.into(),
         }
+    }
+
+    pub(crate) fn logical_session_key(&self) -> &str {
+        &self.logical_session_key
+    }
+
+    pub(crate) fn attempt_id(&self) -> &str {
+        &self.attempt_id
     }
 }
 
-fn session_spawn_env(
-    context: Option<&SessionSpawnContext>,
-) -> Option<(&'static str, &str)> {
-    context.map(|context| {
-        (
-            super::SESSION_KEY_ENV,
-            context.logical_session_key.as_str(),
-        )
-    })
+fn session_spawn_env(context: Option<&SessionSpawnContext>) -> Vec<(&'static str, &str)> {
+    context
+        .map(|context| {
+            vec![
+                (super::SESSION_KEY_ENV, context.logical_session_key()),
+                (super::SESSION_ATTEMPT_ID_ENV, context.attempt_id()),
+            ]
+        })
+        .unwrap_or_default()
 }
 
 /// Build the final set of env vars for the agent subprocess.
@@ -452,9 +466,9 @@ impl AcpConnection {
         for (k, v) in &agent_env {
             cmd.env(k, v);
         }
-        if let Some((key, value)) = session_spawn_env(session_context) {
+        for (key, value) in session_spawn_env(session_context) {
             // Broker-owned context is applied after all operator-controlled
-            // environment sources so the reserved key cannot be spoofed.
+            // environment sources so reserved values cannot be spoofed.
             cmd.env(key, value);
         }
         if !agent_env.is_empty() {
@@ -894,35 +908,43 @@ mod tests {
 
     #[test]
     fn no_session_spawn_context_adds_no_reserved_env() {
-        assert_eq!(session_spawn_env(None), None);
+        assert!(session_spawn_env(None).is_empty());
     }
 
     #[test]
-    fn openab_v1_session_spawn_context_maps_exact_logical_key() {
-        let context = SessionSpawnContext {
-            logical_session_key: "discord:thread-123".to_string(),
-        };
+    fn openab_v1_session_spawn_context_maps_broker_owned_values() {
+        let context = SessionSpawnContext::from_parts("discord:thread-123", "attempt-123");
 
         assert_eq!(
             session_spawn_env(Some(&context)),
-            Some(("OPENAB_SESSION_KEY", "discord:thread-123"))
+            vec![
+                ("OPENAB_SESSION_KEY", "discord:thread-123"),
+                ("OPENAB_SESSION_ATTEMPT_ID", "attempt-123"),
+            ]
         );
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn broker_session_key_overrides_programmatic_agent_env() {
+    async fn broker_session_context_overrides_programmatic_agent_env() {
         let temp = tempfile::tempdir().unwrap();
-        let output = temp.path().join("session-key");
+        let key_output = temp.path().join("session-key");
+        let attempt_output = temp.path().join("session-attempt");
         let args = vec![
             "-c".to_string(),
-            r#"printf '%s' "$OPENAB_SESSION_KEY" > "$1""#.to_string(),
+            r#"printf '%s' "$OPENAB_SESSION_KEY" > "$1"; printf '%s' "$OPENAB_SESSION_ATTEMPT_ID" > "$2""#
+                .to_string(),
             "openab-session-env-test".to_string(),
-            output.to_string_lossy().to_string(),
+            key_output.to_string_lossy().to_string(),
+            attempt_output.to_string_lossy().to_string(),
         ];
         let mut configured_env = std::collections::HashMap::new();
         configured_env.insert("OPENAB_SESSION_KEY".to_string(), "spoofed".to_string());
-        let context = SessionSpawnContext::new("discord:thread-123");
+        configured_env.insert(
+            "OPENAB_SESSION_ATTEMPT_ID".to_string(),
+            "spoofed-attempt".to_string(),
+        );
+        let context = SessionSpawnContext::from_parts("discord:thread-123", "attempt-123");
 
         let connection = super::AcpConnection::spawn_with_context(
             "/bin/sh",
@@ -937,8 +959,11 @@ mod tests {
 
         let observed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if let Ok(value) = tokio::fs::read_to_string(&output).await {
-                    break value;
+                if let (Ok(key), Ok(attempt)) = (
+                    tokio::fs::read_to_string(&key_output).await,
+                    tokio::fs::read_to_string(&attempt_output).await,
+                ) {
+                    break (key, attempt);
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
@@ -946,7 +971,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(observed, "discord:thread-123");
+        assert_eq!(
+            observed,
+            ("discord:thread-123".to_string(), "attempt-123".to_string())
+        );
         drop(connection);
     }
 
