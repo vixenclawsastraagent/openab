@@ -343,7 +343,23 @@ request does not wait forever on a streaming connection mutex.
 
 For strict Kubernetes mode, a failure to persist a new session mapping is a
 dispatch failure. It must not be logged and ignored after provisioning a
-worker.
+worker. A changed mapping is written atomically before the connection becomes
+dispatchable; a failed write releases the uncommitted worker. Startup also
+fails closed when the persisted mapping exists but cannot be read or parsed.
+The Linux/Kubernetes path installs the mapping with a private temporary file,
+file sync, and atomic rename. The default local-process mode and non-Kubernetes
+platforms retain their existing best-effort persistence.
+
+Local-process `session_meta.json` workspace entries are ignored in strict
+mode. Worker paths come only from the controller-owned runtime profile, so
+switching an existing broker to isolation cannot reintroduce a broker
+worktree path.
+
+Cancellation or broker death can still occur after controller activation but
+before the broker mapping commit. That worker is not dispatchable: the
+controller's deterministic anchor and attempt fence remain authoritative, and
+controller-side orphan reconciliation or TTL must retire it. A later attempt
+for the same logical session fences the abandoned generation.
 
 ### 5.2 Session identity and resource names
 

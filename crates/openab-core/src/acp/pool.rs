@@ -4,9 +4,11 @@ use crate::acp::connection::{
 use crate::acp::protocol::ConfigOption;
 use crate::acp::SessionContextMode;
 use crate::config::AgentConfig;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::Instant;
@@ -59,12 +61,87 @@ pub struct SessionPool {
     hung_threshold_secs: u64,
     mapping_path: PathBuf,
     meta_path: PathBuf,
+    mapping_load_error: Option<String>,
     default_config_options: HashMap<String, String>,
 }
 
 type CancelHandle = (Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>, String);
-type ActiveSnapshot = Vec<(String, Arc<Mutex<AcpConnection>>)>;
-type EvictionCandidate = (String, Arc<Mutex<AcpConnection>>, Instant, Option<String>);
+type SessionGate = Arc<Mutex<()>>;
+type ActiveSnapshot = Vec<(String, Arc<Mutex<AcpConnection>>, SessionGate)>;
+type EvictionCandidate = (
+    String,
+    Arc<Mutex<AcpConnection>>,
+    Instant,
+    Option<String>,
+    SessionGate,
+);
+
+fn write_mapping_file(path: &Path, mapping: &HashMap<String, String>) -> Result<()> {
+    let data = serde_json::to_vec_pretty(mapping).context("failed to serialize session mapping")?;
+
+    #[cfg(unix)]
+    {
+        use std::fs::{File, OpenOptions};
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let parent_directory = File::open(parent)
+            .with_context(|| format!("failed to open mapping directory {}", parent.display()))?;
+        parent_directory.sync_all().with_context(|| {
+            format!(
+                "mapping directory {} does not support durable updates",
+                parent.display()
+            )
+        })?;
+        static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let sequence = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("mapping.json");
+        let temporary = parent.join(format!(
+            ".{file_name}.tmp.{}.{sequence}",
+            std::process::id()
+        ));
+
+        let write_result = (|| -> Result<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temporary)?;
+            file.write_all(&data)?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, path)?;
+            // The rename is already committed and visible at this point. A
+            // post-rename directory-sync error must not make the caller
+            // release the worker while leaving its new mapping installed.
+            // The preflight sync above rejects filesystems that do not support
+            // directory durability before any mapping state is changed.
+            if let Err(error) = parent_directory.sync_all() {
+                warn!(
+                    path = %path.display(),
+                    %error,
+                    "mapping was atomically installed but its directory sync failed"
+                );
+            }
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error).with_context(|| format!("failed to persist {}", path.display()));
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, data)
+            .with_context(|| format!("failed to persist {}", path.display()))?;
+    }
+
+    Ok(())
+}
 
 fn remove_if_same_handle<T>(
     map: &mut HashMap<String, Arc<Mutex<T>>>,
@@ -156,6 +233,7 @@ fn purge_session_entries(state: &mut PoolState, key: &str) {
 
 async fn release_strict_session(
     state: &RwLock<PoolState>,
+    mapping_path: &Path,
     key: &str,
     expected: &LifecycleHandle,
 ) -> Result<()> {
@@ -178,9 +256,29 @@ async fn release_strict_session(
         ));
     }
 
+    let mut persisted = state.persisted.clone();
+    persisted.remove(key);
+    let persistence = write_mapping_file(mapping_path, &persisted);
+
     state.active.remove(key);
     purge_session_entries(&mut state, key);
-    Ok(())
+    persistence.map_err(|error| {
+        anyhow!(
+            "session release was accepted, but broker mapping removal could not be persisted: {error}"
+        )
+    })
+}
+
+async fn rollback_uncommitted_session(
+    lifecycle: &LifecycleHandle,
+    cause: anyhow::Error,
+) -> anyhow::Error {
+    match lifecycle.release().await {
+        Ok(()) => anyhow!("{cause}; uncommitted isolated session was released"),
+        Err(rollback) => {
+            anyhow!("{cause}; failed to release uncommitted isolated session: {rollback}")
+        }
+    }
 }
 
 /// Escalating kill for a hung agent's process group: wait 10s after the
@@ -239,8 +337,26 @@ impl SessionPool {
         let _ = std::fs::create_dir_all(&openab_dir);
         let mapping_path = openab_dir.join("thread_map.json");
         let meta_path = openab_dir.join("session_meta.json");
-        let suspended = Self::load_mapping(&mapping_path);
-        let session_workdirs = Self::load_mapping(&meta_path);
+        Self::new_with_paths(
+            config,
+            max_sessions,
+            hung_threshold_secs,
+            default_config_options,
+            mapping_path,
+            meta_path,
+        )
+    }
+
+    fn new_with_paths(
+        config: AgentConfig,
+        max_sessions: usize,
+        hung_threshold_secs: u64,
+        default_config_options: HashMap<String, String>,
+        mapping_path: PathBuf,
+        meta_path: PathBuf,
+    ) -> Self {
+        let (suspended, mapping_load_error) = Self::load_mapping(&mapping_path);
+        let (session_workdirs, _) = Self::load_mapping(&meta_path);
         Self {
             state: RwLock::new(PoolState {
                 active: HashMap::new(),
@@ -259,6 +375,7 @@ impl SessionPool {
             hung_threshold_secs,
             mapping_path,
             meta_path,
+            mapping_load_error,
             default_config_options,
         }
     }
@@ -266,54 +383,80 @@ impl SessionPool {
     /// Enable broker-owned context for an explicitly configured session
     /// runtime bridge. The default constructor remains behavior-compatible
     /// with local ACP and AgentCore agents.
-    pub fn with_session_context(mut self, mode: SessionContextMode) -> Self {
+    pub fn try_with_session_context(mut self, mode: SessionContextMode) -> Result<Self> {
+        if mode == SessionContextMode::OpenabV1 {
+            if let Some(error) = self.mapping_load_error.as_deref() {
+                return Err(anyhow!(
+                    "cannot enable Kubernetes session isolation: {error}"
+                ));
+            }
+            // Broker workspace metadata belongs to the local-process runtime.
+            // In isolated mode the controller-owned worker profile chooses all
+            // writable paths, so stale local metadata is intentionally ignored.
+            self.state.get_mut().session_workdirs.clear();
+        }
         self.session_context = mode;
-        self
+        Ok(self)
     }
 
     pub(crate) fn allows_workspace_directives(&self) -> bool {
         self.session_context == SessionContextMode::None
     }
 
-    fn load_mapping(path: &Path) -> HashMap<String, String> {
+    fn load_mapping(path: &Path) -> (HashMap<String, String>, Option<String>) {
         match std::fs::read_to_string(path) {
-            Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {
-                warn!(path = %path.display(), error = %e, "corrupt mapping file, starting fresh");
-                HashMap::new()
-            }),
-            Err(_) => HashMap::new(),
+            Ok(data) => match serde_json::from_str(&data) {
+                Ok(mapping) => (mapping, None),
+                Err(error) => {
+                    let message = format!(
+                        "failed to parse persisted mapping {}: {error}",
+                        path.display()
+                    );
+                    warn!(%message, "corrupt mapping file, starting fresh");
+                    (HashMap::new(), Some(message))
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (HashMap::new(), None),
+            Err(error) => {
+                let message = format!(
+                    "failed to read persisted mapping {}: {error}",
+                    path.display()
+                );
+                warn!(%message, "unreadable mapping file, starting fresh");
+                (HashMap::new(), Some(message))
+            }
         }
     }
 
     fn save_mapping(&self, persisted: &HashMap<String, String>) {
         let data = match serde_json::to_string_pretty(persisted) {
-            Ok(d) => d,
-            Err(e) => {
-                warn!(error = %e, "failed to serialize thread mapping");
+            Ok(data) => data,
+            Err(error) => {
+                warn!(%error, "failed to serialize thread mapping");
                 return;
             }
         };
-        let tmp = self.mapping_path.with_extension("json.tmp");
-        if let Err(e) =
-            std::fs::write(&tmp, &data).and_then(|_| std::fs::rename(&tmp, &self.mapping_path))
+        let temporary = self.mapping_path.with_extension("json.tmp");
+        if let Err(error) = std::fs::write(&temporary, &data)
+            .and_then(|_| std::fs::rename(&temporary, &self.mapping_path))
         {
-            warn!(path = %self.mapping_path.display(), error = %e, "failed to persist thread mapping");
+            warn!(path = %self.mapping_path.display(), %error, "failed to persist thread mapping");
         }
     }
 
     fn save_meta(&self, workdirs: &HashMap<String, String>) {
         let data = match serde_json::to_string_pretty(workdirs) {
-            Ok(d) => d,
-            Err(e) => {
-                warn!(error = %e, "failed to serialize session metadata");
+            Ok(data) => data,
+            Err(error) => {
+                warn!(%error, "failed to serialize session metadata");
                 return;
             }
         };
-        let tmp = self.meta_path.with_extension("json.tmp");
-        if let Err(e) =
-            std::fs::write(&tmp, &data).and_then(|_| std::fs::rename(&tmp, &self.meta_path))
+        let temporary = self.meta_path.with_extension("json.tmp");
+        if let Err(error) = std::fs::write(&temporary, &data)
+            .and_then(|_| std::fs::rename(&temporary, &self.meta_path))
         {
-            warn!(path = %self.meta_path.display(), error = %e, "failed to persist session metadata");
+            warn!(path = %self.meta_path.display(), %error, "failed to persist session metadata");
         }
     }
 
@@ -373,21 +516,30 @@ impl SessionPool {
         }
 
         // Snapshot active handles so we can inspect them outside the state lock.
-        let snapshot: Vec<(String, Arc<Mutex<AcpConnection>>)> = {
+        let snapshot: ActiveSnapshot = {
             let state = self.state.read().await;
             state
                 .active
                 .iter()
-                .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                .filter_map(|(key, connection)| {
+                    state
+                        .creating
+                        .get(key)
+                        .map(|gate| (key.clone(), Arc::clone(connection), Arc::clone(gate)))
+                })
                 .collect()
         };
 
         let mut eviction_candidate: Option<EvictionCandidate> = None;
         let mut skipped_locked_candidates = 0usize;
-        for (key, conn) in snapshot {
+        for (key, conn, gate) in snapshot {
             if key == thread_id {
                 continue;
             }
+            let Ok(_gate_guard) = gate.try_lock() else {
+                skipped_locked_candidates += 1;
+                continue;
+            };
             let conn_handle = Arc::clone(&conn);
             let Ok(conn) = conn.try_lock() else {
                 skipped_locked_candidates += 1;
@@ -398,9 +550,10 @@ impl SessionPool {
                 conn_handle,
                 conn.last_active,
                 conn.acp_session_id.clone(),
+                Arc::clone(&gate),
             );
             if better_candidate(
-                eviction_candidate.as_ref().map(|(_, _, t, _)| *t),
+                eviction_candidate.as_ref().map(|(_, _, t, _, _)| *t),
                 candidate.2,
             ) {
                 eviction_candidate = Some(candidate);
@@ -530,21 +683,25 @@ impl SessionPool {
         }
 
         if state.active.len() >= self.max_sessions {
-            if let Some((key, expected_conn, _, sid)) = eviction_candidate {
-                if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
-                    state.cancel_handles.remove(&key);
-                    state.lifecycle_handles.remove(&key);
-                    state.activity.remove(&key);
-                    state.pgids.remove(&key);
-                    info!(evicted = %key, "pool full, suspending oldest idle session");
-                    if let Some(sid) = sid {
-                        state.persisted.insert(key.clone(), sid.clone());
-                        state.suspended.insert(key, sid);
+            if let Some((key, expected_conn, _, sid, gate)) = eviction_candidate {
+                if let Ok(_gate_guard) = gate.try_lock() {
+                    if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
+                        state.cancel_handles.remove(&key);
+                        state.lifecycle_handles.remove(&key);
+                        state.activity.remove(&key);
+                        state.pgids.remove(&key);
+                        info!(evicted = %key, "pool full, suspending oldest idle session");
+                        if let Some(sid) = sid {
+                            state.persisted.insert(key.clone(), sid.clone());
+                            state.suspended.insert(key, sid);
+                        } else {
+                            state.persisted.remove(&key);
+                        }
                     } else {
-                        state.persisted.remove(&key);
+                        warn!(evicted = %key, "pool full but eviction candidate changed before removal");
                     }
                 } else {
-                    warn!(evicted = %key, "pool full but eviction candidate changed before removal");
+                    warn!(evicted = %key, "pool full but eviction candidate entered a lifecycle transition");
                 }
             } else if skipped_locked_candidates > 0 {
                 warn!(
@@ -556,16 +713,30 @@ impl SessionPool {
         }
 
         if state.active.len() >= self.max_sessions {
-            return Err(anyhow!("pool exhausted ({} sessions)", self.max_sessions));
+            let error = anyhow!("pool exhausted ({} sessions)", self.max_sessions);
+            if let Some(lifecycle) = lifecycle_handle.as_ref() {
+                drop(state);
+                return Err(rollback_uncommitted_session(lifecycle, error).await);
+            }
+            return Err(error);
         }
 
+        let mut persisted = state.persisted.clone();
         if cancel_session_id.is_empty() {
-            state.persisted.remove(thread_id);
+            persisted.remove(thread_id);
         } else {
-            state
-                .persisted
-                .insert(thread_id.to_string(), cancel_session_id.clone());
+            persisted.insert(thread_id.to_string(), cancel_session_id.clone());
         }
+        if self.session_context == SessionContextMode::OpenabV1 && persisted != state.persisted {
+            if let Err(error) = write_mapping_file(&self.mapping_path, &persisted) {
+                drop(state);
+                let lifecycle = lifecycle_handle
+                    .as_ref()
+                    .expect("strict sessions always have a lifecycle handle");
+                return Err(rollback_uncommitted_session(lifecycle, error).await);
+            }
+        }
+        state.persisted = persisted;
         state.suspended.remove(thread_id);
         state.active.insert(thread_id.to_string(), new_conn);
         if let Some(lifecycle_handle) = lifecycle_handle {
@@ -584,7 +755,9 @@ impl SessionPool {
                 .cancel_handles
                 .insert(thread_id.to_string(), (cancel_handle, cancel_session_id));
         }
-        self.save_mapping(&state.persisted);
+        if self.session_context == SessionContextMode::None {
+            self.save_mapping(&state.persisted);
+        }
 
         // Persist workspace override only after session spawn succeeded (口渡 F2).
         if working_dir_override.is_some() {
@@ -738,11 +911,8 @@ impl SessionPool {
                     })?
             };
 
-            release_strict_session(&self.state, thread_id, &lifecycle).await?;
+            release_strict_session(&self.state, &self.mapping_path, thread_id, &lifecycle).await?;
 
-            let state = self.state.read().await;
-            self.save_mapping(&state.persisted);
-            self.save_meta(&state.session_workdirs);
             info!(thread_id, "isolated session released");
             return Ok(());
         }
@@ -796,7 +966,12 @@ impl SessionPool {
             let snapshot: ActiveSnapshot = state
                 .active
                 .iter()
-                .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                .filter_map(|(key, connection)| {
+                    state
+                        .creating
+                        .get(key)
+                        .map(|gate| (key.clone(), Arc::clone(connection), Arc::clone(gate)))
+                })
                 .collect();
             (
                 snapshot,
@@ -807,8 +982,13 @@ impl SessionPool {
         };
 
         let mut stale = Vec::new();
-        let mut hung: Vec<(String, Arc<Mutex<AcpConnection>>)> = Vec::new();
-        for (key, conn) in snapshot {
+        let mut hung: Vec<(String, Arc<Mutex<AcpConnection>>, SessionGate)> = Vec::new();
+        for (key, conn, gate) in snapshot {
+            // Create, resume, close, and release all own this gate. Cleanup
+            // must never race a lifecycle acknowledgement for the same key.
+            let Ok(_gate_guard) = gate.try_lock() else {
+                continue;
+            };
             // Skip active sessions for this cleanup round instead of waiting on
             // their per-connection mutex. A busy session is not idle unless hung.
             let conn_handle = Arc::clone(&conn);
@@ -855,7 +1035,7 @@ impl SessionPool {
                             }
                             kill_pgid_after_grace(pgid).await;
                         });
-                        hung.push((key, conn_handle));
+                        hung.push((key, conn_handle, Arc::clone(&gate)));
                     }
                 }
                 continue;
@@ -871,7 +1051,12 @@ impl SessionPool {
                 }
             }
             if classify_idle(conn.last_active, conn.alive(), cutoff) {
-                stale.push((key, conn_handle, conn.acp_session_id.clone()));
+                stale.push((
+                    key,
+                    conn_handle,
+                    conn.acp_session_id.clone(),
+                    Arc::clone(&gate),
+                ));
             }
         }
 
@@ -880,7 +1065,10 @@ impl SessionPool {
         }
 
         let mut state = self.state.write().await;
-        for (key, expected_conn, sid) in stale {
+        for (key, expected_conn, sid, gate) in stale {
+            let Ok(_gate_guard) = gate.try_lock() else {
+                continue;
+            };
             if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
                 info!(thread_id = %key, "cleaning up idle session");
                 state.cancel_handles.remove(&key);
@@ -896,7 +1084,10 @@ impl SessionPool {
                 }
             }
         }
-        for (key, expected_conn) in hung {
+        for (key, expected_conn, gate) in hung {
+            let Ok(_gate_guard) = gate.try_lock() else {
+                continue;
+            };
             if !apply_hung_eviction(&mut state, &key, &expected_conn) {
                 warn!(thread_id = %key, "hung session was replaced before eviction; maps untouched");
             }
@@ -947,12 +1138,14 @@ mod tests {
     use super::{
         better_candidate, classify_hung, classify_idle, get_or_insert_gate, purge_session_entries,
         release_strict_session, remove_if_same_handle, resolve_effective_workdir,
-        session_spawn_context, PoolState,
+        rollback_uncommitted_session, session_spawn_context, write_mapping_file, PoolState,
+        SessionPool,
     };
     use crate::acp::connection::{
         LifecycleCapabilities, LifecycleHandle, SessionActivity, SessionLifecycleControl,
     };
     use crate::acp::SessionContextMode;
+    use crate::config::AgentConfig;
     use anyhow::{anyhow, Result};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1040,6 +1233,52 @@ mod tests {
             creating: HashMap::from([("thread".to_string(), Arc::new(Mutex::new(())))]),
             session_workdirs: HashMap::from([("thread".to_string(), "/private/ws".to_string())]),
         }
+    }
+
+    fn strict_mapping_file() -> (tempfile::TempDir, std::path::PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("thread_map.json");
+        write_mapping_file(
+            &path,
+            &HashMap::from([("thread".to_string(), "outer-session".to_string())]),
+        )
+        .unwrap();
+        (temp, path)
+    }
+
+    #[cfg(unix)]
+    fn strict_test_pool(temp: &std::path::Path, max_sessions: usize) -> SessionPool {
+        let script = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"sessionCapabilities":{"close":{},"_meta":{"openab.dev":{"sessionRelease":{"version":1}}}}}}}'
+      ;;
+    *'"method":"session/new"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"outer-session"}}'
+      ;;
+    *'"method":"_openab/session/release"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{}}'
+      ;;
+  esac
+done
+"#;
+        let config = AgentConfig {
+            command: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            working_dir: temp.display().to_string(),
+            ..AgentConfig::default()
+        };
+        SessionPool::new_with_paths(
+            config,
+            max_sessions,
+            60,
+            HashMap::new(),
+            temp.join("thread_map.json"),
+            temp.join("session_meta.json"),
+        )
+        .try_with_session_context(SessionContextMode::OpenabV1)
+        .unwrap()
     }
 
     #[test]
@@ -1299,15 +1538,213 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mapping_file_write_is_atomic_and_round_trips() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("thread_map.json");
+        let expected = HashMap::from([("thread".to_string(), "session".to_string())]);
+
+        write_mapping_file(&path, &expected).unwrap();
+
+        let actual: HashMap<String, String> =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn mapping_file_write_surfaces_parent_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("not-a-directory");
+        std::fs::write(&parent, "file").unwrap();
+        let path = parent.join("thread_map.json");
+
+        let error = write_mapping_file(&path, &HashMap::new()).unwrap_err();
+
+        assert!(error.to_string().contains("thread_map.json"));
+    }
+
+    #[test]
+    fn isolated_context_rejects_corrupt_startup_mapping() {
+        let temp = tempfile::tempdir().unwrap();
+        let mapping_path = temp.path().join("thread_map.json");
+        std::fs::write(&mapping_path, "{not-json").unwrap();
+        let pool = SessionPool::new_with_paths(
+            AgentConfig::default(),
+            1,
+            60,
+            HashMap::new(),
+            mapping_path,
+            temp.path().join("session_meta.json"),
+        );
+
+        let error = pool
+            .try_with_session_context(SessionContextMode::OpenabV1)
+            .err()
+            .expect("strict mode must reject corrupt mappings");
+
+        assert!(error
+            .to_string()
+            .contains("cannot enable Kubernetes session isolation"));
+    }
+
+    #[test]
+    fn isolated_context_ignores_local_process_workspace_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let meta_path = temp.path().join("session_meta.json");
+        write_mapping_file(
+            &meta_path,
+            &HashMap::from([("discord:thread".to_string(), "/broker/worktree".to_string())]),
+        )
+        .unwrap();
+        let pool = SessionPool::new_with_paths(
+            AgentConfig::default(),
+            1,
+            60,
+            HashMap::new(),
+            temp.path().join("thread_map.json"),
+            meta_path,
+        )
+        .try_with_session_context(SessionContextMode::OpenabV1)
+        .unwrap();
+
+        assert!(pool
+            .state
+            .try_read()
+            .expect("pool state should be unlocked")
+            .session_workdirs
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn uncommitted_session_rollback_reports_primary_and_release_errors() {
+        let success = FakeLifecycle::new(ReleaseBehavior::Succeed);
+        let success_error =
+            rollback_uncommitted_session(&success.handle(), anyhow!("mapping write failed")).await;
+        assert!(success_error.to_string().contains("mapping write failed"));
+        assert_eq!(success.release_calls.load(Ordering::Relaxed), 1);
+
+        let failure = FakeLifecycle::new(ReleaseBehavior::Fail);
+        let failure_error =
+            rollback_uncommitted_session(&failure.handle(), anyhow!("mapping write failed")).await;
+        let message = failure_error.to_string();
+        assert!(message.contains("mapping write failed"));
+        assert!(message.contains("controller rejected release"));
+        assert_eq!(failure.release_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn strict_create_releases_bridge_when_new_mapping_cannot_persist() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("released");
+        let mapping_dir = temp.path().join("mapping");
+        std::fs::create_dir(&mapping_dir).unwrap();
+        let mapping_path = mapping_dir.join("thread_map.json");
+        let script = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"sessionCapabilities":{"close":{},"_meta":{"openab.dev":{"sessionRelease":{"version":1}}}}}}}'
+      ;;
+    *'"method":"session/new"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"outer-session"}}'
+      ;;
+    *'"method":"_openab/session/release"'*)
+      printf '%s' released > "$MARKER"
+      printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{}}'
+      ;;
+  esac
+done
+"#;
+        let mut config = AgentConfig {
+            command: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            working_dir: temp.path().display().to_string(),
+            ..AgentConfig::default()
+        };
+        config
+            .env
+            .insert("MARKER".to_string(), marker.display().to_string());
+        let pool = SessionPool::new_with_paths(
+            config,
+            1,
+            60,
+            HashMap::new(),
+            mapping_path,
+            temp.path().join("session_meta.json"),
+        )
+        .try_with_session_context(SessionContextMode::OpenabV1)
+        .unwrap();
+
+        std::fs::remove_dir(&mapping_dir).unwrap();
+        std::fs::write(&mapping_dir, "not a directory").unwrap();
+        let error = pool
+            .get_or_create("discord:thread", None)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("uncommitted isolated session"));
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "released");
+        let state = pool.state.read().await;
+        assert!(!state.active.contains_key("discord:thread"));
+        assert!(!state.persisted.contains_key("discord:thread"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_skips_session_while_its_lifecycle_gate_is_held() {
+        let temp = tempfile::tempdir().unwrap();
+        let pool = strict_test_pool(temp.path(), 1);
+        assert!(pool.get_or_create("discord:thread-a", None).await.unwrap());
+        let gate = {
+            let state = pool.state.read().await;
+            Arc::clone(state.creating.get("discord:thread-a").unwrap())
+        };
+        let _lifecycle_guard = gate.lock().await;
+
+        pool.cleanup_idle(0).await;
+
+        assert!(pool
+            .state
+            .read()
+            .await
+            .active
+            .contains_key("discord:thread-a"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn capacity_eviction_skips_session_in_a_lifecycle_transition() {
+        let temp = tempfile::tempdir().unwrap();
+        let pool = strict_test_pool(temp.path(), 1);
+        assert!(pool.get_or_create("discord:thread-a", None).await.unwrap());
+        let gate = {
+            let state = pool.state.read().await;
+            Arc::clone(state.creating.get("discord:thread-a").unwrap())
+        };
+        let _lifecycle_guard = gate.lock().await;
+
+        let error = pool
+            .get_or_create("discord:thread-b", None)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("pool exhausted"));
+        let state = pool.state.read().await;
+        assert!(state.active.contains_key("discord:thread-a"));
+        assert!(!state.active.contains_key("discord:thread-b"));
+    }
+
     #[tokio::test]
     async fn strict_reset_keeps_state_until_release_ack() {
         let fake = FakeLifecycle::new(ReleaseBehavior::Block);
         let handle = fake.handle();
         let state = Arc::new(RwLock::new(strict_state(Arc::clone(&handle))));
+        let (_temp, mapping_path) = strict_mapping_file();
         let started = fake.release_started.notified();
         let release = tokio::spawn({
             let state = Arc::clone(&state);
-            async move { release_strict_session(&state, "thread", &handle).await }
+            async move { release_strict_session(&state, &mapping_path, "thread", &handle).await }
         });
 
         started.await;
@@ -1324,6 +1761,11 @@ mod tests {
             state.creating.contains_key("thread"),
             "strict reset must preserve the creation gate"
         );
+        let persisted: HashMap<String, String> = serde_json::from_str(
+            &std::fs::read_to_string(_temp.path().join("thread_map.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(!persisted.contains_key("thread"));
     }
 
     #[tokio::test]
@@ -1331,8 +1773,9 @@ mod tests {
         let fake = FakeLifecycle::new(ReleaseBehavior::Fail);
         let handle = fake.handle();
         let state = RwLock::new(strict_state(Arc::clone(&handle)));
+        let (_temp, mapping_path) = strict_mapping_file();
 
-        let error = release_strict_session(&state, "thread", &handle)
+        let error = release_strict_session(&state, &mapping_path, "thread", &handle)
             .await
             .unwrap_err();
 
@@ -1345,12 +1788,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn strict_reset_purges_dispatch_state_after_ack_even_if_persistence_fails() {
+        let fake = FakeLifecycle::new(ReleaseBehavior::Succeed);
+        let handle = fake.handle();
+        let state = RwLock::new(strict_state(Arc::clone(&handle)));
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("not-a-directory");
+        std::fs::write(&parent, "file").unwrap();
+        let mapping_path = parent.join("thread_map.json");
+
+        let error = release_strict_session(&state, &mapping_path, "thread", &handle)
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("release was accepted, but broker mapping removal"));
+        let state = state.read().await;
+        assert!(!state.active.contains_key("thread"));
+        assert!(!state.lifecycle_handles.contains_key("thread"));
+        assert!(!state.persisted.contains_key("thread"));
+        assert!(!state.suspended.contains_key("thread"));
+        assert!(!state.session_workdirs.contains_key("thread"));
+    }
+
+    #[tokio::test]
     async fn strict_reset_rejects_unadvertised_release_without_calling_it() {
         let fake = FakeLifecycle::unsupported();
         let handle = fake.handle();
         let state = RwLock::new(strict_state(Arc::clone(&handle)));
+        let (_temp, mapping_path) = strict_mapping_file();
 
-        let error = release_strict_session(&state, "thread", &handle)
+        let error = release_strict_session(&state, &mapping_path, "thread", &handle)
             .await
             .unwrap_err();
 
@@ -1366,10 +1835,11 @@ mod tests {
         let replacement = FakeLifecycle::new(ReleaseBehavior::Succeed);
         let replacement_handle = replacement.handle();
         let state = Arc::new(RwLock::new(strict_state(Arc::clone(&stale_handle))));
+        let (_temp, mapping_path) = strict_mapping_file();
         let started = stale.release_started.notified();
         let release = tokio::spawn({
             let state = Arc::clone(&state);
-            async move { release_strict_session(&state, "thread", &stale_handle).await }
+            async move { release_strict_session(&state, &mapping_path, "thread", &stale_handle).await }
         });
 
         started.await;

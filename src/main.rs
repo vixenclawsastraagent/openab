@@ -516,7 +516,7 @@ async fn main() -> anyhow::Result<()> {
                 .saturating_add(cfg.pool.hung_grace_secs),
             cfg.pool.default_config_options,
         )
-        .with_session_context(session_context),
+        .try_with_session_context(session_context)?,
     );
     let ttl_secs = cfg.pool.session_ttl_hours * 3600;
 
