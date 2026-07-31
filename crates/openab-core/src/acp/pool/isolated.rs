@@ -1,6 +1,6 @@
 use super::{
-    classify_hung, classify_idle, kill_pgid_after_grace, purge_session_entries, PoolState,
-    SessionGate, SessionPool,
+    better_candidate, classify_hung, classify_idle, kill_pgid_after_grace, purge_session_entries,
+    PoolState, SessionGate, SessionPool,
 };
 use crate::acp::connection::{
     AcpConnection, LifecycleHandle, SessionActivity, SessionSpawnContext,
@@ -15,6 +15,14 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::Instant;
 use tracing::{info, warn};
+
+type StrictEvictionCandidate = (
+    String,
+    Arc<Mutex<AcpConnection>>,
+    Instant,
+    Option<String>,
+    SessionGate,
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StrictSuspendOutcome {
@@ -97,6 +105,77 @@ pub(super) fn session_spawn_context(
     match mode {
         SessionContextMode::None => None,
         SessionContextMode::OpenabV1 => Some(SessionSpawnContext::new(logical_session_key)),
+    }
+}
+
+pub(super) async fn suspend_for_capacity(
+    pool: &SessionPool,
+    thread_id: &str,
+    had_existing: bool,
+) -> Result<()> {
+    let snapshot = {
+        let state = pool.state.read().await;
+        state
+            .active
+            .iter()
+            .filter_map(|(key, connection)| {
+                state
+                    .creating
+                    .get(key)
+                    .map(|gate| (key.clone(), Arc::clone(connection), Arc::clone(gate)))
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut eviction_candidate: Option<StrictEvictionCandidate> = None;
+    for (key, connection, gate) in snapshot {
+        if key == thread_id {
+            continue;
+        }
+        let Ok(_gate_guard) = gate.try_lock() else {
+            continue;
+        };
+        let connection_handle = Arc::clone(&connection);
+        let Ok(connection) = connection.try_lock() else {
+            continue;
+        };
+        let candidate = (
+            key,
+            connection_handle,
+            connection.last_active,
+            connection.acp_session_id.clone(),
+            Arc::clone(&gate),
+        );
+        if better_candidate(
+            eviction_candidate.as_ref().map(|(_, _, time, _, _)| *time),
+            candidate.2,
+        ) {
+            eviction_candidate = Some(candidate);
+        }
+    }
+
+    if had_existing || pool.state.read().await.active.len() < pool.max_sessions {
+        return Ok(());
+    }
+
+    let Some((key, expected_connection, _, _, gate)) = eviction_candidate.as_ref() else {
+        return Err(anyhow!(
+            "pool exhausted ({} sessions); no idle isolated session can be suspended",
+            pool.max_sessions
+        ));
+    };
+    match try_suspend_strict_session(&pool.state, key, expected_connection, gate, None).await? {
+        StrictSuspendOutcome::Suspended => {
+            info!(evicted = %key, "pool full, suspended isolated session before provisioning");
+            Ok(())
+        }
+        StrictSuspendOutcome::Orphaned => Err(anyhow!(
+            "pool full; isolated session {key} was orphaned for reconciliation"
+        )),
+        StrictSuspendOutcome::Skipped => Err(anyhow!(
+            "pool exhausted ({} sessions); eviction candidate became busy",
+            pool.max_sessions
+        )),
     }
 }
 

@@ -65,14 +65,8 @@ pub struct SessionPool {
 
 type CancelHandle = (Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>, String);
 type SessionGate = Arc<Mutex<()>>;
-type ActiveSnapshot = Vec<(String, Arc<Mutex<AcpConnection>>, SessionGate)>;
-type EvictionCandidate = (
-    String,
-    Arc<Mutex<AcpConnection>>,
-    Instant,
-    Option<String>,
-    SessionGate,
-);
+type ActiveSnapshot = Vec<(String, Arc<Mutex<AcpConnection>>)>;
+type EvictionCandidate = (String, Arc<Mutex<AcpConnection>>, Instant, Option<String>);
 
 fn remove_if_same_handle<T>(
     map: &mut HashMap<String, Arc<Mutex<T>>>,
@@ -388,87 +382,47 @@ impl SessionPool {
             }
         }
 
-        // Snapshot active handles so we can inspect them outside the state lock.
-        let snapshot: ActiveSnapshot = {
-            let state = self.state.read().await;
-            state
-                .active
-                .iter()
-                .filter_map(|(key, connection)| {
+        let (eviction_candidate, skipped_locked_candidates) =
+            if self.session_context == SessionContextMode::None {
+                // Snapshot active handles so we can inspect them outside the state lock.
+                let snapshot: Vec<(String, Arc<Mutex<AcpConnection>>)> = {
+                    let state = self.state.read().await;
                     state
-                        .creating
-                        .get(key)
-                        .map(|gate| (key.clone(), Arc::clone(connection), Arc::clone(gate)))
-                })
-                .collect()
-        };
-
-        let mut eviction_candidate: Option<EvictionCandidate> = None;
-        let mut skipped_locked_candidates = 0usize;
-        for (key, conn, gate) in snapshot {
-            if key == thread_id {
-                continue;
-            }
-            let Ok(_gate_guard) = gate.try_lock() else {
-                skipped_locked_candidates += 1;
-                continue;
-            };
-            let conn_handle = Arc::clone(&conn);
-            let Ok(conn) = conn.try_lock() else {
-                skipped_locked_candidates += 1;
-                continue;
-            };
-            let candidate = (
-                key,
-                conn_handle,
-                conn.last_active,
-                conn.acp_session_id.clone(),
-                Arc::clone(&gate),
-            );
-            if better_candidate(
-                eviction_candidate.as_ref().map(|(_, _, t, _, _)| *t),
-                candidate.2,
-            ) {
-                eviction_candidate = Some(candidate);
-            }
-        }
-
-        if self.session_context == SessionContextMode::OpenabV1 && !had_existing {
-            let at_capacity = self.state.read().await.active.len() >= self.max_sessions;
-            if at_capacity {
-                let Some((key, expected_connection, _, _, gate)) = eviction_candidate.as_ref()
-                else {
-                    return Err(anyhow!(
-                        "pool exhausted ({} sessions); no idle isolated session can be suspended",
-                        self.max_sessions
-                    ));
+                        .active
+                        .iter()
+                        .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                        .collect()
                 };
-                match isolated::try_suspend_strict_session(
-                    &self.state,
-                    key,
-                    expected_connection,
-                    gate,
-                    None,
-                )
-                .await?
-                {
-                    isolated::StrictSuspendOutcome::Suspended => {
-                        info!(evicted = %key, "pool full, suspended isolated session before provisioning");
+
+                let mut eviction_candidate: Option<EvictionCandidate> = None;
+                let mut skipped_locked_candidates = 0usize;
+                for (key, conn) in snapshot {
+                    if key == thread_id {
+                        continue;
                     }
-                    isolated::StrictSuspendOutcome::Orphaned => {
-                        return Err(anyhow!(
-                            "pool full; isolated session {key} was orphaned for reconciliation"
-                        ));
-                    }
-                    isolated::StrictSuspendOutcome::Skipped => {
-                        return Err(anyhow!(
-                            "pool exhausted ({} sessions); eviction candidate became busy",
-                            self.max_sessions
-                        ));
+                    let conn_handle = Arc::clone(&conn);
+                    let Ok(conn) = conn.try_lock() else {
+                        skipped_locked_candidates += 1;
+                        continue;
+                    };
+                    let candidate = (
+                        key,
+                        conn_handle,
+                        conn.last_active,
+                        conn.acp_session_id.clone(),
+                    );
+                    if better_candidate(
+                        eviction_candidate.as_ref().map(|(_, _, t, _)| *t),
+                        candidate.2,
+                    ) {
+                        eviction_candidate = Some(candidate);
                     }
                 }
-            }
-        }
+                (eviction_candidate, skipped_locked_candidates)
+            } else {
+                isolated::suspend_for_capacity(self, thread_id, had_existing).await?;
+                (None, 0)
+            };
 
         // Resolve effective working directory: stored per-session > explicit override > global config.
         // Stored value has highest priority to enforce immutability (ADR §4.5).
@@ -596,25 +550,20 @@ impl SessionPool {
         if self.session_context == SessionContextMode::None
             && state.active.len() >= self.max_sessions
         {
-            if let Some((key, expected_conn, _, sid, gate)) = eviction_candidate {
-                if let Ok(_gate_guard) = gate.try_lock() {
-                    if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
-                        state.cancel_handles.remove(&key);
-                        state.lifecycle_handles.remove(&key);
-                        state.activity.remove(&key);
-                        state.pgids.remove(&key);
-                        info!(evicted = %key, "pool full, suspending oldest idle session");
-                        if let Some(sid) = sid {
-                            state.persisted.insert(key.clone(), sid.clone());
-                            state.suspended.insert(key, sid);
-                        } else {
-                            state.persisted.remove(&key);
-                        }
+            if let Some((key, expected_conn, _, sid)) = eviction_candidate {
+                if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
+                    state.cancel_handles.remove(&key);
+                    state.activity.remove(&key);
+                    state.pgids.remove(&key);
+                    info!(evicted = %key, "pool full, suspending oldest idle session");
+                    if let Some(sid) = sid {
+                        state.persisted.insert(key.clone(), sid.clone());
+                        state.suspended.insert(key, sid);
                     } else {
-                        warn!(evicted = %key, "pool full but eviction candidate changed before removal");
+                        state.persisted.remove(&key);
                     }
                 } else {
-                    warn!(evicted = %key, "pool full but eviction candidate entered a lifecycle transition");
+                    warn!(evicted = %key, "pool full but eviction candidate changed before removal");
                 }
             } else if skipped_locked_candidates > 0 {
                 warn!(
@@ -911,12 +860,7 @@ impl SessionPool {
             let snapshot: ActiveSnapshot = state
                 .active
                 .iter()
-                .filter_map(|(key, connection)| {
-                    state
-                        .creating
-                        .get(key)
-                        .map(|gate| (key.clone(), Arc::clone(connection), Arc::clone(gate)))
-                })
+                .map(|(k, v)| (k.clone(), Arc::clone(v)))
                 .collect();
             (
                 snapshot,
@@ -927,13 +871,8 @@ impl SessionPool {
         };
 
         let mut stale = Vec::new();
-        let mut hung: Vec<(String, Arc<Mutex<AcpConnection>>, SessionGate)> = Vec::new();
-        for (key, conn, gate) in snapshot {
-            // Create, resume, close, and release all own this gate. Cleanup
-            // must never race a lifecycle acknowledgement for the same key.
-            let Ok(_gate_guard) = gate.try_lock() else {
-                continue;
-            };
+        let mut hung: Vec<(String, Arc<Mutex<AcpConnection>>)> = Vec::new();
+        for (key, conn) in snapshot {
             // Skip active sessions for this cleanup round instead of waiting on
             // their per-connection mutex. A busy session is not idle unless hung.
             let conn_handle = Arc::clone(&conn);
@@ -980,7 +919,7 @@ impl SessionPool {
                             }
                             kill_pgid_after_grace(pgid).await;
                         });
-                        hung.push((key, conn_handle, Arc::clone(&gate)));
+                        hung.push((key, conn_handle));
                     }
                 }
                 continue;
@@ -996,12 +935,7 @@ impl SessionPool {
                 }
             }
             if classify_idle(conn.last_active, conn.alive(), cutoff) {
-                stale.push((
-                    key,
-                    conn_handle,
-                    conn.acp_session_id.clone(),
-                    Arc::clone(&gate),
-                ));
+                stale.push((key, conn_handle, conn.acp_session_id.clone()));
             }
         }
 
@@ -1010,14 +944,10 @@ impl SessionPool {
         }
 
         let mut state = self.state.write().await;
-        for (key, expected_conn, sid, gate) in stale {
-            let Ok(_gate_guard) = gate.try_lock() else {
-                continue;
-            };
+        for (key, expected_conn, sid) in stale {
             if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
                 info!(thread_id = %key, "cleaning up idle session");
                 state.cancel_handles.remove(&key);
-                state.lifecycle_handles.remove(&key);
                 state.activity.remove(&key);
                 state.pgids.remove(&key);
                 if let Some(sid) = sid {
@@ -1029,10 +959,7 @@ impl SessionPool {
                 }
             }
         }
-        for (key, expected_conn, gate) in hung {
-            let Ok(_gate_guard) = gate.try_lock() else {
-                continue;
-            };
+        for (key, expected_conn) in hung {
             if !apply_hung_eviction(&mut state, &key, &expected_conn) {
                 warn!(thread_id = %key, "hung session was replaced before eviction; maps untouched");
             }
@@ -1082,14 +1009,95 @@ impl SessionPool {
 mod tests {
     use super::{
         better_candidate, classify_hung, classify_idle, get_or_insert_gate, purge_session_entries,
-        remove_if_same_handle, resolve_effective_workdir, PoolState,
+        remove_if_same_handle, resolve_effective_workdir, PoolState, SessionPool,
     };
     use crate::acp::connection::SessionActivity;
     use crate::acp::SessionContextMode;
+    use crate::config::AgentConfig;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
     use tokio::time::Instant;
+
+    #[cfg(unix)]
+    fn default_test_pool(temp: &std::path::Path, max_sessions: usize) -> SessionPool {
+        let script = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}'
+      ;;
+    *'"method":"session/new"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"local-session"}}'
+      ;;
+    *'"method":"session/load"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
+      ;;
+  esac
+done
+"#;
+        let config = AgentConfig {
+            command: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            working_dir: temp.display().to_string(),
+            ..AgentConfig::default()
+        };
+        SessionPool::new_with_paths(
+            config,
+            max_sessions,
+            60,
+            HashMap::new(),
+            temp.join("thread_map.json"),
+            temp.join("session_meta.json"),
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn default_capacity_eviction_ignores_held_lifecycle_gate() {
+        let temp = tempfile::tempdir().unwrap();
+        let pool = default_test_pool(temp.path(), 1);
+        assert_eq!(pool.session_context, SessionContextMode::None);
+        assert!(pool.get_or_create("thread-a", None).await.unwrap());
+        let gate = {
+            let state = pool.state.read().await;
+            Arc::clone(state.creating.get("thread-a").unwrap())
+        };
+        let _gate_guard = gate.lock().await;
+
+        assert!(pool.get_or_create("thread-b", None).await.unwrap());
+
+        let state = pool.state.read().await;
+        assert!(!state.active.contains_key("thread-a"));
+        assert!(state.active.contains_key("thread-b"));
+        assert_eq!(
+            state.suspended.get("thread-a"),
+            Some(&"local-session".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn default_idle_cleanup_ignores_held_lifecycle_gate() {
+        let temp = tempfile::tempdir().unwrap();
+        let pool = default_test_pool(temp.path(), 1);
+        assert_eq!(pool.session_context, SessionContextMode::None);
+        assert!(pool.get_or_create("thread-a", None).await.unwrap());
+        let gate = {
+            let state = pool.state.read().await;
+            Arc::clone(state.creating.get("thread-a").unwrap())
+        };
+        let _gate_guard = gate.lock().await;
+
+        pool.cleanup_idle(0).await;
+
+        let state = pool.state.read().await;
+        assert!(!state.active.contains_key("thread-a"));
+        assert_eq!(
+            state.suspended.get("thread-a"),
+            Some(&"local-session".to_string())
+        );
+    }
 
     #[test]
     fn local_workdir_resolution_preserves_existing_precedence() {
