@@ -339,6 +339,11 @@ explicit `[agent].command`. The internal `OPENAB_SESSION_KEY` and
 `OPENAB_SESSION_ATTEMPT_ID` environment names are broker-owned in this mode
 and cannot appear in `[agent.env]` or `agent.inherit_env`.
 
+Broker filesystem workspace directives such as `[[ws:/path]]` are rejected in
+this mode. Worker checkout selection belongs to the administrator-owned
+Kubernetes profile; a chat message cannot mount or select an arbitrary path
+from the broker Pod.
+
 ---
 
 ## `[agent]`

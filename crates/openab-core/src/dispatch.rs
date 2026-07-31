@@ -130,6 +130,11 @@ pub trait DispatchTarget: Send + Sync + 'static {
     /// Bot home directory (security boundary for workspace resolution).
     fn bot_home(&self) -> std::path::PathBuf;
 
+    /// Whether chat messages may select a path from the broker filesystem.
+    fn allows_workspace_directives(&self) -> bool {
+        true
+    }
+
     /// Ensure the ACP session for `session_key` exists (idempotent).
     /// Returns `true` if a new session was created, `false` if it already existed.
     async fn ensure_session(&self, session_key: &str, working_dir: Option<&str>) -> Result<bool>;
@@ -163,6 +168,10 @@ impl DispatchTarget for AdapterRouter {
 
     fn bot_home(&self) -> std::path::PathBuf {
         self.bot_home_path()
+    }
+
+    fn allows_workspace_directives(&self) -> bool {
+        self.pool().allows_workspace_directives()
     }
 
     async fn ensure_session(&self, session_key: &str, working_dir: Option<&str>) -> Result<bool> {
@@ -676,6 +685,22 @@ async fn dispatch_batch(
     let parse_result = batch
         .first()
         .map(|first_msg| crate::directives::parse_directives(&first_msg.prompt));
+
+    if parse_result
+        .as_ref()
+        .is_some_and(|parsed| parsed.metadata.raw.contains_key("ws"))
+        && !target.allows_workspace_directives()
+    {
+        let message = "Kubernetes session mode does not accept [[ws:...]] broker workspace paths";
+        let _ = adapter
+            .send_message(&dispatch_channel, &format!("⚠️ {message}"))
+            .await;
+        error!(
+            session_key,
+            "workspace directive rejected before provisioning"
+        );
+        return;
+    }
 
     // Tentatively resolve [[ws:...]] — if resolution fails and the session turns out to
     // be new, we abort. If the session already existed, resolution failure is irrelevant.
@@ -1389,6 +1414,8 @@ mod tests {
     struct MockDispatchTarget {
         reactions: ReactionsConfig,
         calls: Mutex<Vec<RecordedDispatch>>,
+        ensure_calls: Mutex<usize>,
+        allows_workspace_directives: bool,
         /// If set, `ensure_session` returns this error once.
         ensure_err: Mutex<Option<String>>,
         /// If set, `stream_prompt_blocks` returns this error once.
@@ -1400,13 +1427,26 @@ mod tests {
             Self {
                 reactions: ReactionsConfig::default(),
                 calls: Mutex::new(Vec::new()),
+                ensure_calls: Mutex::new(0),
+                allows_workspace_directives: true,
                 ensure_err: Mutex::new(None),
                 stream_err: Mutex::new(None),
             }
         }
 
+        fn without_workspace_directives() -> Self {
+            Self {
+                allows_workspace_directives: false,
+                ..Self::new()
+            }
+        }
+
         fn calls(&self) -> Vec<RecordedDispatch> {
             self.calls.lock().unwrap().clone()
+        }
+
+        fn ensure_calls(&self) -> usize {
+            *self.ensure_calls.lock().unwrap()
         }
     }
 
@@ -1424,11 +1464,16 @@ mod tests {
             std::path::PathBuf::from("/tmp")
         }
 
+        fn allows_workspace_directives(&self) -> bool {
+            self.allows_workspace_directives
+        }
+
         async fn ensure_session(
             &self,
             _session_key: &str,
             _working_dir: Option<&str>,
         ) -> Result<bool> {
+            *self.ensure_calls.lock().unwrap() += 1;
             if let Some(msg) = self.ensure_err.lock().unwrap().take() {
                 return Err(anyhow::anyhow!(msg));
             }
@@ -1558,6 +1603,28 @@ mod tests {
         .await;
 
         mock.calls()
+    }
+
+    #[tokio::test]
+    async fn isolated_mode_rejects_workspace_before_ensuring_session() {
+        let mock = Arc::new(MockDispatchTarget::without_workspace_directives());
+        let target: Arc<dyn DispatchTarget> = mock.clone();
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+
+        for workspace in ["@missing", "/definitely/missing"] {
+            dispatch_batch(
+                "mock:T",
+                &make_channel("T"),
+                &target,
+                &adapter,
+                vec![make_msg(&format!("[[ws:{workspace}]]\ninspect this"), 10)],
+                false,
+            )
+            .await;
+        }
+
+        assert_eq!(mock.ensure_calls(), 0);
+        assert!(mock.calls().is_empty());
     }
 
     #[tokio::test]

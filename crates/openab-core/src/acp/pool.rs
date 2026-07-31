@@ -97,6 +97,20 @@ fn session_spawn_context(
     }
 }
 
+fn resolve_effective_workdir(
+    mode: SessionContextMode,
+    stored: Option<&str>,
+    requested: Option<&str>,
+    default: &str,
+) -> Result<String> {
+    if mode == SessionContextMode::OpenabV1 && (stored.is_some() || requested.is_some()) {
+        return Err(anyhow!(
+            "Kubernetes session mode does not accept broker workspace paths"
+        ));
+    }
+    Ok(stored.or(requested).unwrap_or(default).to_string())
+}
+
 /// Returns true when a session should be treated as stale during idle cleanup.
 fn classify_idle(last_active: Instant, alive: bool, cutoff: Instant) -> bool {
     last_active < cutoff || !alive
@@ -257,6 +271,10 @@ impl SessionPool {
         self
     }
 
+    pub(crate) fn allows_workspace_directives(&self) -> bool {
+        self.session_context == SessionContextMode::None
+    }
+
     fn load_mapping(path: &Path) -> HashMap<String, String> {
         match std::fs::read_to_string(path) {
             Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {
@@ -396,13 +414,12 @@ impl SessionPool {
             state.session_workdirs.get(thread_id).cloned()
         };
 
-        let effective_workdir = if let Some(stored) = stored_workdir {
-            stored
-        } else if let Some(wd) = working_dir_override {
-            wd.to_string()
-        } else {
-            self.config.working_dir.clone()
-        };
+        let effective_workdir = resolve_effective_workdir(
+            self.session_context,
+            stored_workdir.as_deref(),
+            working_dir_override,
+            &self.config.working_dir,
+        )?;
 
         // Build the replacement connection outside the state lock so one stuck
         // initialization does not block all unrelated sessions.
@@ -929,7 +946,8 @@ impl SessionPool {
 mod tests {
     use super::{
         better_candidate, classify_hung, classify_idle, get_or_insert_gate, purge_session_entries,
-        release_strict_session, remove_if_same_handle, session_spawn_context, PoolState,
+        release_strict_session, remove_if_same_handle, resolve_effective_workdir,
+        session_spawn_context, PoolState,
     };
     use crate::acp::connection::{
         LifecycleCapabilities, LifecycleHandle, SessionActivity, SessionLifecycleControl,
@@ -1049,6 +1067,54 @@ mod tests {
             .expect("second context");
 
         assert_ne!(first.attempt_id(), second.attempt_id());
+    }
+
+    #[test]
+    fn local_workdir_resolution_preserves_existing_precedence() {
+        assert_eq!(
+            resolve_effective_workdir(
+                SessionContextMode::None,
+                Some("/stored"),
+                Some("/requested"),
+                "/default",
+            )
+            .unwrap(),
+            "/stored"
+        );
+        assert_eq!(
+            resolve_effective_workdir(
+                SessionContextMode::None,
+                None,
+                Some("/requested"),
+                "/default",
+            )
+            .unwrap(),
+            "/requested"
+        );
+    }
+
+    #[test]
+    fn isolated_session_rejects_broker_workspace_paths() {
+        for (stored, requested) in [
+            (Some("/stored"), None),
+            (None, Some("/requested")),
+            (Some("/stored"), Some("/requested")),
+        ] {
+            let error = resolve_effective_workdir(
+                SessionContextMode::OpenabV1,
+                stored,
+                requested,
+                "/bridge",
+            )
+            .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("does not accept broker workspace paths"));
+        }
+        assert_eq!(
+            resolve_effective_workdir(SessionContextMode::OpenabV1, None, None, "/bridge").unwrap(),
+            "/bridge"
+        );
     }
 
     #[test]
