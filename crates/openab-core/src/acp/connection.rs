@@ -1,8 +1,8 @@
 #[cfg(test)]
 pub(crate) use super::lifecycle::SessionLifecycleControl;
 use super::lifecycle::{
-    new_lifecycle_handle, parse_lifecycle_capabilities, send_bounded_request, session_spawn_env,
-    write_bounded_line, PendingRequests, CONTROL_WRITE_TIMEOUT, OPENAB_META_NAMESPACE,
+    new_lifecycle_handle, parse_lifecycle_capabilities, session_spawn_env, PendingRequests,
+    OPENAB_META_NAMESPACE,
 };
 pub(crate) use super::lifecycle::{LifecycleCapabilities, LifecycleHandle, SessionSpawnContext};
 use crate::acp::protocol::{
@@ -18,7 +18,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
-use tokio::time::{Duration, Instant};
+use tokio::time::Instant;
 use tracing::{debug, error, info, trace};
 
 /// Pick the most permissive selectable permission option from ACP options.
@@ -528,25 +528,40 @@ impl AcpConnection {
 
     pub(crate) async fn send_raw(&self, data: &str) -> Result<()> {
         debug!(data = data.trim(), "acp_send");
-        write_bounded_line(&self.stdin, data, CONTROL_WRITE_TIMEOUT).await
+        // A hung agent can stop draining stdin; bound the write so callers
+        // (and the mutexes they hold) can never block on it indefinitely.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut w = self.stdin.lock().await;
+            w.write_all(data.as_bytes()).await?;
+            w.write_all(b"\n").await?;
+            w.flush().await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|_| anyhow!("stdin write timeout"))??;
+        Ok(())
     }
 
     async fn send_request(&self, method: &str, params: Option<Value>) -> Result<JsonRpcMessage> {
-        let response_timeout = if method == "session/new" {
-            Duration::from_secs(120)
-        } else {
-            Duration::from_secs(30)
-        };
-        send_bounded_request(
-            &self.stdin,
-            &self.next_id,
-            &self.pending,
-            method,
-            params,
-            CONTROL_WRITE_TIMEOUT,
-            response_timeout,
-        )
-        .await
+        let id = self.next_id();
+        let req = JsonRpcRequest::new(id, method, params);
+        let data = serde_json::to_string(&req)?;
+
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(id, tx);
+
+        self.send_raw(&data).await?;
+
+        let timeout_secs = if method == "session/new" { 120 } else { 30 };
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx)
+            .await
+            .map_err(|_| anyhow!("timeout waiting for {method} response"))?
+            .map_err(|_| anyhow!("channel closed waiting for {method}"))?;
+
+        if let Some(err) = &resp.error {
+            return Err(anyhow!("{err}"));
+        }
+        Ok(resp)
     }
 
     pub async fn initialize(&mut self) -> Result<()> {
@@ -591,13 +606,21 @@ impl AcpConnection {
                 ));
             }
         }
-        info!(
-            agent = agent_name,
-            load_session = self.supports_load_session,
-            close_session = self.lifecycle_capabilities.close,
-            openab_release_v1 = self.lifecycle_capabilities.release_v1,
-            "initialized"
-        );
+        if self.requires_openab_lifecycle {
+            info!(
+                agent = agent_name,
+                load_session = self.supports_load_session,
+                close_session = self.lifecycle_capabilities.close,
+                openab_release_v1 = self.lifecycle_capabilities.release_v1,
+                "initialized"
+            );
+        } else {
+            info!(
+                agent = agent_name,
+                load_session = self.supports_load_session,
+                "initialized"
+            );
+        }
         Ok(())
     }
 
@@ -893,6 +916,67 @@ mod tests {
         build_agent_env, build_permission_response, pick_best_option, SessionSpawnContext,
     };
     use serde_json::json;
+
+    #[cfg(unix)]
+    async fn spawn_default_test_agent(
+        temp: &std::path::Path,
+        script: &str,
+    ) -> super::AcpConnection {
+        super::AcpConnection::spawn(
+            "/bin/sh",
+            &["-c".to_string(), script.to_string()],
+            temp.to_string_lossy().as_ref(),
+            &std::collections::HashMap::new(),
+            &[],
+        )
+        .await
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn default_session_load_keeps_upstream_channel_closed_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = r#"
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"agentInfo":{"name":"default-agent"},"agentCapabilities":{"loadSession":true}}}'
+IFS= read -r line
+while :; do sleep 1; done
+        "#;
+        let mut connection = spawn_default_test_agent(temp.path(), script).await;
+        connection.initialize().await.unwrap();
+        assert!(!connection.requires_openab_lifecycle);
+        assert_eq!(
+            connection.lifecycle_capabilities,
+            super::LifecycleCapabilities::default()
+        );
+        let pending = std::sync::Arc::clone(&connection.pending);
+
+        let load = tokio::spawn(async move {
+            let result = connection
+                .session_load("persisted-session", temp.path().to_string_lossy().as_ref())
+                .await;
+            (connection, result)
+        });
+        let sender = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(sender) = pending.lock().await.remove(&2) {
+                    break sender;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("session/load should install its pending response");
+        drop(sender);
+
+        let (connection, result) = load.await.unwrap();
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "channel closed waiting for session/load"
+        );
+        assert!(connection.lifecycle_handle().is_none());
+    }
 
     #[cfg(unix)]
     #[tokio::test]
