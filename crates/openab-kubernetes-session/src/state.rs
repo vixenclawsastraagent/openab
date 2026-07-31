@@ -15,6 +15,8 @@ pub enum StateError {
     InvalidProfileVersion,
     #[error("attempt and incarnation identifiers must not be nil")]
     InvalidRuntimeIdentifier,
+    #[error("a new generation must use a fresh attempt identifier")]
+    ReusedAttemptIdentifier,
     #[error("compute and storage deadlines must follow last activity")]
     InvalidDeadlines,
     #[error("last activity cannot move backwards from {current} to {proposed}")]
@@ -24,6 +26,20 @@ pub enum StateError {
     },
     #[error("activity cannot be refreshed while the session is {phase:?}")]
     ActivityNotAllowed { phase: SessionPhase },
+    #[error("immutable anchor field {field} changed")]
+    ImmutableAnchorFieldChanged { field: &'static str },
+    #[error(
+        "invalid fence successor from generation {current_generation} attempt {current_attempt} \
+         to generation {next_generation} attempt {next_attempt}"
+    )]
+    InvalidFenceSuccessor {
+        current_generation: u64,
+        current_attempt: Uuid,
+        next_generation: u64,
+        next_attempt: Uuid,
+    },
+    #[error("worker Pod UID changed outside a create/delete observation")]
+    InvalidPodSuccessor,
     #[error(
         "fence mismatch: expected generation {expected_generation} attempt {expected_attempt}, \
          got generation {actual_generation} attempt {actual_attempt}"
@@ -323,6 +339,60 @@ impl SessionAnchorV1 {
         self.storage_deadline_at
     }
 
+    pub fn validate_successor(&self, next: &Self) -> Result<(), StateError> {
+        self.validate()?;
+        next.validate()?;
+        self.validate_immutable_fields(next)?;
+
+        let current_generation = self.fence.generation();
+        let next_generation = next.fence.generation();
+        if next_generation == current_generation {
+            if next.fence.attempt_id() != self.fence.attempt_id() {
+                return Err(self.invalid_fence_successor(next));
+            }
+            if self.phase != next.phase && !valid_transition(self.phase, next.phase) {
+                return Err(StateError::InvalidTransition {
+                    from: self.phase,
+                    to: next.phase,
+                });
+            }
+            self.validate_pod_successor(next)?;
+            self.validate_activity_successor(next)?;
+            return Ok(());
+        }
+
+        let expected_generation = current_generation
+            .checked_add(1)
+            .ok_or_else(|| self.invalid_fence_successor(next))?;
+        if next_generation != expected_generation
+            || next.fence.attempt_id() == self.fence.attempt_id()
+        {
+            return Err(self.invalid_fence_successor(next));
+        }
+        if !matches!(self.phase, SessionPhase::Suspended | SessionPhase::Blocked)
+            || next.phase != SessionPhase::Provisioning
+        {
+            return Err(StateError::InvalidTransition {
+                from: self.phase,
+                to: next.phase,
+            });
+        }
+        if let Some(pod_uid) = &self.pod_uid {
+            return Err(StateError::PodStillPresent {
+                pod_uid: pod_uid.clone(),
+            });
+        }
+        if next.pod_uid.is_some() {
+            return Err(StateError::InvalidPodSuccessor);
+        }
+        validate_deadlines(
+            self.last_activity_at,
+            next.last_activity_at,
+            next.compute_deadline_at,
+            next.storage_deadline_at,
+        )
+    }
+
     pub fn refresh_activity(
         &mut self,
         expected: &Fence,
@@ -444,6 +514,9 @@ impl SessionAnchorV1 {
             .generation()
             .checked_add(1)
             .ok_or(StateError::GenerationOverflow)?;
+        if new_attempt_id == self.fence.attempt_id() {
+            return Err(StateError::ReusedAttemptIdentifier);
+        }
         let next_fence = Fence::new(generation, new_attempt_id)?;
         validate_deadlines(
             self.last_activity_at,
@@ -469,6 +542,65 @@ impl SessionAnchorV1 {
             actual_generation: self.fence.generation(),
             actual_attempt: self.fence.attempt_id(),
         })
+    }
+
+    fn validate_immutable_fields(&self, next: &Self) -> Result<(), StateError> {
+        if next.session_id != self.session_id {
+            return Err(StateError::ImmutableAnchorFieldChanged { field: "sessionId" });
+        }
+        if next.scope_id != self.scope_id {
+            return Err(StateError::ImmutableAnchorFieldChanged { field: "scopeId" });
+        }
+        if next.incarnation_id != self.incarnation_id {
+            return Err(StateError::ImmutableAnchorFieldChanged {
+                field: "incarnationId",
+            });
+        }
+        if next.profile != self.profile {
+            return Err(StateError::ImmutableAnchorFieldChanged { field: "profile" });
+        }
+        Ok(())
+    }
+
+    fn validate_pod_successor(&self, next: &Self) -> Result<(), StateError> {
+        match (self.pod_uid.as_deref(), next.pod_uid.as_deref()) {
+            (current, successor) if current == successor => Ok(()),
+            (None, Some(_)) if self.phase == SessionPhase::Provisioning => Ok(()),
+            (Some(_), None) if !matches!(self.phase, SessionPhase::Ready | SessionPhase::Busy) => {
+                Ok(())
+            }
+            _ => Err(StateError::InvalidPodSuccessor),
+        }
+    }
+
+    fn validate_activity_successor(&self, next: &Self) -> Result<(), StateError> {
+        let changed = self.last_activity_at != next.last_activity_at
+            || self.compute_deadline_at != next.compute_deadline_at
+            || self.storage_deadline_at != next.storage_deadline_at;
+        if !changed {
+            return Ok(());
+        }
+        if !matches!(
+            self.phase,
+            SessionPhase::Provisioning | SessionPhase::Ready | SessionPhase::Busy
+        ) {
+            return Err(StateError::ActivityNotAllowed { phase: self.phase });
+        }
+        validate_deadlines(
+            self.last_activity_at,
+            next.last_activity_at,
+            next.compute_deadline_at,
+            next.storage_deadline_at,
+        )
+    }
+
+    fn invalid_fence_successor(&self, next: &Self) -> StateError {
+        StateError::InvalidFenceSuccessor {
+            current_generation: self.fence.generation(),
+            current_attempt: self.fence.attempt_id(),
+            next_generation: next.fence.generation(),
+            next_attempt: next.fence.attempt_id(),
+        }
     }
 
     fn validate(&self) -> Result<(), StateError> {

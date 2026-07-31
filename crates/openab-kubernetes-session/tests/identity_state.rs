@@ -3,6 +3,7 @@ use openab_kubernetes_session::identity::{IdentityError, ResourceNames, ScopeId,
 use openab_kubernetes_session::state::{
     Fence, ProfileRef, SessionAnchorV1, SessionPhase, StateError,
 };
+use serde_json::json;
 use uuid::Uuid;
 
 fn dns_label(value: &str) -> bool {
@@ -335,6 +336,18 @@ fn failed_generation_advance_does_not_partially_mutate_state() {
     );
     assert_eq!(anchor, before);
 
+    assert_eq!(
+        anchor.advance_generation(
+            &first_fence,
+            first_fence.attempt_id(),
+            old_activity + Duration::minutes(20),
+            old_activity + Duration::minutes(35),
+            old_activity + Duration::hours(72),
+        ),
+        Err(StateError::ReusedAttemptIdentifier)
+    );
+    assert_eq!(anchor, before);
+
     assert!(matches!(
         anchor.advance_generation(
             &first_fence,
@@ -358,4 +371,99 @@ fn failed_generation_advance_does_not_partially_mutate_state() {
         Err(StateError::InvalidDeadlines)
     );
     assert_eq!(anchor, before);
+}
+
+#[test]
+fn serialized_snapshots_cannot_bypass_successor_fencing() {
+    let current = test_anchor();
+
+    let mut changed_attempt = serde_json::to_value(&current).unwrap();
+    changed_attempt["fence"]["attemptId"] = json!(Uuid::from_u128(99));
+    let changed_attempt: SessionAnchorV1 = serde_json::from_value(changed_attempt).unwrap();
+    assert!(matches!(
+        current.validate_successor(&changed_attempt),
+        Err(StateError::InvalidFenceSuccessor { .. })
+    ));
+
+    let mut skipped_generation = serde_json::to_value(&current).unwrap();
+    skipped_generation["fence"]["generation"] = json!(3);
+    skipped_generation["fence"]["attemptId"] = json!(Uuid::from_u128(3));
+    let skipped_generation: SessionAnchorV1 = serde_json::from_value(skipped_generation).unwrap();
+    assert!(matches!(
+        current.validate_successor(&skipped_generation),
+        Err(StateError::InvalidFenceSuccessor { .. })
+    ));
+}
+
+#[test]
+fn adjacent_generation_cannot_reuse_the_current_attempt() {
+    let mut current = test_anchor();
+    let fence = current.fence().clone();
+    current.transition(&fence, SessionPhase::Blocked).unwrap();
+
+    let mut reused_attempt = serde_json::to_value(&current).unwrap();
+    reused_attempt["fence"]["generation"] = json!(fence.generation() + 1);
+    reused_attempt["phase"] = json!("provisioning");
+    let reused_attempt: SessionAnchorV1 = serde_json::from_value(reused_attempt).unwrap();
+
+    assert!(matches!(
+        current.validate_successor(&reused_attempt),
+        Err(StateError::InvalidFenceSuccessor { .. })
+    ));
+}
+
+#[test]
+fn generation_overflow_does_not_partially_mutate_state() {
+    let mut encoded = serde_json::to_value(test_anchor()).unwrap();
+    encoded["fence"]["generation"] = json!(u64::MAX);
+    encoded["phase"] = json!("blocked");
+    let mut anchor: SessionAnchorV1 = serde_json::from_value(encoded).unwrap();
+    let before = anchor.clone();
+    let fence = anchor.fence().clone();
+    let activity = anchor.last_activity_at() + Duration::minutes(20);
+
+    assert_eq!(
+        anchor.advance_generation(
+            &fence,
+            Uuid::from_u128(3),
+            activity,
+            activity + Duration::minutes(15),
+            activity + Duration::hours(72),
+        ),
+        Err(StateError::GenerationOverflow)
+    );
+    assert_eq!(anchor, before);
+}
+
+#[test]
+fn domain_mutations_produce_valid_successor_snapshots() {
+    let current = test_anchor();
+    let mut next = current.clone();
+    let fence = next.fence().clone();
+    let activity = next.last_activity_at() + Duration::minutes(2);
+    next.refresh_activity(
+        &fence,
+        activity,
+        activity + Duration::minutes(15),
+        activity + Duration::hours(72),
+    )
+    .unwrap();
+
+    current.validate_successor(&next).unwrap();
+
+    let mut suspended = current.clone();
+    suspended.transition(&fence, SessionPhase::Blocked).unwrap();
+    let mut replacement = suspended.clone();
+    let replacement_activity = activity + Duration::minutes(20);
+    replacement
+        .advance_generation(
+            &fence,
+            Uuid::from_u128(3),
+            replacement_activity,
+            replacement_activity + Duration::minutes(15),
+            replacement_activity + Duration::hours(72),
+        )
+        .unwrap();
+
+    suspended.validate_successor(&replacement).unwrap();
 }

@@ -358,13 +358,53 @@ Destructive cleanup is ordered and idempotent:
 3. wait until that exact Pod UID is gone;
 4. delete the PVC using a UID precondition and observe finalizer completion;
 5. delete the generation Secret and tokenless ServiceAccount; and
-6. delete the anchor using UID and `resourceVersion` preconditions.
+6. request anchor deletion using UID and `resourceVersion` preconditions; and
+7. retain the session mapping until a subsequent read observes that exact
+   anchor as absent.
 
 The controller uses idempotent create-or-observe operations. A replacement Pod
 is not created until the previous Pod UID is observed deleted. An
 `AlreadyExists` response is followed by a read and validation of the full
 session digest, anchor UID, and generation; a same-named object is never
 adopted based on its name alone.
+
+The initial ConfigMap store also validates every replacement as a legal domain
+state successor before issuing its compare-and-swap. A current
+`resourceVersion` therefore cannot be combined with a deserialized state that
+changes an attempt within one generation, moves the generation backwards, or
+skips a generation. The v1 anchor itself has no owner reference or finalizer;
+either appearing through admission or drift is rejected because it could make
+the anchor disappear unexpectedly or block ordered cleanup.
+
+API-server write responses are validated rather than assumed to echo the
+request. The store never removes an owner reference or finalizer that it does
+not own, following Kubernetes'
+[finalizer guidance](https://kubernetes.io/docs/concepts/overview/working-with-objects/finalizers/).
+If admission adds either to an anchor, recovery fails closed and requires the
+responsible controller or an operator who understands that lifecycle contract
+to resolve it. The v1 ConfigMap anchor defines no OpenAB-owned finalizer.
+
+If a newly created response is otherwise mutated, the store requests deletion
+with the returned UID and `resourceVersion`. An accepted delete request only
+means deletion has started; it does not claim that finalizer processing or
+physical removal has completed. The controller must observe absence before
+reusing the session identity or releasing retained state.
+
+If admission mutates a replacement, the store makes one guarded canonical
+repair only when the persisted `anchor.json` parses successfully and is
+already exactly equal to the intended successor. The repair may correct the
+store-owned envelope, such as required labels, extra data keys, `binaryData`,
+or the mutable flag, but it never overwrites a different persisted state. A
+newer generation, a different attempt in the same generation, or an
+unparseable state therefore fails closed without a second PUT.
+
+The repair uses the latest response as its base. The replacement
+compare-and-swap uses the opaque `resourceVersion`; the UID is separately
+checked as immutable object identity. A successful repair returns the repaired
+observation as the committed result, so callers do not retry the stale write.
+A conflicting, malformed, lifecycle-mutated, state-mutated, or repeatedly
+mutated recovery is not retried or adopted: the failure remains observable for
+reconciliation and operator action.
 
 #### 5.3.1 Quick state-management solution for this version
 
