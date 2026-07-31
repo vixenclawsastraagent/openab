@@ -236,6 +236,26 @@ where
         .await
     }
 
+    async fn close_inner(&self) -> Result<()> {
+        if !self.capabilities.close {
+            return Err(anyhow!("session/close capability was not advertised"));
+        }
+        let response = send_bounded_request(
+            &self.writer,
+            &self.next_id,
+            &self.pending,
+            "session/close",
+            Some(json!({"sessionId": self.session_id})),
+            CONTROL_WRITE_TIMEOUT,
+            LIFECYCLE_RESPONSE_TIMEOUT,
+        )
+        .await?;
+        if !response.result.as_ref().is_some_and(Value::is_object) {
+            return Err(anyhow!("session/close returned an invalid acknowledgement"));
+        }
+        Ok(())
+    }
+
     async fn release_inner(&self) -> Result<()> {
         if !self.capabilities.release_v1 {
             return Err(anyhow!(
@@ -269,6 +289,12 @@ where
 pub(crate) trait SessionLifecycleControl: Send + Sync {
     fn capabilities(&self) -> LifecycleCapabilities;
     async fn cancel(&self) -> Result<()>;
+    // The pool integration calls this through LifecycleHandle. Keep a default
+    // so existing local/test controls remain inert unless they opt in.
+    #[allow(dead_code)]
+    async fn close(&self) -> Result<()> {
+        Err(anyhow!("session/close lifecycle control is not available"))
+    }
     async fn release(&self) -> Result<()>;
 }
 
@@ -280,6 +306,10 @@ impl SessionLifecycleControl for AcpLifecycleHandle<ChildStdin> {
 
     async fn cancel(&self) -> Result<()> {
         self.cancel_inner().await
+    }
+
+    async fn close(&self) -> Result<()> {
+        self.close_inner().await
     }
 
     async fn release(&self) -> Result<()> {
@@ -1468,7 +1498,7 @@ mod reader_loop_tests {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::{
-        parse_lifecycle_capabilities, send_bounded_request, AcpLifecycleHandle,
+        parse_lifecycle_capabilities, run_reader_loop, send_bounded_request, AcpLifecycleHandle,
         LifecycleCapabilities, PendingRequests,
     };
     use crate::acp::protocol::JsonRpcMessage;
@@ -1476,8 +1506,8 @@ mod lifecycle_tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
-    use tokio::io::{duplex, AsyncBufReadExt, BufReader};
-    use tokio::sync::Mutex;
+    use tokio::io::{duplex, AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::sync::{mpsc, Mutex};
     use tokio::time::Duration;
 
     fn pending_requests() -> PendingRequests {
@@ -1503,7 +1533,10 @@ mod lifecycle_tests {
         serde_json::from_str(line.trim()).unwrap()
     }
 
-    async fn run_release(result: serde_json::Value) -> (serde_json::Value, anyhow::Result<()>) {
+    async fn run_lifecycle_request(
+        result: serde_json::Value,
+        close: bool,
+    ) -> (serde_json::Value, anyhow::Result<()>) {
         let (writer, peer) = duplex(8 * 1024);
         let pending = pending_requests();
         let handle = AcpLifecycleHandle::new(
@@ -1516,7 +1549,13 @@ mod lifecycle_tests {
                 release_v1: true,
             },
         );
-        let request = tokio::spawn(async move { handle.release_inner().await });
+        let request = tokio::spawn(async move {
+            if close {
+                handle.close_inner().await
+            } else {
+                handle.release_inner().await
+            }
+        });
         let sent = read_json(&mut BufReader::new(peer)).await;
         let id = sent["id"].as_u64().unwrap();
         pending
@@ -1659,14 +1698,73 @@ mod lifecycle_tests {
 
     #[tokio::test]
     async fn release_uses_extension_method_and_requires_object_ack() {
-        let (sent, result) = run_release(json!({})).await;
+        let (sent, result) = run_lifecycle_request(json!({}), false).await;
         assert_eq!(sent["method"], "_openab/session/release");
         assert_eq!(sent["params"], json!({"sessionId": "outer-session"}));
         result.unwrap();
 
-        let (_, result) = run_release(serde_json::Value::Null).await;
+        let (_, result) = run_lifecycle_request(serde_json::Value::Null, false).await;
         let error = result.unwrap_err();
         assert!(error.to_string().contains("invalid acknowledgement"));
+    }
+
+    #[tokio::test]
+    async fn close_uses_standard_method_and_requires_object_ack() {
+        let (sent, result) = run_lifecycle_request(json!({}), true).await;
+        assert_eq!(sent["method"], "session/close");
+        assert_eq!(sent["params"], json!({"sessionId": "outer-session"}));
+        result.unwrap();
+
+        let (_, result) = run_lifecycle_request(serde_json::Value::Null, true).await;
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("invalid acknowledgement"));
+    }
+
+    #[tokio::test]
+    async fn close_error_response_clears_shared_pending_entry() {
+        let (client_writer, agent_reader) = duplex(8 * 1024);
+        let (mut agent_writer, client_reader) = duplex(8 * 1024);
+        let (permission_writer, _permission_reader) = duplex(8 * 1024);
+        let pending = pending_requests();
+        let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
+            Arc::new(Mutex::new(None));
+        let reader = tokio::spawn(run_reader_loop(
+            client_reader,
+            Arc::new(Mutex::new(permission_writer)),
+            Arc::clone(&pending),
+            notify_tx,
+        ));
+        let handle = AcpLifecycleHandle::new(
+            Arc::new(Mutex::new(client_writer)),
+            Arc::new(AtomicU64::new(1)),
+            Arc::clone(&pending),
+            "outer-session".to_string(),
+            LifecycleCapabilities {
+                close: true,
+                release_v1: false,
+            },
+        );
+
+        let request = tokio::spawn(async move { handle.close_inner().await });
+        let sent = read_json(&mut BufReader::new(agent_reader)).await;
+        let id = sent["id"].as_u64().unwrap();
+        let reply = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": -32000, "message": "close failed"}
+        });
+        agent_writer
+            .write_all(format!("{reply}\n").as_bytes())
+            .await
+            .unwrap();
+        agent_writer.flush().await.unwrap();
+
+        let error = request.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("close failed"));
+        assert!(pending.lock().await.is_empty());
+
+        drop(agent_writer);
+        reader.await.unwrap();
     }
 
     #[tokio::test]
@@ -1712,5 +1810,28 @@ mod lifecycle_tests {
         )
         .await;
         assert!(read.is_err(), "unsupported release must not write");
+    }
+
+    #[tokio::test]
+    async fn unsupported_close_fails_before_writing() {
+        let (writer, mut peer) = duplex(8 * 1024);
+        let handle = AcpLifecycleHandle::new(
+            Arc::new(Mutex::new(writer)),
+            Arc::new(AtomicU64::new(1)),
+            pending_requests(),
+            "outer-session".to_string(),
+            LifecycleCapabilities::default(),
+        );
+
+        let error = handle.close_inner().await.unwrap_err();
+        assert!(error.to_string().contains("not advertised"));
+
+        let mut byte = [0_u8; 1];
+        let read = tokio::time::timeout(
+            Duration::from_millis(10),
+            tokio::io::AsyncReadExt::read(&mut peer, &mut byte),
+        )
+        .await;
+        assert!(read.is_err(), "unsupported close must not write");
     }
 }
