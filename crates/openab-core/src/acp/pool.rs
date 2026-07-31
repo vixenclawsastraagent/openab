@@ -76,6 +76,13 @@ type EvictionCandidate = (
     SessionGate,
 );
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StrictSuspendOutcome {
+    Suspended,
+    Orphaned,
+    Skipped,
+}
+
 fn write_mapping_file(path: &Path, mapping: &HashMap<String, String>) -> Result<()> {
     let data = serde_json::to_vec_pretty(mapping).context("failed to serialize session mapping")?;
 
@@ -279,6 +286,164 @@ async fn rollback_uncommitted_session(
             anyhow!("{cause}; failed to release uncommitted isolated session: {rollback}")
         }
     }
+}
+
+fn park_strict_session(
+    state: &mut PoolState,
+    key: &str,
+    expected_connection: &Arc<Mutex<AcpConnection>>,
+    expected_lifecycle: &LifecycleHandle,
+    clean_close: bool,
+) -> Result<()> {
+    let same_connection = state
+        .active
+        .get(key)
+        .is_some_and(|current| Arc::ptr_eq(current, expected_connection));
+    let same_lifecycle = state
+        .lifecycle_handles
+        .get(key)
+        .is_some_and(|current| Arc::ptr_eq(current, expected_lifecycle));
+    if !same_connection || !same_lifecycle {
+        return Err(anyhow!(
+            "isolated session changed during lifecycle transition"
+        ));
+    }
+    let session_id = state.persisted.get(key).cloned().ok_or_else(|| {
+        anyhow!("isolated session for thread {key} has no persisted session mapping")
+    })?;
+
+    state.active.remove(key);
+    state.cancel_handles.remove(key);
+    state.lifecycle_handles.remove(key);
+    state.activity.remove(key);
+    state.pgids.remove(key);
+    if clean_close {
+        state.suspended.insert(key.to_string(), session_id);
+    } else {
+        // `persisted` without `active` or `suspended` is the broker's
+        // lightweight orphan marker. A fresh bridge attempt will reconcile it.
+        state.suspended.remove(key);
+    }
+    Ok(())
+}
+
+async fn try_suspend_strict_session(
+    state: &RwLock<PoolState>,
+    key: &str,
+    expected_connection: &Arc<Mutex<AcpConnection>>,
+    gate: &SessionGate,
+    idle_cutoff: Option<Instant>,
+) -> Result<StrictSuspendOutcome> {
+    // Prompt dispatch takes the connection first and briefly takes this gate
+    // for pointer revalidation. Both locks are non-blocking here so cleanup or
+    // capacity management never queues behind a live turn.
+    let Ok(connection) = expected_connection.try_lock() else {
+        return Ok(StrictSuspendOutcome::Skipped);
+    };
+    let Ok(_gate_guard) = gate.try_lock() else {
+        return Ok(StrictSuspendOutcome::Skipped);
+    };
+
+    let lifecycle =
+        {
+            let state = state.read().await;
+            if !state
+                .active
+                .get(key)
+                .is_some_and(|current| Arc::ptr_eq(current, expected_connection))
+            {
+                return Ok(StrictSuspendOutcome::Skipped);
+            }
+            if let Some(cutoff) = idle_cutoff {
+                if connection.alive() && connection.last_active >= cutoff {
+                    return Ok(StrictSuspendOutcome::Skipped);
+                }
+            }
+            if !state.persisted.contains_key(key) {
+                return Err(anyhow!(
+                    "isolated session for thread {key} has no persisted session mapping"
+                ));
+            }
+            state.lifecycle_handles.get(key).cloned().ok_or_else(|| {
+                anyhow!("isolated session for thread {key} has no lifecycle handle")
+            })?
+        };
+
+    if !connection.alive() {
+        let mut state = state.write().await;
+        park_strict_session(&mut state, key, expected_connection, &lifecycle, false)?;
+        return Ok(StrictSuspendOutcome::Orphaned);
+    }
+
+    let close_result = lifecycle.close().await;
+    let mut state = state.write().await;
+    match close_result {
+        Ok(()) => {
+            park_strict_session(&mut state, key, expected_connection, &lifecycle, true)?;
+            Ok(StrictSuspendOutcome::Suspended)
+        }
+        Err(close_error) => {
+            let orphan_result =
+                park_strict_session(&mut state, key, expected_connection, &lifecycle, false);
+            match orphan_result {
+                Ok(()) => Err(anyhow!(
+                    "session/close failed; isolated session was orphaned for reconciliation: {close_error}"
+                )),
+                Err(orphan_error) => Err(anyhow!(
+                    "session/close failed ({close_error}) and orphan transition failed: {orphan_error}"
+                )),
+            }
+        }
+    }
+}
+
+async fn orphan_hung_strict_session(
+    state: &RwLock<PoolState>,
+    key: &str,
+    expected_connection: &Arc<Mutex<AcpConnection>>,
+    expected_lifecycle: &LifecycleHandle,
+    expected_activity: &Arc<SessionActivity>,
+    gate: &SessionGate,
+    hung_threshold: std::time::Duration,
+) -> Result<StrictSuspendOutcome> {
+    let Ok(_gate_guard) = gate.try_lock() else {
+        return Ok(StrictSuspendOutcome::Skipped);
+    };
+
+    // The turn may have completed after cleanup's first hung classification.
+    // Recheck only after entering the lifecycle gate so a stale snapshot cannot
+    // detach a healthy bridge.
+    if expected_connection.try_lock().is_ok() {
+        if expected_activity.in_flight() {
+            expected_activity.set_in_flight(false);
+            expected_activity.touch();
+        }
+        return Ok(StrictSuspendOutcome::Skipped);
+    }
+    if !classify_hung(
+        expected_activity.in_flight(),
+        expected_activity.age(),
+        hung_threshold,
+    ) {
+        return Ok(StrictSuspendOutcome::Skipped);
+    }
+
+    let mut state = state.write().await;
+    let same_activity = state
+        .activity
+        .get(key)
+        .is_some_and(|current| Arc::ptr_eq(current, expected_activity));
+    if !same_activity {
+        return Ok(StrictSuspendOutcome::Skipped);
+    }
+    park_strict_session(
+        &mut state,
+        key,
+        expected_connection,
+        expected_lifecycle,
+        false,
+    )?;
+    Ok(StrictSuspendOutcome::Orphaned)
 }
 
 /// Escalating kill for a hung agent's process group: wait 10s after the
@@ -490,10 +655,12 @@ impl SessionPool {
 
         let (existing, saved_session_id) = {
             let state = self.state.read().await;
-            (
-                state.active.get(thread_id).cloned(),
-                state.suspended.get(thread_id).cloned(),
-            )
+            let saved_session_id = state.suspended.get(thread_id).cloned().or_else(|| {
+                (self.session_context == SessionContextMode::OpenabV1)
+                    .then(|| state.persisted.get(thread_id).cloned())
+                    .flatten()
+            });
+            (state.active.get(thread_id).cloned(), saved_session_id)
         };
 
         let had_existing = existing.is_some();
@@ -560,6 +727,37 @@ impl SessionPool {
             }
         }
 
+        if self.session_context == SessionContextMode::OpenabV1 && !had_existing {
+            let at_capacity = self.state.read().await.active.len() >= self.max_sessions;
+            if at_capacity {
+                let Some((key, expected_connection, _, _, gate)) = eviction_candidate.as_ref()
+                else {
+                    return Err(anyhow!(
+                        "pool exhausted ({} sessions); no idle isolated session can be suspended",
+                        self.max_sessions
+                    ));
+                };
+                match try_suspend_strict_session(&self.state, key, expected_connection, gate, None)
+                    .await?
+                {
+                    StrictSuspendOutcome::Suspended => {
+                        info!(evicted = %key, "pool full, suspended isolated session before provisioning");
+                    }
+                    StrictSuspendOutcome::Orphaned => {
+                        return Err(anyhow!(
+                            "pool full; isolated session {key} was orphaned for reconciliation"
+                        ));
+                    }
+                    StrictSuspendOutcome::Skipped => {
+                        return Err(anyhow!(
+                            "pool exhausted ({} sessions); eviction candidate became busy",
+                            self.max_sessions
+                        ));
+                    }
+                }
+            }
+        }
+
         // Resolve effective working directory: stored per-session > explicit override > global config.
         // Stored value has highest priority to enforce immutability (ADR §4.5).
         let stored_workdir = {
@@ -590,7 +788,7 @@ impl SessionPool {
         new_conn.initialize().await?;
 
         let mut resumed = false;
-        let mut load_failed: Option<&str> = None;
+        let mut load_failed: Option<String> = None;
         if let Some(ref sid) = saved_session_id {
             if new_conn.supports_load_session {
                 match new_conn.session_load(sid, &effective_workdir).await {
@@ -602,13 +800,13 @@ impl SessionPool {
                         let err_str = e.to_string();
                         let is_transient =
                             TRANSIENT_LOAD_ERRORS.iter().any(|s| err_str.contains(s));
-                        if is_transient {
+                        if self.session_context == SessionContextMode::OpenabV1 || is_transient {
                             warn!(thread_id, session_id = %sid, error = %e,
-                                "session/load failed transiently, preserving session ID for retry");
+                                "session/load failed, preserving session ID for retry");
                             load_failed = Some(if err_str.contains("timeout waiting for") {
-                                "timeout"
+                                "timeout".to_string()
                             } else {
-                                "connection lost"
+                                err_str
                             });
                         } else {
                             warn!(thread_id, session_id = %sid, error = %e,
@@ -620,10 +818,10 @@ impl SessionPool {
         }
 
         if let Some(reason) = load_failed {
-            // session/load failed transiently. The original session ID is already
-            // in state.persisted (we haven't touched it), so the next message will
-            // retry session/load automatically. Return an error so the current message
-            // is not processed against a context-free session.
+            // The original session ID is already in state.persisted, so the
+            // next message retries session/load. Strict mode never falls back
+            // to session/new for a retained outer ID: that would bypass the
+            // controller's continuity and deletion fences.
             return Err(anyhow!(
                 "session load {reason}: could not restore previous session"
             ));
@@ -682,7 +880,9 @@ impl SessionPool {
             state.pgids.remove(thread_id);
         }
 
-        if state.active.len() >= self.max_sessions {
+        if self.session_context == SessionContextMode::None
+            && state.active.len() >= self.max_sessions
+        {
             if let Some((key, expected_conn, _, sid, gate)) = eviction_candidate {
                 if let Ok(_gate_guard) = gate.try_lock() {
                     if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
@@ -788,17 +988,38 @@ impl SessionPool {
             Box<dyn std::future::Future<Output = Result<R>> + Send + 'a>,
         >,
     {
-        let conn = {
+        let (connection, lifecycle_gate) = {
             let state = self.state.read().await;
-            state
+            let connection = state
                 .active
                 .get(thread_id)
                 .cloned()
-                .ok_or_else(|| anyhow!("no connection for thread {thread_id}"))?
+                .ok_or_else(|| anyhow!("no connection for thread {thread_id}"))?;
+            let gate = if self.session_context == SessionContextMode::OpenabV1 {
+                Some(state.creating.get(thread_id).cloned().ok_or_else(|| {
+                    anyhow!("isolated session for thread {thread_id} has no lifecycle gate")
+                })?)
+            } else {
+                None
+            };
+            (connection, gate)
         };
 
-        let mut conn = conn.lock().await;
-        f(&mut conn).await
+        let mut connection_guard = connection.lock().await;
+        if let Some(gate) = lifecycle_gate {
+            let _gate_guard = gate.lock().await;
+            let state = self.state.read().await;
+            let is_current = state
+                .active
+                .get(thread_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &connection));
+            if !is_current {
+                return Err(anyhow!(
+                    "session for thread {thread_id} changed before prompt dispatch"
+                ));
+            }
+        }
+        f(&mut connection_guard).await
     }
 
     /// Get cached configOptions for a session (e.g. available models).
@@ -957,7 +1178,120 @@ impl SessionPool {
         }
     }
 
+    async fn cleanup_idle_strict(&self, ttl_secs: u64) {
+        let cutoff = Instant::now() - std::time::Duration::from_secs(ttl_secs);
+        let hung_threshold = std::time::Duration::from_secs(self.hung_threshold_secs);
+        let snapshot = {
+            let state = self.state.read().await;
+            let active_count = state.active.len();
+            let snapshot: Vec<_> = state
+                .active
+                .iter()
+                .filter_map(|(key, connection)| {
+                    Some((
+                        key.clone(),
+                        Arc::clone(connection),
+                        Arc::clone(state.creating.get(key)?),
+                        Arc::clone(state.lifecycle_handles.get(key)?),
+                        Arc::clone(state.activity.get(key)?),
+                        state.pgids.get(key).copied(),
+                    ))
+                })
+                .collect();
+            if snapshot.len() != active_count {
+                warn!(
+                    active_count,
+                    complete_count = snapshot.len(),
+                    "isolated session pool contains incomplete lifecycle entries"
+                );
+            }
+            snapshot
+        };
+
+        for (key, connection, gate, lifecycle, activity, pgid) in snapshot {
+            match connection.try_lock() {
+                Ok(connection_guard) => {
+                    if activity.in_flight() {
+                        activity.set_in_flight(false);
+                        activity.touch();
+                    }
+                    if !classify_idle(
+                        connection_guard.last_active,
+                        connection_guard.alive(),
+                        cutoff,
+                    ) {
+                        continue;
+                    }
+                    drop(connection_guard);
+                    match try_suspend_strict_session(
+                        &self.state,
+                        &key,
+                        &connection,
+                        &gate,
+                        Some(cutoff),
+                    )
+                    .await
+                    {
+                        Ok(StrictSuspendOutcome::Suspended) => {
+                            info!(thread_id = %key, "suspended idle isolated session");
+                        }
+                        Ok(StrictSuspendOutcome::Orphaned) => {
+                            warn!(thread_id = %key, "dead isolated bridge detached as orphan");
+                        }
+                        Ok(StrictSuspendOutcome::Skipped) => {}
+                        Err(error) => {
+                            warn!(
+                                thread_id = %key,
+                                %error,
+                                "isolated session close failed during idle cleanup"
+                            );
+                        }
+                    }
+                }
+                Err(_) if classify_hung(activity.in_flight(), activity.age(), hung_threshold) => {
+                    match orphan_hung_strict_session(
+                        &self.state,
+                        &key,
+                        &connection,
+                        &lifecycle,
+                        &activity,
+                        &gate,
+                        hung_threshold,
+                    )
+                    .await
+                    {
+                        Ok(StrictSuspendOutcome::Orphaned) => {
+                            warn!(
+                                thread_id = %key,
+                                age_secs = activity.age().as_secs(),
+                                "hung isolated bridge detached as orphan"
+                            );
+                            tokio::spawn(async move {
+                                let _ = lifecycle.cancel().await;
+                                kill_pgid_after_grace(pgid).await;
+                            });
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            warn!(
+                                thread_id = %key,
+                                %error,
+                                "failed to detach hung isolated bridge"
+                            );
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
     pub async fn cleanup_idle(&self, ttl_secs: u64) {
+        if self.session_context == SessionContextMode::OpenabV1 {
+            self.cleanup_idle_strict(ttl_secs).await;
+            return;
+        }
+
         let cutoff = Instant::now() - std::time::Duration::from_secs(ttl_secs);
         let hung_threshold = std::time::Duration::from_secs(self.hung_threshold_secs);
 
@@ -1136,10 +1470,10 @@ impl SessionPool {
 #[cfg(test)]
 mod tests {
     use super::{
-        better_candidate, classify_hung, classify_idle, get_or_insert_gate, purge_session_entries,
-        release_strict_session, remove_if_same_handle, resolve_effective_workdir,
-        rollback_uncommitted_session, session_spawn_context, write_mapping_file, PoolState,
-        SessionPool,
+        better_candidate, classify_hung, classify_idle, get_or_insert_gate,
+        orphan_hung_strict_session, purge_session_entries, release_strict_session,
+        remove_if_same_handle, resolve_effective_workdir, rollback_uncommitted_session,
+        session_spawn_context, write_mapping_file, PoolState, SessionPool, StrictSuspendOutcome,
     };
     use crate::acp::connection::{
         LifecycleCapabilities, LifecycleHandle, SessionActivity, SessionLifecycleControl,
@@ -1148,7 +1482,7 @@ mod tests {
     use crate::config::AgentConfig;
     use anyhow::{anyhow, Result};
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::sync::{Mutex, Notify, RwLock};
     use tokio::time::Instant;
@@ -1247,26 +1581,17 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn strict_test_pool(temp: &std::path::Path, max_sessions: usize) -> SessionPool {
-        let script = r#"
-while IFS= read -r line; do
-  case "$line" in
-    *'"method":"initialize"'*)
-      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"sessionCapabilities":{"close":{},"_meta":{"openab.dev":{"sessionRelease":{"version":1}}}}}}}'
-      ;;
-    *'"method":"session/new"'*)
-      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"outer-session"}}'
-      ;;
-    *'"method":"_openab/session/release"'*)
-      printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{}}'
-      ;;
-  esac
-done
-"#;
+    fn strict_pool_from_script(
+        temp: &std::path::Path,
+        max_sessions: usize,
+        script: &str,
+        env: HashMap<String, String>,
+    ) -> SessionPool {
         let config = AgentConfig {
             command: "/bin/sh".to_string(),
             args: vec!["-c".to_string(), script.to_string()],
             working_dir: temp.display().to_string(),
+            env,
             ..AgentConfig::default()
         };
         SessionPool::new_with_paths(
@@ -1279,6 +1604,32 @@ done
         )
         .try_with_session_context(SessionContextMode::OpenabV1)
         .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn strict_test_pool(temp: &std::path::Path, max_sessions: usize) -> SessionPool {
+        let script = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"sessionCapabilities":{"close":{},"_meta":{"openab.dev":{"sessionRelease":{"version":1}}}}}}}'
+      ;;
+    *'"method":"session/new"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"outer-session"}}'
+      ;;
+    *'"method":"session/load"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
+      ;;
+    *'"method":"session/close"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{}}'
+      ;;
+    *'"method":"_openab/session/release"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{}}'
+      ;;
+  esac
+done
+"#;
+        strict_pool_from_script(temp, max_sessions, script, HashMap::new())
     }
 
     #[test]
@@ -1714,6 +2065,262 @@ done
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn hung_orphan_rechecks_a_turn_that_completed_after_classification() {
+        let temp = tempfile::tempdir().unwrap();
+        let pool = strict_test_pool(temp.path(), 1);
+        assert!(pool.get_or_create("discord:thread", None).await.unwrap());
+        let (connection, lifecycle, activity, gate) = {
+            let state = pool.state.read().await;
+            (
+                Arc::clone(state.active.get("discord:thread").unwrap()),
+                Arc::clone(state.lifecycle_handles.get("discord:thread").unwrap()),
+                Arc::clone(state.activity.get("discord:thread").unwrap()),
+                Arc::clone(state.creating.get("discord:thread").unwrap()),
+            )
+        };
+        activity.set_in_flight(true);
+        activity.set_last_active_ms(0);
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        assert!(classify_hung(
+            activity.in_flight(),
+            activity.age(),
+            std::time::Duration::ZERO,
+        ));
+
+        let outcome = orphan_hung_strict_session(
+            &pool.state,
+            "discord:thread",
+            &connection,
+            &lifecycle,
+            &activity,
+            &gate,
+            std::time::Duration::ZERO,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, StrictSuspendOutcome::Skipped);
+        assert!(!activity.in_flight());
+        assert!(pool
+            .state
+            .read()
+            .await
+            .active
+            .contains_key("discord:thread"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn isolated_idle_cleanup_closes_before_marking_suspended() {
+        let temp = tempfile::tempdir().unwrap();
+        let pool = strict_test_pool(temp.path(), 1);
+        assert!(pool.get_or_create("discord:thread", None).await.unwrap());
+
+        pool.cleanup_idle(0).await;
+
+        let state = pool.state.read().await;
+        assert!(!state.active.contains_key("discord:thread"));
+        assert!(!state.lifecycle_handles.contains_key("discord:thread"));
+        assert_eq!(
+            state.persisted.get("discord:thread"),
+            Some(&"outer-session".to_string())
+        );
+        assert_eq!(
+            state.suspended.get("discord:thread"),
+            Some(&"outer-session".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn isolated_orphan_resumes_from_persisted_mapping() {
+        let temp = tempfile::tempdir().unwrap();
+        let pool = strict_test_pool(temp.path(), 1);
+        assert!(pool.get_or_create("discord:thread", None).await.unwrap());
+        let (connection, lifecycle, activity, gate) = {
+            let state = pool.state.read().await;
+            (
+                Arc::clone(state.active.get("discord:thread").unwrap()),
+                Arc::clone(state.lifecycle_handles.get("discord:thread").unwrap()),
+                Arc::clone(state.activity.get("discord:thread").unwrap()),
+                Arc::clone(state.creating.get("discord:thread").unwrap()),
+            )
+        };
+        activity.set_in_flight(true);
+        activity.set_last_active_ms(0);
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let connection_guard = connection.lock().await;
+
+        assert_eq!(
+            orphan_hung_strict_session(
+                &pool.state,
+                "discord:thread",
+                &connection,
+                &lifecycle,
+                &activity,
+                &gate,
+                std::time::Duration::ZERO,
+            )
+            .await
+            .unwrap(),
+            StrictSuspendOutcome::Orphaned
+        );
+        drop(connection_guard);
+        drop(lifecycle);
+        drop(connection);
+        {
+            let state = pool.state.read().await;
+            assert!(state.persisted.contains_key("discord:thread"));
+            assert!(!state.suspended.contains_key("discord:thread"));
+        }
+
+        assert!(!pool.get_or_create("discord:thread", None).await.unwrap());
+        let connection = {
+            let state = pool.state.read().await;
+            Arc::clone(state.active.get("discord:thread").unwrap())
+        };
+        assert!(!connection.lock().await.session_reset);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn isolated_capacity_closes_old_worker_before_provisioning_new_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("lifecycle.log");
+        let script = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"sessionCapabilities":{"close":{},"_meta":{"openab.dev":{"sessionRelease":{"version":1}}}}}}}'
+      ;;
+    *'"method":"session/new"'*)
+      printf 'new:%s\n' "$OPENAB_SESSION_KEY" >> "$LOG"
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"outer-session"}}'
+      ;;
+    *'"method":"session/close"'*)
+      printf 'close:%s\n' "$OPENAB_SESSION_KEY" >> "$LOG"
+      printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{}}'
+      ;;
+  esac
+done
+"#;
+        let pool = strict_pool_from_script(
+            temp.path(),
+            1,
+            script,
+            HashMap::from([("LOG".to_string(), log.display().to_string())]),
+        );
+        assert!(pool.get_or_create("discord:thread-a", None).await.unwrap());
+
+        assert!(pool.get_or_create("discord:thread-b", None).await.unwrap());
+
+        let events = std::fs::read_to_string(log).unwrap();
+        assert_eq!(
+            events.lines().collect::<Vec<_>>(),
+            vec![
+                "new:discord:thread-a",
+                "close:discord:thread-a",
+                "new:discord:thread-b"
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn isolated_capacity_does_not_provision_after_close_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("lifecycle.log");
+        let script = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"sessionCapabilities":{"close":{},"_meta":{"openab.dev":{"sessionRelease":{"version":1}}}}}}}'
+      ;;
+    *'"method":"session/new"'*)
+      printf 'new:%s\n' "$OPENAB_SESSION_KEY" >> "$LOG"
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"outer-session"}}'
+      ;;
+    *'"method":"session/close"'*)
+      printf 'close:%s\n' "$OPENAB_SESSION_KEY" >> "$LOG"
+      printf '%s\n' '{"jsonrpc":"2.0","id":3,"error":{"code":-32000,"message":"close failed"}}'
+      ;;
+  esac
+done
+"#;
+        let pool = strict_pool_from_script(
+            temp.path(),
+            1,
+            script,
+            HashMap::from([("LOG".to_string(), log.display().to_string())]),
+        );
+        assert!(pool.get_or_create("discord:thread-a", None).await.unwrap());
+
+        let error = pool
+            .get_or_create("discord:thread-b", None)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("orphaned"));
+        let events = std::fs::read_to_string(log).unwrap();
+        assert_eq!(
+            events.lines().collect::<Vec<_>>(),
+            vec!["new:discord:thread-a", "close:discord:thread-a"]
+        );
+        let state = pool.state.read().await;
+        assert!(!state.active.contains_key("discord:thread-a"));
+        assert!(state.persisted.contains_key("discord:thread-a"));
+        assert!(!state.suspended.contains_key("discord:thread-a"));
+        assert!(!state.persisted.contains_key("discord:thread-b"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn isolated_load_failure_never_falls_back_to_session_new() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("unexpected-new");
+        write_mapping_file(
+            &temp.path().join("thread_map.json"),
+            &HashMap::from([("discord:thread".to_string(), "outer-session".to_string())]),
+        )
+        .unwrap();
+        let script = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"sessionCapabilities":{"close":{},"_meta":{"openab.dev":{"sessionRelease":{"version":1}}}}}}}'
+      ;;
+    *'"method":"session/load"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"retained state unavailable"}}'
+      ;;
+    *'"method":"session/new"'*)
+      printf '%s' new > "$MARKER"
+      printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"replacement"}}'
+      ;;
+  esac
+done
+"#;
+        let pool = strict_pool_from_script(
+            temp.path(),
+            1,
+            script,
+            HashMap::from([("MARKER".to_string(), marker.display().to_string())]),
+        );
+
+        let error = pool
+            .get_or_create("discord:thread", None)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("could not restore"));
+        assert!(!marker.exists());
+        assert_eq!(
+            pool.state.read().await.persisted.get("discord:thread"),
+            Some(&"outer-session".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn capacity_eviction_skips_session_in_a_lifecycle_transition() {
         let temp = tempfile::tempdir().unwrap();
         let pool = strict_test_pool(temp.path(), 1);
@@ -1733,6 +2340,50 @@ done
         let state = pool.state.read().await;
         assert!(state.active.contains_key("discord:thread-a"));
         assert!(!state.active.contains_key("discord:thread-b"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn isolated_prompt_rejects_a_connection_removed_while_queued() {
+        let temp = tempfile::tempdir().unwrap();
+        let pool = Arc::new(strict_test_pool(temp.path(), 1));
+        assert!(pool.get_or_create("discord:thread", None).await.unwrap());
+        let (connection, gate) = {
+            let state = pool.state.read().await;
+            (
+                Arc::clone(state.active.get("discord:thread").unwrap()),
+                Arc::clone(state.creating.get("discord:thread").unwrap()),
+            )
+        };
+        let connection_guard = connection.lock().await;
+        let closure_called = Arc::new(AtomicBool::new(false));
+        let queued = tokio::spawn({
+            let pool = Arc::clone(&pool);
+            let closure_called = Arc::clone(&closure_called);
+            async move {
+                pool.with_connection("discord:thread", move |_| {
+                    closure_called.store(true, Ordering::Relaxed);
+                    Box::pin(async { Ok(()) })
+                })
+                .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while Arc::strong_count(&connection) < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued prompt should capture the connection");
+
+        let lifecycle_guard = gate.lock().await;
+        pool.state.write().await.active.remove("discord:thread");
+        drop(lifecycle_guard);
+        drop(connection_guard);
+
+        let error = queued.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("changed before prompt dispatch"));
+        assert!(!closure_called.load(Ordering::Relaxed));
     }
 
     #[tokio::test]
