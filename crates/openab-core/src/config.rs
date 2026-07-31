@@ -1625,9 +1625,6 @@ struct AgentConfigRaw {
     working_dir: String,
     env: HashMap<String, String>,
     inherit_env: Vec<String>,
-    /// Reserved compatibility trap: session context is internal bridge
-    /// plumbing, not a user-facing isolation switch.
-    session_context: Option<String>,
 }
 
 impl Default for AgentConfigRaw {
@@ -1638,7 +1635,6 @@ impl Default for AgentConfigRaw {
             working_dir: default_working_dir(),
             env: HashMap::new(),
             inherit_env: Vec::new(),
-            session_context: None,
         }
     }
 }
@@ -1673,11 +1669,6 @@ impl<'de> serde::Deserialize<'de> for AgentConfig {
         D: serde::Deserializer<'de>,
     {
         let raw = AgentConfigRaw::deserialize(deserializer)?;
-        if raw.session_context.is_some() {
-            return Err(serde::de::Error::custom(
-                "agent.session_context is internal; use [kubernetes_session] to enable isolation",
-            ));
-        }
         let cmd_explicit = raw.command.is_some();
         let command = raw.command.unwrap_or_else(default_agent_command);
         // If command was explicitly set but args was not, default args to []
@@ -2597,13 +2588,16 @@ inherit_env = ["HTTPS_PROXY"]
     }
 
     #[test]
-    fn agent_session_context_is_not_a_user_facing_switch() {
-        let err = parse_config_str(
+    fn unknown_agent_session_context_is_ignored_and_keeps_isolation_disabled() {
+        let cfg = parse_config_str(
             "[discord]\nbot_token = \"x\"\n[agent]\nsession_context = \"openab-v1\"\n",
             "test",
         )
-        .unwrap_err();
-        assert!(err.to_string().contains("use [kubernetes_session]"));
+        .unwrap();
+
+        assert!(cfg.kubernetes_session.is_none());
+        assert_ne!(cfg.agent.command, "openab-kubernetes-session");
+        assert!(!cfg.agent.command_explicit);
     }
 
     #[test]
