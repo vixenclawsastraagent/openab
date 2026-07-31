@@ -1,11 +1,6 @@
 [workspace]
-members = [
-    "crates/openab-core",
-    "crates/openab-gateway",
-    "crates/openab-kubernetes-session",
-    "crates/openab-mcp",
-]
-exclude = ["openab-agent", "crates/platform-schema"]
+members = ["crates/openab-core", "crates/openab-gateway", "crates/openab-mcp"]
+exclude = ["openab-agent", "crates/platform-schema", "crates/openab-kubernetes-session"]
 
 [package]
 name = "openab"

@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
+# This add-on owns its dependency graph and release artifacts independently of
+# the default OpenAB workspace.
+[workspace]
+
 [features]
 default = []
 controller = ["dep:k8s-openapi", "dep:kube"]
