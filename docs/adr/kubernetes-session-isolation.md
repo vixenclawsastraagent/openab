@@ -279,20 +279,62 @@ The core seam will use stable standard ACP lifecycle methods where available:
   suspension; and
 - `session/cancel` for only the current in-flight turn.
 
+The bridge must also advertise `loadSession = true`; otherwise a retained
+session could not be resumed or destructively released after its worker Pod
+was suspended.
+
 ACP [stabilized `session/close` on 23 April
 2026](https://agentclientprotocol.com/announcements/session-close-stabilized).
 Capability support is detected by the presence of the
 `sessionCapabilities.close` object, not a boolean value.
 
-[`session/delete` remains a Draft ACP
-RFD](https://agentclientprotocol.com/rfds/session-delete) at this baseline, so
-destructive cleanup will not depend on it. The add-on bridge instead negotiates
-a versioned `_openab/session/release` extension for destructive reset and
-retention expiry. ACP reserves method names beginning with `_` for custom use.
-The extension is sent only to a bridge that explicitly advertised the matching
-OpenAB lifecycle capability; ordinary ACP agents never receive it. A future
-change may adopt `session/delete` after it stabilizes without changing the
-controller's internal destroy operation.
+ACP also [stabilized `session/delete` on 5 June
+2026](https://agentclientprotocol.com/announcements/session-delete-stabilized),
+but its contract only removes a session from future `session/list` results.
+The protocol explicitly leaves soft versus hard deletion, deletion of an
+active session, and later `session/load` behavior implementation-defined.
+OpenAB therefore cannot treat a generic successful `session/delete` response
+as proof that a Kubernetes controller durably accepted Pod and PVC cleanup.
+
+The add-on bridge instead negotiates this stronger extension:
+
+```json
+{
+  "agentCapabilities": {
+    "sessionCapabilities": {
+      "close": {},
+      "_meta": {
+        "openab.dev": {
+          "sessionRelease": {"version": 1}
+        }
+      }
+    }
+  }
+}
+```
+
+After that exact capability is observed, destructive reset may send:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 42,
+  "method": "_openab/session/release",
+  "params": {"sessionId": "outer-session-id"}
+}
+```
+
+The bridge returns `{"result": {}}` only after the controller has
+generation-fenced the lifecycle anchor into `Deleting` and made the cleanup
+intent durable. The acknowledgement is idempotent and transfers responsibility
+for eventual finalizer completion to the controller; it does not claim that
+the backing disk has already disappeared. A timeout, transport error, protocol
+error, or non-object result preserves the broker mapping.
+
+ACP [reserves method names beginning with `_` for custom
+extensions](https://agentclientprotocol.com/protocol/v1/extensibility). The
+extension is sent only to an isolated-session bridge that advertised the exact
+OpenAB capability. Ordinary ACP agents never receive it.
 
 The pool must perform lifecycle work outside the global pool-state lock. A
 lock-free control handle will carry the ACP stdin, pending-response channel,
@@ -359,9 +401,14 @@ Destructive cleanup is ordered and idempotent:
 3. wait until that exact Pod UID is gone;
 4. delete the PVC using a UID precondition and observe finalizer completion;
 5. delete the generation Secret and tokenless ServiceAccount; and
-6. request anchor deletion using UID and `resourceVersion` preconditions; and
-7. retain the session mapping until a subsequent read observes that exact
-   anchor as absent.
+6. request anchor deletion using UID and `resourceVersion` preconditions.
+
+The destructive release acknowledgement is allowed after step 1 is durably
+observed. At that point the broker may remove its resumable-session mapping,
+while the controller remains responsible for steps 2 through 6. A new ensure
+for the same deterministic session identity must report deletion in progress;
+it cannot create or adopt replacement resources until a later read observes
+the exact old anchor as absent.
 
 The controller uses idempotent create-or-observe operations. A replacement Pod
 is not created until the previous Pod UID is observed deleted. An

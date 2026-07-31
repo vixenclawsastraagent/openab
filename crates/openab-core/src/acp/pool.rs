@@ -1,4 +1,6 @@
-use crate::acp::connection::{AcpConnection, SessionActivity, SessionSpawnContext};
+use crate::acp::connection::{
+    AcpConnection, LifecycleHandle, SessionActivity, SessionSpawnContext,
+};
 use crate::acp::protocol::ConfigOption;
 use crate::acp::SessionContextMode;
 use crate::config::AgentConfig;
@@ -23,6 +25,9 @@ struct PoolState {
     /// Lock-free cancel handles: thread_key → (stdin, session_id).
     /// Stored separately so cancel can work without locking the connection.
     cancel_handles: HashMap<String, CancelHandle>,
+    /// Acknowledged lifecycle controls exist only for explicitly configured
+    /// isolated-session bridges.
+    lifecycle_handles: HashMap<String, LifecycleHandle>,
     /// Lock-free activity handles for hung-session detection without the connection mutex.
     activity: HashMap<String, Arc<SessionActivity>>,
     /// Child process-group ids, captured at insert time so hung eviction can
@@ -123,6 +128,7 @@ fn better_candidate(current_oldest: Option<Instant>, candidate_last_active: Inst
 /// process still owns an in-flight turn. Mirror `reset_session` instead.
 fn purge_session_entries(state: &mut PoolState, key: &str) {
     state.cancel_handles.remove(key);
+    state.lifecycle_handles.remove(key);
     state.activity.remove(key);
     state.pgids.remove(key);
     state.suspended.remove(key);
@@ -132,6 +138,35 @@ fn purge_session_entries(state: &mut PoolState, key: &str) {
     // a concurrent get_or_create mint a fresh gate and run two creations for
     // the same key.
     state.session_workdirs.remove(key);
+}
+
+async fn release_strict_session(
+    state: &RwLock<PoolState>,
+    key: &str,
+    expected: &LifecycleHandle,
+) -> Result<()> {
+    if !expected.capabilities().release_v1 {
+        return Err(anyhow!(
+            "_openab/session/release capability was not advertised"
+        ));
+    }
+
+    expected.release().await?;
+
+    let mut state = state.write().await;
+    let same_handle = state
+        .lifecycle_handles
+        .get(key)
+        .is_some_and(|current| Arc::ptr_eq(current, expected));
+    if !same_handle {
+        return Err(anyhow!(
+            "session lifecycle handle changed during release acknowledgement"
+        ));
+    }
+
+    state.active.remove(key);
+    purge_session_entries(&mut state, key);
+    Ok(())
 }
 
 /// Escalating kill for a hung agent's process group: wait 10s after the
@@ -196,6 +231,7 @@ impl SessionPool {
             state: RwLock::new(PoolState {
                 active: HashMap::new(),
                 cancel_handles: HashMap::new(),
+                lifecycle_handles: HashMap::new(),
                 activity: HashMap::new(),
                 pgids: HashMap::new(),
                 persisted: suspended.clone(),
@@ -443,6 +479,14 @@ impl SessionPool {
         }
 
         let cancel_handle = new_conn.cancel_handle();
+        let lifecycle_handle = match self.session_context {
+            SessionContextMode::None => None,
+            SessionContextMode::OpenabV1 => Some(
+                new_conn
+                    .lifecycle_handle()
+                    .ok_or_else(|| anyhow!("isolated session bridge has no ACP session ID"))?,
+            ),
+        };
         let activity_handle = new_conn.activity_handle();
         let child_pgid = new_conn.child_pgid();
         let cancel_session_id = new_conn.acp_session_id.clone().unwrap_or_default();
@@ -463,6 +507,7 @@ impl SessionPool {
             drop(existing);
             state.active.remove(thread_id);
             state.cancel_handles.remove(thread_id);
+            state.lifecycle_handles.remove(thread_id);
             state.activity.remove(thread_id);
             state.pgids.remove(thread_id);
         }
@@ -471,6 +516,7 @@ impl SessionPool {
             if let Some((key, expected_conn, _, sid)) = eviction_candidate {
                 if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
                     state.cancel_handles.remove(&key);
+                    state.lifecycle_handles.remove(&key);
                     state.activity.remove(&key);
                     state.pgids.remove(&key);
                     info!(evicted = %key, "pool full, suspending oldest idle session");
@@ -505,6 +551,11 @@ impl SessionPool {
         }
         state.suspended.remove(thread_id);
         state.active.insert(thread_id.to_string(), new_conn);
+        if let Some(lifecycle_handle) = lifecycle_handle {
+            state
+                .lifecycle_handles
+                .insert(thread_id.to_string(), lifecycle_handle);
+        }
         state
             .activity
             .insert(thread_id.to_string(), activity_handle);
@@ -610,6 +661,18 @@ impl SessionPool {
     /// Cancel the current in-flight operation for a session.
     /// Uses pre-stored cancel handles to avoid locking the connection (which is held during streaming).
     pub async fn cancel_session(&self, thread_id: &str) -> Result<()> {
+        if self.session_context == SessionContextMode::OpenabV1 {
+            let lifecycle = {
+                let state = self.state.read().await;
+                state
+                    .lifecycle_handles
+                    .get(thread_id)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("no isolated session for thread {thread_id}"))?
+            };
+            return lifecycle.cancel().await;
+        }
+
         let (stdin, session_id) = {
             let state = self.state.read().await;
             state
@@ -637,6 +700,36 @@ impl SessionPool {
     /// Arc reference is dropped (after streaming finishes). The next message will
     /// trigger a fresh `get_or_create` with a new ACP session.
     pub async fn reset_session(&self, thread_id: &str) -> Result<()> {
+        if self.session_context == SessionContextMode::OpenabV1 {
+            let create_gate = {
+                let mut state = self.state.write().await;
+                get_or_insert_gate(&mut state.creating, thread_id)
+            };
+            let _create_guard = create_gate.lock().await;
+
+            let lifecycle = {
+                let state = self.state.read().await;
+                if !state.active.contains_key(thread_id) {
+                    return Err(anyhow!("no active isolated session for thread {thread_id}"));
+                }
+                state
+                    .lifecycle_handles
+                    .get(thread_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow!("isolated session for thread {thread_id} has no lifecycle handle")
+                    })?
+            };
+
+            release_strict_session(&self.state, thread_id, &lifecycle).await?;
+
+            let state = self.state.read().await;
+            self.save_mapping(&state.persisted);
+            self.save_meta(&state.session_workdirs);
+            info!(thread_id, "isolated session released");
+            return Ok(());
+        }
+
         // Send session/cancel via the lock-free stdin handle first.
         // This stops in-flight streaming even while with_connection() holds the
         // connection mutex, so the old process finishes promptly.
@@ -660,6 +753,7 @@ impl SessionPool {
         let mut state = self.state.write().await;
         let had_active = state.active.remove(thread_id).is_some();
         state.cancel_handles.remove(thread_id);
+        state.lifecycle_handles.remove(thread_id);
         state.activity.remove(thread_id);
         state.pgids.remove(thread_id);
         state.suspended.remove(thread_id);
@@ -773,6 +867,7 @@ impl SessionPool {
             if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
                 info!(thread_id = %key, "cleaning up idle session");
                 state.cancel_handles.remove(&key);
+                state.lifecycle_handles.remove(&key);
                 state.activity.remove(&key);
                 state.pgids.remove(&key);
                 if let Some(sid) = sid {
@@ -823,6 +918,7 @@ impl SessionPool {
         let count = state.active.len();
         state.active.clear();
         state.cancel_handles.clear();
+        state.lifecycle_handles.clear();
         state.activity.clear();
         state.pgids.clear();
         info!(count, "pool shutdown complete");
@@ -833,14 +929,100 @@ impl SessionPool {
 mod tests {
     use super::{
         better_candidate, classify_hung, classify_idle, get_or_insert_gate, purge_session_entries,
-        remove_if_same_handle, session_spawn_context, PoolState,
+        release_strict_session, remove_if_same_handle, session_spawn_context, PoolState,
     };
-    use crate::acp::connection::SessionActivity;
+    use crate::acp::connection::{
+        LifecycleCapabilities, LifecycleHandle, SessionActivity, SessionLifecycleControl,
+    };
     use crate::acp::SessionContextMode;
+    use anyhow::{anyhow, Result};
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-    use tokio::sync::Mutex;
+    use tokio::sync::{Mutex, Notify, RwLock};
     use tokio::time::Instant;
+
+    #[derive(Clone, Copy)]
+    enum ReleaseBehavior {
+        Succeed,
+        Fail,
+        Block,
+    }
+
+    struct FakeLifecycle {
+        capabilities: LifecycleCapabilities,
+        release_calls: AtomicUsize,
+        behavior: ReleaseBehavior,
+        release_started: Notify,
+        release_continue: Notify,
+    }
+
+    impl FakeLifecycle {
+        fn new(behavior: ReleaseBehavior) -> Arc<Self> {
+            Arc::new(Self {
+                capabilities: LifecycleCapabilities {
+                    close: true,
+                    release_v1: true,
+                },
+                release_calls: AtomicUsize::new(0),
+                behavior,
+                release_started: Notify::new(),
+                release_continue: Notify::new(),
+            })
+        }
+
+        fn unsupported() -> Arc<Self> {
+            Arc::new(Self {
+                capabilities: LifecycleCapabilities::default(),
+                release_calls: AtomicUsize::new(0),
+                behavior: ReleaseBehavior::Succeed,
+                release_started: Notify::new(),
+                release_continue: Notify::new(),
+            })
+        }
+
+        fn handle(self: &Arc<Self>) -> LifecycleHandle {
+            Arc::clone(self) as LifecycleHandle
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SessionLifecycleControl for FakeLifecycle {
+        fn capabilities(&self) -> LifecycleCapabilities {
+            self.capabilities
+        }
+
+        async fn cancel(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn release(&self) -> Result<()> {
+            self.release_calls.fetch_add(1, Ordering::Relaxed);
+            self.release_started.notify_waiters();
+            match self.behavior {
+                ReleaseBehavior::Succeed => Ok(()),
+                ReleaseBehavior::Fail => Err(anyhow!("controller rejected release")),
+                ReleaseBehavior::Block => {
+                    self.release_continue.notified().await;
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    fn strict_state(handle: LifecycleHandle) -> PoolState {
+        PoolState {
+            active: HashMap::new(),
+            cancel_handles: HashMap::new(),
+            lifecycle_handles: HashMap::from([("thread".to_string(), handle)]),
+            activity: HashMap::new(),
+            pgids: HashMap::new(),
+            suspended: HashMap::from([("thread".to_string(), "outer-session".to_string())]),
+            persisted: HashMap::from([("thread".to_string(), "outer-session".to_string())]),
+            creating: HashMap::from([("thread".to_string(), Arc::new(Mutex::new(())))]),
+            session_workdirs: HashMap::from([("thread".to_string(), "/private/ws".to_string())]),
+        }
+    }
 
     #[test]
     fn session_context_none_has_no_spawn_context() {
@@ -983,6 +1165,7 @@ mod tests {
         let mut state = PoolState {
             active: HashMap::new(),
             cancel_handles: HashMap::new(),
+            lifecycle_handles: HashMap::new(),
             activity: HashMap::from([
                 ("hung".to_string(), Arc::new(SessionActivity::new())),
                 ("other".to_string(), Arc::new(SessionActivity::new())),
@@ -1048,5 +1231,94 @@ mod tests {
             roundtrip.get("suspended-thread"),
             Some(&"session-suspended".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn strict_reset_keeps_state_until_release_ack() {
+        let fake = FakeLifecycle::new(ReleaseBehavior::Block);
+        let handle = fake.handle();
+        let state = Arc::new(RwLock::new(strict_state(Arc::clone(&handle))));
+        let started = fake.release_started.notified();
+        let release = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move { release_strict_session(&state, "thread", &handle).await }
+        });
+
+        started.await;
+        assert!(state.read().await.persisted.contains_key("thread"));
+        fake.release_continue.notify_waiters();
+        release.await.unwrap().unwrap();
+
+        let state = state.read().await;
+        assert!(!state.persisted.contains_key("thread"));
+        assert!(!state.suspended.contains_key("thread"));
+        assert!(!state.session_workdirs.contains_key("thread"));
+        assert!(!state.lifecycle_handles.contains_key("thread"));
+        assert!(
+            state.creating.contains_key("thread"),
+            "strict reset must preserve the creation gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_reset_preserves_state_when_release_fails() {
+        let fake = FakeLifecycle::new(ReleaseBehavior::Fail);
+        let handle = fake.handle();
+        let state = RwLock::new(strict_state(Arc::clone(&handle)));
+
+        let error = release_strict_session(&state, "thread", &handle)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("controller rejected release"));
+        let state = state.read().await;
+        assert!(state.persisted.contains_key("thread"));
+        assert!(state.suspended.contains_key("thread"));
+        assert!(state.session_workdirs.contains_key("thread"));
+        assert!(state.lifecycle_handles.contains_key("thread"));
+    }
+
+    #[tokio::test]
+    async fn strict_reset_rejects_unadvertised_release_without_calling_it() {
+        let fake = FakeLifecycle::unsupported();
+        let handle = fake.handle();
+        let state = RwLock::new(strict_state(Arc::clone(&handle)));
+
+        let error = release_strict_session(&state, "thread", &handle)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("not advertised"));
+        assert_eq!(fake.release_calls.load(Ordering::Relaxed), 0);
+        assert!(state.read().await.persisted.contains_key("thread"));
+    }
+
+    #[tokio::test]
+    async fn strict_reset_does_not_remove_a_replacement_handle() {
+        let stale = FakeLifecycle::new(ReleaseBehavior::Block);
+        let stale_handle = stale.handle();
+        let replacement = FakeLifecycle::new(ReleaseBehavior::Succeed);
+        let replacement_handle = replacement.handle();
+        let state = Arc::new(RwLock::new(strict_state(Arc::clone(&stale_handle))));
+        let started = stale.release_started.notified();
+        let release = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move { release_strict_session(&state, "thread", &stale_handle).await }
+        });
+
+        started.await;
+        state
+            .write()
+            .await
+            .lifecycle_handles
+            .insert("thread".to_string(), Arc::clone(&replacement_handle));
+        stale.release_continue.notify_waiters();
+        let error = release.await.unwrap().unwrap_err();
+
+        assert!(error.to_string().contains("changed during release"));
+        let state = state.read().await;
+        assert!(state.persisted.contains_key("thread"));
+        let current = state.lifecycle_handles.get("thread").unwrap();
+        assert!(Arc::ptr_eq(current, &replacement_handle));
     }
 }
