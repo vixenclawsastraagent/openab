@@ -191,6 +191,33 @@ pub struct AcpConnection {
     _stderr_handle: Option<JoinHandle<()>>,
 }
 
+/// Broker-owned context injected when spawning an ACP process for a logical
+/// session. This is deliberately separate from operator-controlled `[agent]`
+/// environment configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionSpawnContext {
+    logical_session_key: String,
+}
+
+impl SessionSpawnContext {
+    pub(crate) fn new(logical_session_key: impl Into<String>) -> Self {
+        Self {
+            logical_session_key: logical_session_key.into(),
+        }
+    }
+}
+
+fn session_spawn_env(
+    context: Option<&SessionSpawnContext>,
+) -> Option<(&'static str, &str)> {
+    context.map(|context| {
+        (
+            super::SESSION_KEY_ENV,
+            context.logical_session_key.as_str(),
+        )
+    })
+}
+
 /// Build the final set of env vars for the agent subprocess.
 /// `explicit` ([agent].env) takes precedence over `inherit` ([agent].inherit_env).
 /// Returns (merged env map, list of keys that were inherited from the process).
@@ -325,12 +352,30 @@ pub(crate) async fn run_reader_loop<R, W>(
 }
 
 impl AcpConnection {
+    /// Spawn an ordinary ACP child process with no broker-owned session
+    /// context. This preserves the public API and existing local-agent
+    /// behavior.
     pub async fn spawn(
         command: &str,
         args: &[String],
         working_dir: &str,
         env: &std::collections::HashMap<String, String>,
         inherit_env: &[String],
+    ) -> Result<Self> {
+        Self::spawn_with_context(command, args, working_dir, env, inherit_env, None).await
+    }
+
+    /// Spawn an ACP child with optional broker-owned session context.
+    ///
+    /// Only an explicitly configured session-runtime bridge should use this
+    /// entry point. Ordinary local and AgentCore agents use [`Self::spawn`].
+    pub(crate) async fn spawn_with_context(
+        command: &str,
+        args: &[String],
+        working_dir: &str,
+        env: &std::collections::HashMap<String, String>,
+        inherit_env: &[String],
+        session_context: Option<&SessionSpawnContext>,
     ) -> Result<Self> {
         info!(cmd = command, ?args, cwd = working_dir, "spawning agent");
 
@@ -406,6 +451,11 @@ impl AcpConnection {
         let (agent_env, inherited_keys) = build_agent_env(env, inherit_env);
         for (k, v) in &agent_env {
             cmd.env(k, v);
+        }
+        if let Some((key, value)) = session_spawn_env(session_context) {
+            // Broker-owned context is applied after all operator-controlled
+            // environment sources so the reserved key cannot be spoofed.
+            cmd.env(key, value);
         }
         if !agent_env.is_empty() {
             let explicit_keys: Vec<&String> = env.keys().collect();
@@ -836,8 +886,69 @@ impl Drop for AcpConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_agent_env, build_permission_response, pick_best_option};
+    use super::{
+        build_agent_env, build_permission_response, pick_best_option, session_spawn_env,
+        SessionSpawnContext,
+    };
     use serde_json::json;
+
+    #[test]
+    fn no_session_spawn_context_adds_no_reserved_env() {
+        assert_eq!(session_spawn_env(None), None);
+    }
+
+    #[test]
+    fn openab_v1_session_spawn_context_maps_exact_logical_key() {
+        let context = SessionSpawnContext {
+            logical_session_key: "discord:thread-123".to_string(),
+        };
+
+        assert_eq!(
+            session_spawn_env(Some(&context)),
+            Some(("OPENAB_SESSION_KEY", "discord:thread-123"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn broker_session_key_overrides_programmatic_agent_env() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("session-key");
+        let args = vec![
+            "-c".to_string(),
+            r#"printf '%s' "$OPENAB_SESSION_KEY" > "$1""#.to_string(),
+            "openab-session-env-test".to_string(),
+            output.to_string_lossy().to_string(),
+        ];
+        let mut configured_env = std::collections::HashMap::new();
+        configured_env.insert("OPENAB_SESSION_KEY".to_string(), "spoofed".to_string());
+        let context = SessionSpawnContext::new("discord:thread-123");
+
+        let connection = super::AcpConnection::spawn_with_context(
+            "/bin/sh",
+            &args,
+            temp.path().to_string_lossy().as_ref(),
+            &configured_env,
+            &[],
+            Some(&context),
+        )
+        .await
+        .unwrap();
+
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(value) = tokio::fs::read_to_string(&output).await {
+                    break value;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(observed, "discord:thread-123");
+        drop(connection);
+    }
 
     #[test]
     fn picks_allow_always_over_other_options() {

@@ -85,7 +85,8 @@ fn default_mcp_listen() -> String {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct AgentCoreConfig {    /// AgentCore Runtime ARN (required)
+pub struct AgentCoreConfig {
+    /// AgentCore Runtime ARN (required)
     pub runtime_arn: String,
     /// ACP agent command to run in the PTY shell (default: kiro-cli acp --trust-all-tools)
     #[serde(default = "default_agentcore_shell_command")]
@@ -94,6 +95,27 @@ pub struct AgentCoreConfig {    /// AgentCore Runtime ARN (required)
     #[serde(default = "default_agentcore_cancel_strategy")]
     #[allow(dead_code)]
     pub cancel_strategy: AgentCoreCancelStrategy,
+}
+
+/// Opt-in Kubernetes session-isolation add-on configuration.
+///
+/// Presence selects the trusted ACP bridge instead of a local agent process.
+/// The bridge executable is packaged only in the add-on-flavoured image.
+#[derive(Debug, Clone, Deserialize)]
+pub struct KubernetesSessionConfig {
+    /// Authenticated controller relay endpoint.
+    pub controller_url: String,
+    /// Cluster-owned, versioned worker profile.
+    pub profile: String,
+    /// Stable team/agent ownership boundary for lifecycle state and quotas.
+    pub scope: String,
+    /// Projected credential read by the trusted bridge, never by workers.
+    #[serde(default = "default_kubernetes_session_credential_file")]
+    pub credential_file: String,
+}
+
+fn default_kubernetes_session_credential_file() -> String {
+    "/var/run/secrets/openab-session/token".to_string()
 }
 
 fn default_agentcore_shell_command() -> String {
@@ -197,6 +219,8 @@ pub struct Config {
     pub teams: Option<TeamsConfig>,
     pub feishu: Option<FeishuConfig>,
     pub agentcore: Option<AgentCoreConfig>,
+    /// Optional, default-off Kubernetes session-isolation runtime.
+    pub kubernetes_session: Option<KubernetesSessionConfig>,
     /// OAB MCP Facade (`[mcp]` — OAB MCP Adapter ADR §6.2/§6.3). Presence is
     /// the opt-in signal: absent = no facade, no listener, no new behavior.
     pub mcp: Option<McpFacadeConfig>,
@@ -1601,6 +1625,9 @@ struct AgentConfigRaw {
     working_dir: String,
     env: HashMap<String, String>,
     inherit_env: Vec<String>,
+    /// Reserved compatibility trap: session context is internal bridge
+    /// plumbing, not a user-facing isolation switch.
+    session_context: Option<String>,
 }
 
 impl Default for AgentConfigRaw {
@@ -1611,6 +1638,7 @@ impl Default for AgentConfigRaw {
             working_dir: default_working_dir(),
             env: HashMap::new(),
             inherit_env: Vec::new(),
+            session_context: None,
         }
     }
 }
@@ -1645,6 +1673,11 @@ impl<'de> serde::Deserialize<'de> for AgentConfig {
         D: serde::Deserializer<'de>,
     {
         let raw = AgentConfigRaw::deserialize(deserializer)?;
+        if raw.session_context.is_some() {
+            return Err(serde::de::Error::custom(
+                "agent.session_context is internal; use [kubernetes_session] to enable isolation",
+            ));
+        }
         let cmd_explicit = raw.command.is_some();
         let command = raw.command.unwrap_or_else(default_agent_command);
         // If command was explicitly set but args was not, default args to []
@@ -2159,9 +2192,82 @@ async fn load_config_from_url(url: &str) -> anyhow::Result<Config> {
     parse_config(&raw, url)
 }
 
+fn is_kubernetes_dns_label(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (1..=63).contains(&bytes.len())
+        && bytes
+            .first()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && bytes
+            .last()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+}
+
+fn has_reserved_session_env(agent: &AgentConfig) -> bool {
+    agent
+        .env
+        .keys()
+        .chain(agent.inherit_env.iter())
+        .any(|key| key.eq_ignore_ascii_case(crate::acp::SESSION_KEY_ENV))
+}
+
 fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
     let mut config: Config = toml::from_str(expanded)
         .map_err(|e| anyhow::anyhow!("failed to parse config from {source}: {e}"))?;
+
+    if let Some(ks) = config.kubernetes_session.clone() {
+        anyhow::ensure!(
+            config.agentcore.is_none(),
+            "[kubernetes_session] and [agentcore] are mutually exclusive"
+        );
+        anyhow::ensure!(
+            !config.agent.command_explicit,
+            "[kubernetes_session] cannot be combined with an explicit [agent].command"
+        );
+        anyhow::ensure!(
+            ks.controller_url.starts_with("wss://"),
+            "kubernetes_session.controller_url must use wss://"
+        );
+        anyhow::ensure!(
+            is_kubernetes_dns_label(&ks.profile),
+            "kubernetes_session.profile must be a lowercase Kubernetes DNS label"
+        );
+        anyhow::ensure!(
+            is_kubernetes_dns_label(&ks.scope),
+            "kubernetes_session.scope must be a lowercase Kubernetes DNS label"
+        );
+        anyhow::ensure!(
+            !ks.credential_file.trim().is_empty(),
+            "kubernetes_session.credential_file must not be empty"
+        );
+        anyhow::ensure!(
+            !has_reserved_session_env(&config.agent),
+            "[kubernetes_session] reserves {}; remove it from agent.env and agent.inherit_env",
+            crate::acp::SESSION_KEY_ENV
+        );
+
+        config.agent = AgentConfig {
+            command: "openab-kubernetes-session".to_string(),
+            args: vec![
+                "bridge".to_string(),
+                "--controller-url".to_string(),
+                ks.controller_url,
+                "--profile".to_string(),
+                ks.profile,
+                "--scope".to_string(),
+                ks.scope,
+                "--credential-file".to_string(),
+                ks.credential_file,
+            ],
+            working_dir: config.agent.working_dir.clone(),
+            env: config.agent.env.clone(),
+            inherit_env: config.agent.inherit_env.clone(),
+            command_explicit: true,
+        };
+    }
 
     // Resolve Discord shortcodes in reactions.mapping keys.
     // Allows operators to write `:thumbsup: = "OK"` instead of `"👍" = "OK"`.
@@ -2434,6 +2540,186 @@ fn default_ambient_context_flushes() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kubernetes_session_is_absent_by_default() {
+        let cfg = parse_config_str("[discord]\nbot_token = \"x\"\n", "test").unwrap();
+        assert!(cfg.kubernetes_session.is_none());
+        assert_ne!(cfg.agent.command, "openab-kubernetes-session");
+    }
+
+    #[test]
+    fn kubernetes_session_selects_bridge_and_preserves_bridge_env() {
+        let cfg = parse_config_str(
+            r#"
+[discord]
+bot_token = "x"
+
+[kubernetes_session]
+controller_url = "wss://session-controller.openab-system.svc/relay"
+profile = "codex-strict"
+scope = "team-a"
+
+[agent]
+inherit_env = ["HTTPS_PROXY"]
+"#,
+            "test",
+        )
+        .unwrap();
+
+        let runtime = cfg.kubernetes_session.unwrap();
+        assert_eq!(runtime.scope, "team-a");
+        assert_eq!(
+            runtime.credential_file,
+            "/var/run/secrets/openab-session/token"
+        );
+        assert_eq!(cfg.agent.command, "openab-kubernetes-session");
+        assert_eq!(
+            cfg.agent.args,
+            vec![
+                "bridge",
+                "--controller-url",
+                "wss://session-controller.openab-system.svc/relay",
+                "--profile",
+                "codex-strict",
+                "--scope",
+                "team-a",
+                "--credential-file",
+                "/var/run/secrets/openab-session/token",
+            ]
+        );
+        assert_eq!(cfg.agent.inherit_env, vec!["HTTPS_PROXY"]);
+    }
+
+    #[test]
+    fn agent_session_context_is_not_a_user_facing_switch() {
+        let err = parse_config_str(
+            "[discord]\nbot_token = \"x\"\n[agent]\nsession_context = \"openab-v1\"\n",
+            "test",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("use [kubernetes_session]"));
+    }
+
+    #[test]
+    fn kubernetes_session_rejects_configured_session_key_case_insensitively() {
+        let err = parse_config_str(
+            r#"
+[discord]
+bot_token = "x"
+
+[kubernetes_session]
+controller_url = "wss://session-controller.openab-system.svc/relay"
+profile = "codex-strict"
+scope = "team-a"
+
+[agent.env]
+openab_session_key = "spoofed"
+"#,
+            "test",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("OPENAB_SESSION_KEY"));
+    }
+
+    #[test]
+    fn kubernetes_session_rejects_inherited_session_key() {
+        let err = parse_config_str(
+            r#"
+[discord]
+bot_token = "x"
+
+[kubernetes_session]
+controller_url = "wss://session-controller.openab-system.svc/relay"
+profile = "codex-strict"
+scope = "team-a"
+
+[agent]
+inherit_env = ["OPENAB_SESSION_KEY"]
+"#,
+            "test",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("OPENAB_SESSION_KEY"));
+    }
+
+    #[test]
+    fn kubernetes_session_rejects_agentcore() {
+        let err = parse_config_str(
+            r#"
+[discord]
+bot_token = "x"
+
+[kubernetes_session]
+controller_url = "wss://session-controller.openab-system.svc/relay"
+profile = "codex-strict"
+scope = "team-a"
+
+[agentcore]
+runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/example"
+"#,
+            "test",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn kubernetes_session_rejects_explicit_local_command() {
+        let err = parse_config_str(
+            r#"
+[discord]
+bot_token = "x"
+
+[kubernetes_session]
+controller_url = "wss://session-controller.openab-system.svc/relay"
+profile = "codex-strict"
+scope = "team-a"
+
+[agent]
+command = "codex-acp"
+"#,
+            "test",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("explicit [agent].command"));
+    }
+
+    #[test]
+    fn kubernetes_session_rejects_insecure_controller_url() {
+        let err = parse_config_str(
+            r#"
+[discord]
+bot_token = "x"
+
+[kubernetes_session]
+controller_url = "ws://session-controller.openab-system.svc/relay"
+profile = "codex-strict"
+scope = "team-a"
+"#,
+            "test",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("must use wss://"));
+    }
+
+    #[test]
+    fn kubernetes_session_rejects_invalid_scope() {
+        let err = parse_config_str(
+            r#"
+[discord]
+bot_token = "x"
+
+[kubernetes_session]
+controller_url = "wss://session-controller.openab-system.svc/relay"
+profile = "codex-strict"
+scope = "Team A"
+"#,
+            "test",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("scope"));
+    }
 
     #[test]
     fn mcp_facade_absent_by_default() {

@@ -1232,6 +1232,19 @@ mod tests {
         assert_eq!(d.key("slack", "T2", "userA"), "slack:T2:userA");
     }
 
+    #[test]
+    fn session_key_is_platform_and_logical_thread_only() {
+        let channel = ChannelRef {
+            platform: "discord".into(),
+            channel_id: "parent-channel".into(),
+            thread_id: Some("thread-123".into()),
+            parent_id: Some("parent-channel".into()),
+            origin_event_id: None,
+        };
+
+        assert_eq!(Dispatcher::session_key(&channel), "discord:thread-123");
+    }
+
     fn insert_dummy_handle(d: &Dispatcher, key: &str) {
         let (tx, _rx) = tokio::sync::mpsc::channel::<BufferedMessage>(10);
         let consumer = tokio::spawn(async {});
@@ -1369,6 +1382,7 @@ mod tests {
         block_count: usize,
         other_bot_present: bool,
         dispatch_channel: ChannelRef,
+        session_key: String,
     }
 
     /// Mock `DispatchTarget` — records calls; never touches a real session pool.
@@ -1426,7 +1440,7 @@ mod tests {
         async fn stream_prompt_blocks(
             &self,
             _adapter: &Arc<dyn ChatAdapter>,
-            _session_key: &str,
+            session_key: &str,
             content_blocks: Vec<ContentBlock>,
             thread_channel: &ChannelRef,
             _reactions: Arc<StatusReactionController>,
@@ -1437,6 +1451,7 @@ mod tests {
                 block_count: content_blocks.len(),
                 other_bot_present,
                 dispatch_channel: thread_channel.clone(),
+                session_key: session_key.to_string(),
             });
             if let Some(msg) = self.stream_err.lock().unwrap().take() {
                 return Err(anyhow::anyhow!(msg));
@@ -1552,6 +1567,7 @@ mod tests {
         // pack_arrival_event with no extra_blocks → delimiter + prompt = 2 blocks.
         assert_eq!(calls[0].block_count, 2);
         assert!(!calls[0].other_bot_present);
+        assert_eq!(calls[0].session_key, "mock:T");
     }
 
     #[tokio::test]

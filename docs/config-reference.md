@@ -308,6 +308,39 @@ Full first-class Feishu/Lark section (config-first parity, #1377) — credential
 
 ---
 
+## `[kubernetes_session]`
+
+Selects the optional Kubernetes session-isolation add-on for this configured
+agent. The entire section is optional and default-off. When absent, OpenAB uses
+the existing local ACP or AgentCore path and creates no Kubernetes session
+state.
+
+The section requires the add-on-flavoured broker image and a separately
+installed controller for the configured scope. OpenAB fails closed if the
+bridge or controller is unavailable; it never falls back to a shared local
+agent process.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `controller_url` | string | required | Authenticated controller relay URL. Must use `wss://`. |
+| `profile` | string | required | Cluster-owned worker profile name as a lowercase Kubernetes DNS label. |
+| `scope` | string | required | Stable team/agent state-ownership scope as a lowercase Kubernetes DNS label. |
+| `credential_file` | string | `/var/run/secrets/openab-session/token` | Path to the projected broker-to-controller credential. The credential value is not stored in TOML. |
+
+```toml
+[kubernetes_session]
+controller_url = "wss://openab-session-controller.openab-system.svc/relay"
+profile = "codex-strict"
+scope = "team-a-openab-codex"
+```
+
+`[kubernetes_session]` is mutually exclusive with `[agentcore]` and an
+explicit `[agent].command`. The internal `OPENAB_SESSION_KEY` environment name
+is reserved in this mode and cannot appear in `[agent.env]` or
+`agent.inherit_env`.
+
+---
+
 ## `[agent]`
 
 The AI agent subprocess that OpenAB spawns to handle messages via ACP.

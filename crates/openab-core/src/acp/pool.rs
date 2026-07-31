@@ -1,5 +1,6 @@
-use crate::acp::connection::{AcpConnection, SessionActivity};
+use crate::acp::connection::{AcpConnection, SessionActivity, SessionSpawnContext};
 use crate::acp::protocol::ConfigOption;
+use crate::acp::SessionContextMode;
 use crate::config::AgentConfig;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
@@ -46,6 +47,7 @@ struct PoolState {
 pub struct SessionPool {
     state: RwLock<PoolState>,
     config: AgentConfig,
+    session_context: SessionContextMode,
     max_sessions: usize,
     /// Force-evict sessions stuck in-flight longer than this threshold
     /// (`prompt_hard_timeout_secs + hung_grace_secs`, wired in main.rs).
@@ -78,6 +80,16 @@ fn get_or_insert_gate(map: &mut HashMap<String, Arc<Mutex<()>>>, key: &str) -> A
     map.entry(key.to_string())
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone()
+}
+
+fn session_spawn_context(
+    mode: SessionContextMode,
+    logical_session_key: &str,
+) -> Option<SessionSpawnContext> {
+    match mode {
+        SessionContextMode::None => None,
+        SessionContextMode::OpenabV1 => Some(SessionSpawnContext::new(logical_session_key)),
+    }
 }
 
 /// Returns true when a session should be treated as stale during idle cleanup.
@@ -192,12 +204,21 @@ impl SessionPool {
                 session_workdirs,
             }),
             config,
+            session_context: SessionContextMode::None,
             max_sessions,
             hung_threshold_secs,
             mapping_path,
             meta_path,
             default_config_options,
         }
+    }
+
+    /// Enable broker-owned context for an explicitly configured session
+    /// runtime bridge. The default constructor remains behavior-compatible
+    /// with local ACP and AgentCore agents.
+    pub fn with_session_context(mut self, mode: SessionContextMode) -> Self {
+        self.session_context = mode;
+        self
     }
 
     fn load_mapping(path: &Path) -> HashMap<String, String> {
@@ -349,12 +370,14 @@ impl SessionPool {
 
         // Build the replacement connection outside the state lock so one stuck
         // initialization does not block all unrelated sessions.
-        let mut new_conn = AcpConnection::spawn(
+        let session_spawn_context = session_spawn_context(self.session_context, thread_id);
+        let mut new_conn = AcpConnection::spawn_with_context(
             &self.config.command,
             &self.config.args,
             &effective_workdir,
             &self.config.env,
             &self.config.inherit_env,
+            session_spawn_context.as_ref(),
         )
         .await?;
 
@@ -810,13 +833,30 @@ impl SessionPool {
 mod tests {
     use super::{
         better_candidate, classify_hung, classify_idle, get_or_insert_gate, purge_session_entries,
-        remove_if_same_handle, PoolState,
+        remove_if_same_handle, session_spawn_context, PoolState,
     };
-    use crate::acp::connection::SessionActivity;
+    use crate::acp::connection::{SessionActivity, SessionSpawnContext};
+    use crate::acp::SessionContextMode;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
     use tokio::time::Instant;
+
+    #[test]
+    fn session_context_none_has_no_spawn_context() {
+        assert_eq!(
+            session_spawn_context(SessionContextMode::None, "discord:thread-123"),
+            None
+        );
+    }
+
+    #[test]
+    fn session_context_openab_v1_preserves_exact_logical_key() {
+        assert_eq!(
+            session_spawn_context(SessionContextMode::OpenabV1, "discord:thread-123"),
+            Some(SessionSpawnContext::new("discord:thread-123"))
+        );
+    }
 
     #[test]
     fn remove_if_same_handle_removes_matching_entry() {

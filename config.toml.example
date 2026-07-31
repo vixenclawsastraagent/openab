@@ -171,6 +171,15 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 # runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent"
 # cancel_strategy = "stop"       # "stop" (default) or "noop"
 
+# --- Kubernetes session isolation add-on (alternative to [agent]/[agentcore]) ---
+# Entire section is optional and default-off. It requires the add-on-flavoured
+# broker image plus a separately installed controller for this scope.
+# [kubernetes_session]
+# controller_url = "wss://openab-session-controller.openab-system.svc/relay"
+# profile = "codex-strict"
+# scope = "team-a-openab-codex"
+# credential_file = "/var/run/secrets/openab-session/token"
+
 [agent]
 command = "kiro-cli"
 args = ["acp", "--trust-all-tools"]

@@ -502,14 +502,22 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let pool = Arc::new(acp::SessionPool::new(
-        cfg.agent,
-        cfg.pool.max_sessions,
-        cfg.pool
-            .prompt_hard_timeout_secs
-            .saturating_add(cfg.pool.hung_grace_secs),
-        cfg.pool.default_config_options,
-    ));
+    let session_context = if cfg.kubernetes_session.is_some() {
+        acp::SessionContextMode::OpenabV1
+    } else {
+        acp::SessionContextMode::None
+    };
+    let pool = Arc::new(
+        acp::SessionPool::new(
+            cfg.agent,
+            cfg.pool.max_sessions,
+            cfg.pool
+                .prompt_hard_timeout_secs
+                .saturating_add(cfg.pool.hung_grace_secs),
+            cfg.pool.default_config_options,
+        )
+        .with_session_context(session_context),
+    );
     let ttl_secs = cfg.pool.session_ttl_hours * 3600;
 
     // Resolve STT config (auto-detect GROQ_API_KEY from env)
