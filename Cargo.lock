@@ -2857,6 +2857,7 @@ dependencies = [
 name = "openab-kubernetes-session"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "hex",
  "http 1.4.2",
