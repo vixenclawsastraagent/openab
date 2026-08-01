@@ -1,12 +1,13 @@
 use super::{
-    BootstrapPresence, ConsumedBootstrap, GenerationProvisioner, GenerationProvisionerError,
-    GenerationResource, ObservedWorker, ProvisionerOperation, RegistrationOperation,
-    RegistrationProvisioner, RegistrationProvisionerError, VerifiedBootstrap, WorkerBootstrapAuth,
+    BootstrapPresence, CleanupProgress, ConsumedBootstrap, GenerationProvisioner,
+    GenerationProvisionerError, GenerationResource, LifecycleProvisioner, ObservedWorker,
+    ProvisionerOperation, RegistrationOperation, RegistrationProvisioner,
+    RegistrationProvisionerError, VerifiedBootstrap, WorkerBootstrapAuth,
 };
 use crate::bridge::SessionBinding;
 use crate::identity::{ResourceNames, ScopeId, SessionId};
 use crate::resources::{DesiredGeneration, GenerationContext, MvpWorkerProfile};
-use crate::state::SessionPhase;
+use crate::state::{Fence, SessionPhase};
 use crate::store::StoredAnchor;
 use async_trait::async_trait;
 use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Pod, Secret, ServiceAccount};
@@ -14,7 +15,7 @@ use k8s_openapi::api::networking::v1::NetworkPolicy;
 use k8s_openapi::api::node::v1::RuntimeClass;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{DeleteParams, ListParams, PostParams, Preconditions};
-use kube::{Api, Client};
+use kube::{Api, Client, Resource};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::fmt::Debug;
@@ -31,6 +32,8 @@ const SESSION_ANNOTATION: &str = "openab.dev/session-id";
 const GENERATION_ANNOTATION: &str = "openab.dev/generation";
 const ATTEMPT_ANNOTATION: &str = "openab.dev/attempt-id";
 const INCARNATION_ANNOTATION: &str = "openab.dev/incarnation-id";
+const PROFILE_NAME_ANNOTATION: &str = "openab.dev/profile-name";
+const PROFILE_VERSION_ANNOTATION: &str = "openab.dev/profile-version";
 const ANCHOR_NAME_ANNOTATION: &str = "openab.dev/anchor-name";
 const ANCHOR_UID_ANNOTATION: &str = "openab.dev/anchor-uid";
 
@@ -100,6 +103,53 @@ struct GenerationPreflight {
     pod: Option<Pod>,
 }
 
+/// Evidence that every generation-scoped compute child for one exact
+/// lifecycle anchor was authoritatively observed as absent.
+///
+/// The constructor and fields live in this module so no lifecycle consumer
+/// can manufacture cleanup authority without completing the Kubernetes
+/// absence proof below.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ComputeAbsentProof {
+    session_id: SessionId,
+    incarnation_id: Uuid,
+    fence: Fence,
+    anchor_uid: String,
+}
+
+impl ComputeAbsentProof {
+    fn for_anchor(anchor: &StoredAnchor) -> Self {
+        Self {
+            session_id: anchor.state().session_id(),
+            incarnation_id: anchor.state().incarnation_id(),
+            fence: anchor.state().fence().clone(),
+            anchor_uid: anchor.uid().to_owned(),
+        }
+    }
+
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub fn incarnation_id(&self) -> Uuid {
+        self.incarnation_id
+    }
+
+    pub fn fence(&self) -> &Fence {
+        &self.fence
+    }
+
+    pub fn anchor_uid(&self) -> &str {
+        &self.anchor_uid
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResourceCleanupProgress {
+    Pending,
+    Absent,
+}
+
 impl ChildKind {
     fn resource_label(self) -> &'static str {
         match self {
@@ -118,6 +168,16 @@ impl ChildKind {
             Self::ServiceAccount => names.service_account(generation).ok(),
             Self::RegistrationSecret => names.registration_secret(generation).ok(),
             Self::Pod => names.pod(generation).ok(),
+        }
+    }
+
+    fn resource(self) -> GenerationResource {
+        match self {
+            Self::PersistentVolumeClaim => GenerationResource::PersistentVolumeClaim,
+            Self::NetworkPolicy => GenerationResource::NetworkPolicy,
+            Self::ServiceAccount => GenerationResource::ServiceAccount,
+            Self::RegistrationSecret => GenerationResource::RegistrationSecret,
+            Self::Pod => GenerationResource::Pod,
         }
     }
 }
@@ -325,6 +385,348 @@ impl KubernetesGenerationProvisioner {
     ) -> Result<(), GenerationProvisionerError> {
         validate_discovered_metadata(metadata, &self.namespace, self.scope_id, session_id, kind)?;
         Err(GenerationProvisionerError::ChildrenPresent)
+    }
+
+    fn validate_compute_cleanup_anchor(
+        &self,
+        anchor: &StoredAnchor,
+    ) -> Result<(), GenerationProvisionerError> {
+        if anchor.namespace() != self.namespace
+            || anchor.state().scope_id() != self.scope_id
+            || anchor.name() != ResourceNames::new(anchor.state().session_id()).anchor()
+            || !is_printable_identifier(anchor.uid())
+        {
+            return Err(GenerationProvisionerError::InvalidGeneration);
+        }
+        if !matches!(
+            anchor.state().phase(),
+            SessionPhase::Suspending | SessionPhase::Deleting | SessionPhase::Blocked
+        ) {
+            return Err(GenerationProvisionerError::InvalidCleanupPhase {
+                phase: anchor.state().phase(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn cleanup_exact_resource<K>(
+        &self,
+        api: &Api<K>,
+        anchor: &StoredAnchor,
+        kind: ChildKind,
+        expected_pod_uid: Option<&str>,
+    ) -> Result<ResourceCleanupProgress, GenerationProvisionerError>
+    where
+        K: Clone + Debug + DeserializeOwned + Resource<DynamicType = ()>,
+    {
+        let name = kind
+            .expected_name(
+                ResourceNames::new(anchor.state().session_id()),
+                anchor.state().fence().generation(),
+            )
+            .ok_or(GenerationProvisionerError::InvalidGeneration)?;
+        let observed = api.get_opt(&name).await.map_err(cleanup_api_error)?;
+        let Some(observed) = observed else {
+            return Ok(ResourceCleanupProgress::Absent);
+        };
+        self.validate_cleanup_metadata(anchor, kind, observed.meta())?;
+        let observed_uid = required_cleanup_metadata(observed.meta().uid.as_deref(), kind)?;
+        if expected_pod_uid.is_some_and(|expected| expected != observed_uid) {
+            return Err(GenerationProvisionerError::ResourceRejected {
+                resource: kind.resource(),
+            });
+        }
+        if observed.meta().deletion_timestamp.is_some() {
+            return Ok(ResourceCleanupProgress::Pending);
+        }
+        let resource_version =
+            required_cleanup_metadata(observed.meta().resource_version.as_deref(), kind)?;
+
+        // Kubernetes delete preconditions fence this exact observation. A
+        // successful DELETE (including 404) is still followed by a GET; the
+        // response itself is not authoritative absence proof.
+        // https://kubernetes.io/docs/reference/kubernetes-api/common-definitions/delete-options/
+        let delete = DeleteParams::default().preconditions(Preconditions {
+            uid: Some(observed_uid.to_owned()),
+            resource_version: Some(resource_version.to_owned()),
+        });
+        match api.delete(&name, &delete).await {
+            Ok(_) => {}
+            Err(kube::Error::Api(status)) if status.is_not_found() => {}
+            Err(error) => return Err(cleanup_api_error(error)),
+        }
+
+        let replacement = api.get_opt(&name).await.map_err(cleanup_api_error)?;
+        let Some(replacement) = replacement else {
+            return Ok(ResourceCleanupProgress::Absent);
+        };
+        self.validate_cleanup_metadata(anchor, kind, replacement.meta())?;
+        let replacement_uid = required_cleanup_metadata(replacement.meta().uid.as_deref(), kind)?;
+        if replacement_uid != observed_uid {
+            return Err(GenerationProvisionerError::ResourceRejected {
+                resource: kind.resource(),
+            });
+        }
+        Ok(ResourceCleanupProgress::Pending)
+    }
+
+    fn validate_cleanup_metadata(
+        &self,
+        anchor: &StoredAnchor,
+        kind: ChildKind,
+        metadata: &ObjectMeta,
+    ) -> Result<(), GenerationProvisionerError> {
+        let rejected = || GenerationProvisionerError::ResourceRejected {
+            resource: kind.resource(),
+        };
+        let state = anchor.state();
+        let names = ResourceNames::new(state.session_id());
+        let generation = state.fence().generation();
+        let expected_name = kind.expected_name(names, generation).ok_or_else(rejected)?;
+        if metadata.name.as_deref() != Some(expected_name.as_str())
+            || metadata.namespace.as_deref() != Some(self.namespace.as_str())
+            || !metadata.uid.as_deref().is_some_and(is_printable_identifier)
+            || !metadata
+                .resource_version
+                .as_deref()
+                .is_some_and(is_printable_identifier)
+        {
+            return Err(rejected());
+        }
+
+        let labels = metadata.labels.as_ref().ok_or_else(rejected)?;
+        let annotations = metadata.annotations.as_ref().ok_or_else(rejected)?;
+        let generation_text = generation.to_string();
+        let attempt_text = state.fence().attempt_id().to_string();
+        let incarnation_text = state.incarnation_id().to_string();
+        if labels.get(MANAGED_BY_LABEL).map(String::as_str) != Some(MANAGED_BY_VALUE)
+            || labels.get(RESOURCE_LABEL).map(String::as_str) != Some(kind.resource_label())
+            || labels.get(SESSION_LABEL).map(String::as_str)
+                != Some(&state.session_id().as_hex()[..40])
+            || labels.get(GENERATION_LABEL).map(String::as_str) != Some(generation_text.as_str())
+            || annotations.get(SCOPE_ANNOTATION).map(String::as_str)
+                != Some(state.scope_id().as_hex().as_str())
+            || annotations.get(SESSION_ANNOTATION).map(String::as_str)
+                != Some(state.session_id().as_hex().as_str())
+            || annotations.get(GENERATION_ANNOTATION).map(String::as_str)
+                != Some(generation_text.as_str())
+            || annotations.get(ATTEMPT_ANNOTATION).map(String::as_str)
+                != Some(attempt_text.as_str())
+            || annotations.get(INCARNATION_ANNOTATION).map(String::as_str)
+                != Some(incarnation_text.as_str())
+            || annotations.get(PROFILE_NAME_ANNOTATION).map(String::as_str)
+                != Some(state.profile().name())
+            || annotations
+                .get(PROFILE_VERSION_ANNOTATION)
+                .map(String::as_str)
+                != Some(state.profile().version())
+            || annotations.get(ANCHOR_NAME_ANNOTATION).map(String::as_str) != Some(anchor.name())
+            || annotations.get(ANCHOR_UID_ANNOTATION).map(String::as_str) != Some(anchor.uid())
+        {
+            return Err(rejected());
+        }
+
+        let owners = metadata.owner_references.as_deref().ok_or_else(rejected)?;
+        if owners.len() != 1 {
+            return Err(rejected());
+        }
+        let owner = &owners[0];
+        if owner.api_version != "v1"
+            || owner.kind != "ConfigMap"
+            || owner.name != anchor.name()
+            || owner.uid != anchor.uid()
+            || owner.controller != Some(true)
+            || owner.block_owner_deletion != Some(true)
+        {
+            return Err(rejected());
+        }
+        Ok(())
+    }
+
+    async fn prove_compute_children_absent(
+        &self,
+        anchor: &StoredAnchor,
+    ) -> Result<ComputeAbsentProof, GenerationProvisionerError> {
+        let selector = format!(
+            "{MANAGED_BY_LABEL}={MANAGED_BY_VALUE},{SESSION_LABEL}={}",
+            &anchor.state().session_id().as_hex()[..40]
+        );
+        let params = ListParams::default().labels(&selector);
+
+        let pods = self.pods.list(&params).await.map_err(cleanup_api_error)?;
+        self.reject_compute_inventory(
+            anchor,
+            ChildKind::Pod,
+            pods.items.iter().map(|object| &object.metadata),
+        )?;
+        let secrets = self
+            .registration_secrets
+            .list(&params)
+            .await
+            .map_err(cleanup_api_error)?;
+        self.reject_compute_inventory(
+            anchor,
+            ChildKind::RegistrationSecret,
+            secrets.items.iter().map(|object| &object.metadata),
+        )?;
+        let policies = self
+            .network_policies
+            .list(&params)
+            .await
+            .map_err(cleanup_api_error)?;
+        self.reject_compute_inventory(
+            anchor,
+            ChildKind::NetworkPolicy,
+            policies.items.iter().map(|object| &object.metadata),
+        )?;
+        let accounts = self
+            .service_accounts
+            .list(&params)
+            .await
+            .map_err(cleanup_api_error)?;
+        self.reject_compute_inventory(
+            anchor,
+            ChildKind::ServiceAccount,
+            accounts.items.iter().map(|object| &object.metadata),
+        )?;
+
+        self.prove_direct_compute_child_absent(&self.pods, anchor, ChildKind::Pod)
+            .await?;
+        self.prove_direct_compute_child_absent(
+            &self.registration_secrets,
+            anchor,
+            ChildKind::RegistrationSecret,
+        )
+        .await?;
+        self.prove_direct_compute_child_absent(
+            &self.network_policies,
+            anchor,
+            ChildKind::NetworkPolicy,
+        )
+        .await?;
+        self.prove_direct_compute_child_absent(
+            &self.service_accounts,
+            anchor,
+            ChildKind::ServiceAccount,
+        )
+        .await?;
+        Ok(ComputeAbsentProof::for_anchor(anchor))
+    }
+
+    fn reject_compute_inventory<'a, I>(
+        &self,
+        anchor: &StoredAnchor,
+        kind: ChildKind,
+        objects: I,
+    ) -> Result<(), GenerationProvisionerError>
+    where
+        I: IntoIterator<Item = &'a ObjectMeta>,
+    {
+        let mut present = false;
+        for metadata in objects {
+            self.validate_cleanup_metadata(anchor, kind, metadata)
+                .map_err(|_| GenerationProvisionerError::ChildrenAmbiguous)?;
+            if kind.resource() == GenerationResource::Pod
+                && anchor
+                    .state()
+                    .pod_uid()
+                    .is_some_and(|uid| metadata.uid.as_deref() != Some(uid))
+            {
+                return Err(GenerationProvisionerError::ChildrenAmbiguous);
+            }
+            present = true;
+        }
+        if present {
+            Err(GenerationProvisionerError::ChildrenPresent)
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn prove_direct_compute_child_absent<K>(
+        &self,
+        api: &Api<K>,
+        anchor: &StoredAnchor,
+        kind: ChildKind,
+    ) -> Result<(), GenerationProvisionerError>
+    where
+        K: Clone + Debug + DeserializeOwned + Resource<DynamicType = ()>,
+    {
+        let name = kind
+            .expected_name(
+                ResourceNames::new(anchor.state().session_id()),
+                anchor.state().fence().generation(),
+            )
+            .ok_or(GenerationProvisionerError::ChildrenAmbiguous)?;
+        let observed = api.get_opt(&name).await.map_err(cleanup_api_error)?;
+        let Some(observed) = observed else {
+            return Ok(());
+        };
+        self.validate_cleanup_metadata(anchor, kind, observed.meta())
+            .map_err(|_| GenerationProvisionerError::ChildrenAmbiguous)?;
+        if kind.resource() == GenerationResource::Pod
+            && anchor
+                .state()
+                .pod_uid()
+                .is_some_and(|uid| observed.meta().uid.as_deref() != Some(uid))
+        {
+            return Err(GenerationProvisionerError::ChildrenAmbiguous);
+        }
+        Err(GenerationProvisionerError::ChildrenPresent)
+    }
+
+    async fn reconcile_compute_cleanup(
+        &self,
+        anchor: &StoredAnchor,
+    ) -> Result<CleanupProgress, GenerationProvisionerError> {
+        self.validate_compute_cleanup_anchor(anchor)?;
+        if self
+            .cleanup_exact_resource(&self.pods, anchor, ChildKind::Pod, anchor.state().pod_uid())
+            .await?
+            == ResourceCleanupProgress::Pending
+        {
+            return Ok(CleanupProgress::Pending);
+        }
+        if self
+            .cleanup_exact_resource(
+                &self.registration_secrets,
+                anchor,
+                ChildKind::RegistrationSecret,
+                None,
+            )
+            .await?
+            == ResourceCleanupProgress::Pending
+        {
+            return Ok(CleanupProgress::Pending);
+        }
+        if self
+            .cleanup_exact_resource(
+                &self.network_policies,
+                anchor,
+                ChildKind::NetworkPolicy,
+                None,
+            )
+            .await?
+            == ResourceCleanupProgress::Pending
+        {
+            return Ok(CleanupProgress::Pending);
+        }
+        if self
+            .cleanup_exact_resource(
+                &self.service_accounts,
+                anchor,
+                ChildKind::ServiceAccount,
+                None,
+            )
+            .await?
+            == ResourceCleanupProgress::Pending
+        {
+            return Ok(CleanupProgress::Pending);
+        }
+
+        self.prove_compute_children_absent(anchor)
+            .await
+            .map(CleanupProgress::Absent)
     }
 
     async fn ensure_generation(
@@ -858,6 +1260,16 @@ impl GenerationProvisioner for KubernetesGenerationProvisioner {
 }
 
 #[async_trait]
+impl LifecycleProvisioner for KubernetesGenerationProvisioner {
+    async fn reconcile_compute_absent(
+        &self,
+        anchor: &StoredAnchor,
+    ) -> Result<CleanupProgress, GenerationProvisionerError> {
+        self.reconcile_compute_cleanup(anchor).await
+    }
+}
+
+#[async_trait]
 impl RegistrationProvisioner for KubernetesGenerationProvisioner {
     async fn verify_bootstrap(
         &self,
@@ -1114,6 +1526,7 @@ fn map_generation_registration_error(
     match error {
         GenerationProvisionerError::InvalidGeneration
         | GenerationProvisionerError::InvalidPodUid
+        | GenerationProvisionerError::InvalidCleanupPhase { .. }
         | GenerationProvisionerError::RandomnessUnavailable => {
             RegistrationProvisionerError::InvalidGeneration
         }
@@ -1327,6 +1740,23 @@ fn proof_api_error(_error: kube::Error) -> GenerationProvisionerError {
     GenerationProvisionerError::KubernetesApi {
         operation: ProvisionerOperation::ProveChildrenAbsent,
     }
+}
+
+fn cleanup_api_error(_error: kube::Error) -> GenerationProvisionerError {
+    GenerationProvisionerError::KubernetesApi {
+        operation: ProvisionerOperation::ReconcileComputeAbsence,
+    }
+}
+
+fn required_cleanup_metadata(
+    value: Option<&str>,
+    kind: ChildKind,
+) -> Result<&str, GenerationProvisionerError> {
+    value.filter(|value| is_printable_identifier(value)).ok_or(
+        GenerationProvisionerError::ResourceRejected {
+            resource: kind.resource(),
+        },
+    )
 }
 
 fn is_printable_identifier(value: &str) -> bool {

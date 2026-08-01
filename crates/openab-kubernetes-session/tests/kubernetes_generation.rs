@@ -8,8 +8,8 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::client::Body;
 use kube::Client;
 use openab_kubernetes_session::controller::{
-    GenerationProvisioner, GenerationProvisionerError, GenerationResource,
-    KubernetesGenerationProvisioner, ProvisionerOperation,
+    CleanupProgress, GenerationProvisioner, GenerationProvisionerError, GenerationResource,
+    KubernetesGenerationProvisioner, LifecycleProvisioner, ProvisionerOperation,
 };
 use openab_kubernetes_session::identity::{ResourceNames, ScopeId, SessionId};
 use openab_kubernetes_session::resources::{
@@ -87,6 +87,18 @@ fn anchor_with_observed_pod(session_id: SessionId, pod_uid: &str) -> SessionAnch
     let mut anchor = anchor(session_id);
     let fence = anchor.fence().clone();
     anchor.observe_pod(&fence, pod_uid).unwrap();
+    anchor
+}
+
+fn suspending_anchor(session_id: SessionId, recorded_pod_uid: Option<&str>) -> SessionAnchorV1 {
+    let observed_uid = recorded_pod_uid.unwrap_or("already-absent-pod-uid");
+    let mut anchor = anchor_with_observed_pod(session_id, observed_uid);
+    let fence = anchor.fence().clone();
+    anchor.transition(&fence, SessionPhase::Ready).unwrap();
+    anchor.transition(&fence, SessionPhase::Suspending).unwrap();
+    if recorded_pod_uid.is_none() {
+        anchor.confirm_pod_deleted(&fence, observed_uid).unwrap();
+    }
     anchor
 }
 
@@ -220,6 +232,31 @@ fn conflict_response() -> Response<Body> {
     )
 }
 
+fn delete_accepted_response() -> Response<Body> {
+    json_response(
+        StatusCode::OK,
+        json!({
+            "apiVersion": "v1",
+            "kind": "Status",
+            "status": "Success",
+            "code": 200
+        }),
+    )
+}
+
+fn internal_error_response() -> Response<Body> {
+    json_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        json!({
+            "apiVersion": "v1",
+            "kind": "Status",
+            "status": "Failure",
+            "reason": "InternalError",
+            "code": 500
+        }),
+    )
+}
+
 async fn request_body(request: Request<Body>) -> Value {
     let bytes = request.into_body().collect_bytes().await.unwrap();
     serde_json::from_slice(&bytes).unwrap()
@@ -291,6 +328,66 @@ async fn respond_list(
             "items": items
         }),
     ));
+}
+
+async fn respond_delete(
+    handle: &mut std::pin::Pin<&mut mock::Handle<Request<Body>, Response<Body>>>,
+    expected_path: &str,
+    expected_uid: &str,
+) {
+    let (request, send) = handle.next_request().await.expect("delete request");
+    assert_eq!(request.method(), Method::DELETE);
+    assert_eq!(request.uri().path(), expected_path);
+    let body = request_body(request).await;
+    assert_eq!(body["preconditions"]["uid"], expected_uid);
+    assert_eq!(
+        body["preconditions"]["resourceVersion"],
+        format!("rv-{expected_uid}")
+    );
+    send.send_response(delete_accepted_response());
+}
+
+async fn respond_compute_absence_proof(
+    handle: &mut std::pin::Pin<&mut mock::Handle<Request<Body>, Response<Body>>>,
+    session_id: SessionId,
+    generation: u64,
+) {
+    let names = ResourceNames::new(session_id);
+    let pod_name = names.pod(generation).unwrap();
+    let pod_path = format!("/api/v1/namespaces/{NAMESPACE}/pods");
+    let secret_path = format!("/api/v1/namespaces/{NAMESPACE}/secrets");
+    let policy_path = format!("/apis/networking.k8s.io/v1/namespaces/{NAMESPACE}/networkpolicies");
+    let account_path = format!("/api/v1/namespaces/{NAMESPACE}/serviceaccounts");
+
+    respond_list(handle, &pod_path, "v1", "PodList", vec![]).await;
+    respond_list(handle, &secret_path, "v1", "SecretList", vec![]).await;
+    respond_list(
+        handle,
+        &policy_path,
+        "networking.k8s.io/v1",
+        "NetworkPolicyList",
+        vec![],
+    )
+    .await;
+    respond_list(handle, &account_path, "v1", "ServiceAccountList", vec![]).await;
+
+    for path in [
+        format!("{pod_path}/{pod_name}"),
+        format!(
+            "{secret_path}/{}",
+            names.registration_secret(generation).unwrap()
+        ),
+        format!("{policy_path}/{pod_name}-net"),
+        format!(
+            "{account_path}/{}",
+            names.service_account(generation).unwrap()
+        ),
+    ] {
+        let (request, send) = handle.next_request().await.expect("absence proof GET");
+        assert_eq!(request.method(), Method::GET);
+        assert_eq!(request.uri().path(), path);
+        send.send_response(missing_response());
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1435,6 +1532,532 @@ async fn pinned_dependencies_are_revalidated_and_drift_fails_before_pod_creation
         task.await.unwrap().unwrap_err(),
         GenerationProvisionerError::ResourceRejected {
             resource: openab_kubernetes_session::controller::GenerationResource::RuntimeClass,
+        }
+    );
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn compute_cleanup_rejects_the_wrong_recorded_pod_uid_before_mutation() {
+    let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+    let client = Client::new(service, "default");
+    let session_id = session_id("discord:cleanup-wrong-pod-uid");
+    let anchor = suspending_anchor(session_id, Some("recorded-pod-uid"));
+    let pod = observed_value(
+        desired_for(&anchor, profile(), [0x5a; 32]).pod(),
+        "replacement-pod-uid",
+    );
+    let mut handle = std::pin::pin!(handle);
+    let stored = load_stored_anchor(client.clone(), &mut handle, anchor).await;
+    let provisioner = KubernetesGenerationProvisioner::new(client, NAMESPACE, scope_id()).unwrap();
+    let task = tokio::spawn(async move { provisioner.reconcile_compute_absent(&stored).await });
+
+    respond_get(
+        &mut handle,
+        &format!(
+            "/api/v1/namespaces/{NAMESPACE}/pods/{}",
+            ResourceNames::new(session_id).pod(1).unwrap()
+        ),
+        pod,
+    )
+    .await;
+
+    assert_eq!(
+        task.await.unwrap().unwrap_err(),
+        GenerationProvisionerError::ResourceRejected {
+            resource: GenerationResource::Pod,
+        }
+    );
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn compute_cleanup_rejects_tampered_durable_identity_before_delete() {
+    let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+    let client = Client::new(service, "default");
+    let session_id = session_id("discord:cleanup-tampered-attempt");
+    let anchor = suspending_anchor(session_id, Some("pod-uid"));
+    let mut pod = observed_value(desired_for(&anchor, profile(), [0x5a; 32]).pod(), "pod-uid");
+    pod["metadata"]["annotations"]["openab.dev/attempt-id"] =
+        json!(Uuid::from_u128(0xdead).to_string());
+    let pod_path = format!(
+        "/api/v1/namespaces/{NAMESPACE}/pods/{}",
+        ResourceNames::new(session_id).pod(1).unwrap()
+    );
+    let mut handle = std::pin::pin!(handle);
+    let stored = load_stored_anchor(client.clone(), &mut handle, anchor).await;
+    let provisioner = KubernetesGenerationProvisioner::new(client, NAMESPACE, scope_id()).unwrap();
+    let task = tokio::spawn(async move { provisioner.reconcile_compute_absent(&stored).await });
+
+    respond_get(&mut handle, &pod_path, pod).await;
+
+    assert_eq!(
+        task.await.unwrap().unwrap_err(),
+        GenerationProvisionerError::ResourceRejected {
+            resource: GenerationResource::Pod,
+        }
+    );
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn compute_cleanup_observes_pod_absence_after_a_preconditioned_delete_returns_not_found() {
+    let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+    let client = Client::new(service, "default");
+    let session_id = session_id("discord:cleanup-pod-preconditions");
+    let anchor = suspending_anchor(session_id, Some("pod-uid"));
+    let pod = observed_value(desired_for(&anchor, profile(), [0x5a; 32]).pod(), "pod-uid");
+    let names = ResourceNames::new(session_id);
+    let pod_path = format!(
+        "/api/v1/namespaces/{NAMESPACE}/pods/{}",
+        names.pod(1).unwrap()
+    );
+    let secret_path = format!(
+        "/api/v1/namespaces/{NAMESPACE}/secrets/{}",
+        names.registration_secret(1).unwrap()
+    );
+    let mut handle = std::pin::pin!(handle);
+    let stored = load_stored_anchor(client.clone(), &mut handle, anchor).await;
+    let provisioner = KubernetesGenerationProvisioner::new(client, NAMESPACE, scope_id()).unwrap();
+    let task = tokio::spawn(async move { provisioner.reconcile_compute_absent(&stored).await });
+
+    respond_get(&mut handle, &pod_path, pod).await;
+    let (request, send) = handle.next_request().await.expect("Pod delete request");
+    assert_eq!(request.method(), Method::DELETE);
+    assert_eq!(request.uri().path(), pod_path);
+    let body = request_body(request).await;
+    assert_eq!(body["preconditions"]["uid"], "pod-uid");
+    assert_eq!(body["preconditions"]["resourceVersion"], "rv-pod-uid");
+    send.send_response(missing_response());
+    let (request, send) = handle
+        .next_request()
+        .await
+        .expect("post-delete Pod observation");
+    assert_eq!(request.method(), Method::GET);
+    assert_eq!(request.uri().path(), pod_path);
+    send.send_response(missing_response());
+    let (request, send) = handle
+        .next_request()
+        .await
+        .expect("Secret GET only after Pod absence");
+    assert_eq!(request.method(), Method::GET);
+    assert_eq!(request.uri().path(), secret_path);
+    send.send_response(internal_error_response());
+
+    assert_eq!(
+        task.await.unwrap().unwrap_err(),
+        GenerationProvisionerError::KubernetesApi {
+            operation: ProvisionerOperation::ReconcileComputeAbsence,
+        }
+    );
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn compute_cleanup_does_not_touch_children_until_pod_absence_is_observed() {
+    let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+    let client = Client::new(service, "default");
+    let session_id = session_id("discord:cleanup-pod-terminating-after-delete");
+    let anchor = suspending_anchor(session_id, Some("pod-uid"));
+    let mut pod = observed_value(desired_for(&anchor, profile(), [0x5a; 32]).pod(), "pod-uid");
+    let pod_path = format!(
+        "/api/v1/namespaces/{NAMESPACE}/pods/{}",
+        ResourceNames::new(session_id).pod(1).unwrap()
+    );
+    let mut handle = std::pin::pin!(handle);
+    let stored = load_stored_anchor(client.clone(), &mut handle, anchor).await;
+    let provisioner = KubernetesGenerationProvisioner::new(client, NAMESPACE, scope_id()).unwrap();
+    let task = tokio::spawn(async move { provisioner.reconcile_compute_absent(&stored).await });
+
+    respond_get(&mut handle, &pod_path, pod.clone()).await;
+    respond_delete(&mut handle, &pod_path, "pod-uid").await;
+    pod["metadata"]["deletionTimestamp"] = json!("2026-08-01T08:01:00Z");
+    respond_get(&mut handle, &pod_path, pod).await;
+
+    assert_eq!(task.await.unwrap().unwrap(), CleanupProgress::Pending);
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn compute_cleanup_deletes_children_in_order_and_retains_the_pvc() {
+    let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+    let client = Client::new(service, "default");
+    let session_id = session_id("discord:cleanup-ordered");
+    let anchor = suspending_anchor(session_id, Some("pod-uid"));
+    let expected_fence = anchor.fence().clone();
+    let expected_incarnation = anchor.incarnation_id();
+    let desired = desired_for(&anchor, profile(), [0x5a; 32]);
+    let names = ResourceNames::new(session_id);
+    let pod_path = format!(
+        "/api/v1/namespaces/{NAMESPACE}/pods/{}",
+        names.pod(1).unwrap()
+    );
+    let secret_path = format!(
+        "/api/v1/namespaces/{NAMESPACE}/secrets/{}",
+        names.registration_secret(1).unwrap()
+    );
+    let policy_path = format!(
+        "/apis/networking.k8s.io/v1/namespaces/{NAMESPACE}/networkpolicies/{}-net",
+        names.pod(1).unwrap()
+    );
+    let account_path = format!(
+        "/api/v1/namespaces/{NAMESPACE}/serviceaccounts/{}",
+        names.service_account(1).unwrap()
+    );
+    let resources = [
+        (
+            pod_path,
+            observed_value(desired.pod(), "pod-uid"),
+            "pod-uid",
+        ),
+        (
+            secret_path,
+            observed_value(desired.registration_secret(), "secret-uid"),
+            "secret-uid",
+        ),
+        (
+            policy_path,
+            observed_value(desired.network_policy(), "policy-uid"),
+            "policy-uid",
+        ),
+        (
+            account_path,
+            observed_value(desired.service_account(), "account-uid"),
+            "account-uid",
+        ),
+    ];
+    let mut handle = std::pin::pin!(handle);
+    let stored = load_stored_anchor(client.clone(), &mut handle, anchor).await;
+    let provisioner = KubernetesGenerationProvisioner::new(client, NAMESPACE, scope_id()).unwrap();
+    let task = tokio::spawn(async move { provisioner.reconcile_compute_absent(&stored).await });
+
+    for (path, object, uid) in resources {
+        respond_get(&mut handle, &path, object).await;
+        respond_delete(&mut handle, &path, uid).await;
+        let (request, send) = handle
+            .next_request()
+            .await
+            .expect("post-delete absence observation");
+        assert_eq!(request.method(), Method::GET);
+        assert_eq!(request.uri().path(), path);
+        send.send_response(missing_response());
+    }
+    respond_compute_absence_proof(&mut handle, session_id, 1).await;
+
+    let CleanupProgress::Absent(proof) = task.await.unwrap().unwrap() else {
+        panic!("all compute children should be absent");
+    };
+    assert_eq!(proof.session_id(), session_id);
+    assert_eq!(proof.incarnation_id(), expected_incarnation);
+    assert_eq!(proof.fence(), &expected_fence);
+    assert_eq!(proof.anchor_uid(), ANCHOR_UID);
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn compute_cleanup_returns_pending_for_an_exact_terminating_pod() {
+    let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+    let client = Client::new(service, "default");
+    let session_id = session_id("discord:cleanup-already-terminating");
+    let anchor = suspending_anchor(session_id, Some("pod-uid"));
+    let mut pod = observed_value(desired_for(&anchor, profile(), [0x5a; 32]).pod(), "pod-uid");
+    pod["metadata"]["deletionTimestamp"] = json!("2026-08-01T08:01:00Z");
+    let mut handle = std::pin::pin!(handle);
+    let stored = load_stored_anchor(client.clone(), &mut handle, anchor).await;
+    let provisioner = KubernetesGenerationProvisioner::new(client, NAMESPACE, scope_id()).unwrap();
+    let task = tokio::spawn(async move { provisioner.reconcile_compute_absent(&stored).await });
+
+    respond_get(
+        &mut handle,
+        &format!(
+            "/api/v1/namespaces/{NAMESPACE}/pods/{}",
+            ResourceNames::new(session_id).pod(1).unwrap()
+        ),
+        pod,
+    )
+    .await;
+
+    assert_eq!(task.await.unwrap().unwrap(), CleanupProgress::Pending);
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn compute_cleanup_rejects_a_same_name_replacement_after_delete() {
+    let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+    let client = Client::new(service, "default");
+    let session_id = session_id("discord:cleanup-replacement-after-delete");
+    let anchor = suspending_anchor(session_id, Some("pod-uid"));
+    let desired = desired_for(&anchor, profile(), [0x5a; 32]);
+    let pod = observed_value(desired.pod(), "pod-uid");
+    let replacement = observed_value(desired.pod(), "replacement-pod-uid");
+    let pod_path = format!(
+        "/api/v1/namespaces/{NAMESPACE}/pods/{}",
+        ResourceNames::new(session_id).pod(1).unwrap()
+    );
+    let mut handle = std::pin::pin!(handle);
+    let stored = load_stored_anchor(client.clone(), &mut handle, anchor).await;
+    let provisioner = KubernetesGenerationProvisioner::new(client, NAMESPACE, scope_id()).unwrap();
+    let task = tokio::spawn(async move { provisioner.reconcile_compute_absent(&stored).await });
+
+    respond_get(&mut handle, &pod_path, pod).await;
+    respond_delete(&mut handle, &pod_path, "pod-uid").await;
+    respond_get(&mut handle, &pod_path, replacement).await;
+
+    assert_eq!(
+        task.await.unwrap().unwrap_err(),
+        GenerationProvisionerError::ResourceRejected {
+            resource: GenerationResource::Pod,
+        }
+    );
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn compute_cleanup_proves_absence_with_lists_and_deterministic_reads() {
+    let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+    let client = Client::new(service, "default");
+    let session_id = session_id("discord:cleanup-absence-proof");
+    let anchor = suspending_anchor(session_id, None);
+    let mut handle = std::pin::pin!(handle);
+    let stored = load_stored_anchor(client.clone(), &mut handle, anchor).await;
+    let provisioner = KubernetesGenerationProvisioner::new(client, NAMESPACE, scope_id()).unwrap();
+    let task = tokio::spawn(async move { provisioner.reconcile_compute_absent(&stored).await });
+    let names = ResourceNames::new(session_id);
+    for path in [
+        format!(
+            "/api/v1/namespaces/{NAMESPACE}/pods/{}",
+            names.pod(1).unwrap()
+        ),
+        format!(
+            "/api/v1/namespaces/{NAMESPACE}/secrets/{}",
+            names.registration_secret(1).unwrap()
+        ),
+        format!(
+            "/apis/networking.k8s.io/v1/namespaces/{NAMESPACE}/networkpolicies/{}-net",
+            names.pod(1).unwrap()
+        ),
+        format!(
+            "/api/v1/namespaces/{NAMESPACE}/serviceaccounts/{}",
+            names.service_account(1).unwrap()
+        ),
+    ] {
+        let (request, send) = handle.next_request().await.expect("cleanup GET");
+        assert_eq!(request.method(), Method::GET);
+        assert_eq!(request.uri().path(), path);
+        send.send_response(missing_response());
+    }
+    respond_compute_absence_proof(&mut handle, session_id, 1).await;
+
+    assert!(matches!(
+        task.await.unwrap().unwrap(),
+        CleanupProgress::Absent(_)
+    ));
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn compute_cleanup_rejects_a_selector_evading_deterministic_child() {
+    let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+    let client = Client::new(service, "default");
+    let session_id = session_id("discord:cleanup-selector-evasion");
+    let anchor = suspending_anchor(session_id, None);
+    let mut escaped_pod = observed_value(
+        desired_for(&anchor, profile(), [0x5a; 32]).pod(),
+        "selector-evading-pod-uid",
+    );
+    escaped_pod["metadata"]["labels"]
+        .as_object_mut()
+        .unwrap()
+        .remove("openab.dev/session");
+    let names = ResourceNames::new(session_id);
+    let pod_collection = format!("/api/v1/namespaces/{NAMESPACE}/pods");
+    let secret_collection = format!("/api/v1/namespaces/{NAMESPACE}/secrets");
+    let policy_collection =
+        format!("/apis/networking.k8s.io/v1/namespaces/{NAMESPACE}/networkpolicies");
+    let account_collection = format!("/api/v1/namespaces/{NAMESPACE}/serviceaccounts");
+    let initial_paths = [
+        format!("{pod_collection}/{}", names.pod(1).unwrap()),
+        format!(
+            "{secret_collection}/{}",
+            names.registration_secret(1).unwrap()
+        ),
+        format!("{policy_collection}/{}-net", names.pod(1).unwrap()),
+        format!("{account_collection}/{}", names.service_account(1).unwrap()),
+    ];
+    let mut handle = std::pin::pin!(handle);
+    let stored = load_stored_anchor(client.clone(), &mut handle, anchor).await;
+    let provisioner = KubernetesGenerationProvisioner::new(client, NAMESPACE, scope_id()).unwrap();
+    let task = tokio::spawn(async move { provisioner.reconcile_compute_absent(&stored).await });
+
+    for path in initial_paths {
+        let (request, send) = handle.next_request().await.expect("initial cleanup GET");
+        assert_eq!(request.method(), Method::GET);
+        assert_eq!(request.uri().path(), path);
+        send.send_response(missing_response());
+    }
+    respond_list(&mut handle, &pod_collection, "v1", "PodList", vec![]).await;
+    respond_list(&mut handle, &secret_collection, "v1", "SecretList", vec![]).await;
+    respond_list(
+        &mut handle,
+        &policy_collection,
+        "networking.k8s.io/v1",
+        "NetworkPolicyList",
+        vec![],
+    )
+    .await;
+    respond_list(
+        &mut handle,
+        &account_collection,
+        "v1",
+        "ServiceAccountList",
+        vec![],
+    )
+    .await;
+    respond_get(
+        &mut handle,
+        &format!("{pod_collection}/{}", names.pod(1).unwrap()),
+        escaped_pod,
+    )
+    .await;
+
+    assert_eq!(
+        task.await.unwrap().unwrap_err(),
+        GenerationProvisionerError::ChildrenAmbiguous
+    );
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn compute_cleanup_absence_proof_rejects_wrong_generation_inventory() {
+    let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+    let client = Client::new(service, "default");
+    let session_id = session_id("discord:cleanup-orphan-inventory");
+    let anchor = suspending_anchor(session_id, None);
+    let mut orphan = observed_value(
+        desired_for(&anchor, profile(), [0x5a; 32]).pod(),
+        "orphan-pod-uid",
+    );
+    let names = ResourceNames::new(session_id);
+    orphan["metadata"]["name"] = json!(names.pod(2).unwrap());
+    orphan["metadata"]["labels"]["openab.dev/generation"] = json!("2");
+    orphan["metadata"]["annotations"]["openab.dev/generation"] = json!("2");
+    let mut handle = std::pin::pin!(handle);
+    let stored = load_stored_anchor(client.clone(), &mut handle, anchor).await;
+    let provisioner = KubernetesGenerationProvisioner::new(client, NAMESPACE, scope_id()).unwrap();
+    let task = tokio::spawn(async move { provisioner.reconcile_compute_absent(&stored).await });
+    for path in [
+        format!(
+            "/api/v1/namespaces/{NAMESPACE}/pods/{}",
+            names.pod(1).unwrap()
+        ),
+        format!(
+            "/api/v1/namespaces/{NAMESPACE}/secrets/{}",
+            names.registration_secret(1).unwrap()
+        ),
+        format!(
+            "/apis/networking.k8s.io/v1/namespaces/{NAMESPACE}/networkpolicies/{}-net",
+            names.pod(1).unwrap()
+        ),
+        format!(
+            "/api/v1/namespaces/{NAMESPACE}/serviceaccounts/{}",
+            names.service_account(1).unwrap()
+        ),
+    ] {
+        let (request, send) = handle.next_request().await.expect("cleanup GET");
+        assert_eq!(request.uri().path(), path);
+        send.send_response(missing_response());
+    }
+    respond_list(
+        &mut handle,
+        &format!("/api/v1/namespaces/{NAMESPACE}/pods"),
+        "v1",
+        "PodList",
+        vec![orphan],
+    )
+    .await;
+
+    assert_eq!(
+        task.await.unwrap().unwrap_err(),
+        GenerationProvisionerError::ChildrenAmbiguous
+    );
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn compute_cleanup_accepts_a_blocked_partial_generation_without_a_recorded_pod() {
+    let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+    let client = Client::new(service, "default");
+    let session_id = session_id("discord:cleanup-blocked-partial");
+    let mut anchor = anchor(session_id);
+    let fence = anchor.fence().clone();
+    anchor.transition(&fence, SessionPhase::Blocked).unwrap();
+    let secret = observed_value(
+        desired_for(&anchor, profile(), [0x5a; 32]).registration_secret(),
+        "blocked-secret-uid",
+    );
+    let mut handle = std::pin::pin!(handle);
+    let stored = load_stored_anchor(client.clone(), &mut handle, anchor).await;
+    let provisioner = KubernetesGenerationProvisioner::new(client, NAMESPACE, scope_id()).unwrap();
+    let task = tokio::spawn(async move { provisioner.reconcile_compute_absent(&stored).await });
+    let names = ResourceNames::new(session_id);
+    let pod_path = format!(
+        "/api/v1/namespaces/{NAMESPACE}/pods/{}",
+        names.pod(1).unwrap()
+    );
+    let secret_path = format!(
+        "/api/v1/namespaces/{NAMESPACE}/secrets/{}",
+        names.registration_secret(1).unwrap()
+    );
+    let policy_path = format!(
+        "/apis/networking.k8s.io/v1/namespaces/{NAMESPACE}/networkpolicies/{}-net",
+        names.pod(1).unwrap()
+    );
+    let account_path = format!(
+        "/api/v1/namespaces/{NAMESPACE}/serviceaccounts/{}",
+        names.service_account(1).unwrap()
+    );
+    let (request, send) = handle.next_request().await.expect("blocked Pod GET");
+    assert_eq!(request.uri().path(), pod_path);
+    send.send_response(missing_response());
+    respond_get(&mut handle, &secret_path, secret).await;
+    respond_delete(&mut handle, &secret_path, "blocked-secret-uid").await;
+    let (request, send) = handle
+        .next_request()
+        .await
+        .expect("blocked Secret absence observation");
+    assert_eq!(request.uri().path(), secret_path);
+    send.send_response(missing_response());
+    for path in [policy_path, account_path] {
+        let (request, send) = handle.next_request().await.expect("cleanup GET");
+        assert_eq!(request.uri().path(), path);
+        send.send_response(missing_response());
+    }
+    respond_compute_absence_proof(&mut handle, session_id, 1).await;
+
+    assert!(matches!(
+        task.await.unwrap().unwrap(),
+        CleanupProgress::Absent(_)
+    ));
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn compute_cleanup_rejects_a_wrong_phase_without_a_kubernetes_api_call() {
+    let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+    let client = Client::new(service, "default");
+    let session_id = session_id("discord:cleanup-wrong-phase");
+    let anchor = anchor(session_id);
+    let mut handle = std::pin::pin!(handle);
+    let stored = load_stored_anchor(client.clone(), &mut handle, anchor).await;
+    let provisioner = KubernetesGenerationProvisioner::new(client, NAMESPACE, scope_id()).unwrap();
+
+    assert_eq!(
+        provisioner
+            .reconcile_compute_absent(&stored)
+            .await
+            .unwrap_err(),
+        GenerationProvisionerError::InvalidCleanupPhase {
+            phase: SessionPhase::Provisioning,
         }
     );
     assert_no_request(&mut handle).await;

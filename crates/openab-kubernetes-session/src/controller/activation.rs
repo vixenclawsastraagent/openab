@@ -62,6 +62,7 @@ impl ObservedWorker {
 pub enum ProvisionerOperation {
     ProveChildrenAbsent,
     EnsureGeneration,
+    ReconcileComputeAbsence,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,6 +98,8 @@ pub enum GenerationProvisionerError {
     RandomnessUnavailable,
     #[error("the observed worker Pod UID is invalid")]
     InvalidPodUid,
+    #[error("compute cleanup is not allowed while the session is {phase:?}")]
+    InvalidCleanupPhase { phase: SessionPhase },
 }
 
 /// Minimal Kubernetes operations needed to arbitrate an activation.
