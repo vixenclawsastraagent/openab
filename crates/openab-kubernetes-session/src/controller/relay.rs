@@ -385,6 +385,22 @@ impl RelayOrchestrator {
         }
     }
 
+    /// Wait until an exact backpressured ACP message should be retried.
+    ///
+    /// This is a readiness hint, not a capacity reservation. The transport must
+    /// retain the original message and call [`Self::route_acp`] again after this
+    /// method returns successfully.
+    pub async fn wait_for_route_capacity(
+        &self,
+        connection: &RelayConnection,
+        message: &AcpMessageV1,
+    ) -> Result<(), RelayDeliveryError> {
+        self.registry
+            .wait_for_route_capacity(connection, message)
+            .await
+            .map_err(RelayDeliveryError::Rendezvous)
+    }
+
     /// Fence ACP and run one exact bridge lifecycle request in a
     /// controller-owned task.
     ///
@@ -1381,6 +1397,304 @@ mod tests {
         assert_eq!(
             registry.route_target(bridge.connection()),
             Err(RendezvousRouteError::StaleConnection)
+        );
+    }
+
+    #[tokio::test]
+    async fn route_capacity_waiter_observes_lane_drain_before_and_after_wait() {
+        let controller = Arc::new(FakeController::new(binding()));
+        controller.set_lifecycle_outcome(LifecycleServiceOutcome::ReleasePending);
+        let (relay, registry) = orchestrator(controller);
+        let (bridge, worker, mut bridge_outbound, mut worker_outbound) =
+            install_original_active_pair(&registry);
+        drain_installed_handshake(&mut bridge_outbound, &mut worker_outbound);
+        let first = AcpMessageV1::new(json!({"sequence": 1})).unwrap();
+        let retry = AcpMessageV1::new(json!({"sequence": 2})).unwrap();
+        assert_eq!(
+            relay
+                .route_acp(bridge.connection(), first.clone())
+                .await
+                .unwrap(),
+            RelayAcpDeliveryOutcome::Delivered
+        );
+        assert!(matches!(
+            relay.route_acp(bridge.connection(), retry.clone()).await,
+            Ok(RelayAcpDeliveryOutcome::Backpressured {
+                reason: RelayBackpressure::LaneItems,
+                ..
+            })
+        ));
+
+        {
+            let capacity = relay.wait_for_route_capacity(bridge.connection(), &retry);
+            tokio::pin!(capacity);
+            assert!(timeout(Duration::from_millis(20), &mut capacity)
+                .await
+                .is_err());
+            assert_eq!(
+                decode_outbound(worker_outbound.try_recv().unwrap()),
+                ControllerToWorkerV1::Acp(first)
+            );
+            timeout(Duration::from_secs(1), &mut capacity)
+                .await
+                .expect("draining the peer lane must wake the route waiter")
+                .unwrap();
+        }
+        assert_eq!(
+            relay
+                .route_acp(bridge.connection(), retry.clone())
+                .await
+                .unwrap(),
+            RelayAcpDeliveryOutcome::Delivered
+        );
+        drop(worker_outbound.try_recv().unwrap());
+
+        let late = AcpMessageV1::new(json!({"sequence": 3})).unwrap();
+        let late_retry = AcpMessageV1::new(json!({"sequence": 4})).unwrap();
+        assert_eq!(
+            relay.route_acp(bridge.connection(), late).await.unwrap(),
+            RelayAcpDeliveryOutcome::Delivered
+        );
+        assert!(matches!(
+            relay
+                .route_acp(bridge.connection(), late_retry.clone())
+                .await,
+            Ok(RelayAcpDeliveryOutcome::Backpressured {
+                reason: RelayBackpressure::LaneItems,
+                ..
+            })
+        ));
+        drop(worker_outbound.try_recv().unwrap());
+        timeout(
+            Duration::from_secs(1),
+            relay.wait_for_route_capacity(bridge.connection(), &late_retry),
+        )
+        .await
+        .expect("a lane drained before waiting must be observed")
+        .unwrap();
+
+        let fenced_first = AcpMessageV1::new(json!({"sequence": 5})).unwrap();
+        let fenced_retry = AcpMessageV1::new(json!({"sequence": 6})).unwrap();
+        assert_eq!(
+            relay
+                .route_acp(bridge.connection(), fenced_first)
+                .await
+                .unwrap(),
+            RelayAcpDeliveryOutcome::Delivered
+        );
+        assert!(matches!(
+            relay
+                .route_acp(bridge.connection(), fenced_retry.clone())
+                .await,
+            Ok(RelayAcpDeliveryOutcome::Backpressured {
+                reason: RelayBackpressure::LaneItems,
+                ..
+            })
+        ));
+        let lifecycle = {
+            let capacity = relay.wait_for_route_capacity(bridge.connection(), &fenced_retry);
+            tokio::pin!(capacity);
+            assert!(timeout(Duration::from_millis(20), &mut capacity)
+                .await
+                .is_err());
+            let lifecycle = tokio::spawn({
+                let relay = relay.clone();
+                let connection = bridge.connection().clone();
+                async move {
+                    relay
+                        .request_lifecycle(&connection, lifecycle_request("release", 0x410))
+                        .await
+                }
+            });
+            timeout(Duration::from_secs(1), async {
+                while registry.route_target(worker.connection())
+                    != Err(RendezvousRouteError::LifecyclePending)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the lifecycle request must fence routing");
+            timeout(Duration::from_secs(1), &mut capacity)
+                .await
+                .expect("lifecycle fencing must wake a lane capacity waiter")
+                .unwrap();
+            lifecycle
+        };
+        assert!(matches!(
+            relay.route_acp(bridge.connection(), fenced_retry).await,
+            Err(RelayDeliveryError::Rendezvous(
+                RendezvousRouteError::LifecyclePending
+            ))
+        ));
+        assert_eq!(
+            lifecycle.await.unwrap().unwrap(),
+            RelayLifecycleOutcome::ReleasePending
+        );
+    }
+
+    #[tokio::test]
+    async fn route_capacity_waiter_observes_byte_release_before_and_after_wait() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let budget = RelayByteBudget::new(NonZeroUsize::new(4 * 64 * 1024).unwrap()).unwrap();
+        let (relay, registry) = orchestrator_with_budget(controller, budget.clone());
+        let (bridge, _worker, mut bridge_outbound, mut worker_outbound) =
+            install_original_active_pair(&registry);
+        drain_installed_handshake(&mut bridge_outbound, &mut worker_outbound);
+        let first = AcpMessageV1::new(json!({"sequence": 1})).unwrap();
+        let held_bytes = budget.hold_for_test(budget.available_bytes());
+        assert!(matches!(
+            relay.route_acp(bridge.connection(), first.clone()).await,
+            Ok(RelayAcpDeliveryOutcome::Backpressured {
+                reason: RelayBackpressure::ProcessBytes,
+                ..
+            })
+        ));
+
+        {
+            let capacity = relay.wait_for_route_capacity(bridge.connection(), &first);
+            tokio::pin!(capacity);
+            assert!(timeout(Duration::from_millis(20), &mut capacity)
+                .await
+                .is_err());
+            drop(held_bytes);
+            timeout(Duration::from_secs(1), &mut capacity)
+                .await
+                .expect("releasing byte capacity must wake the route waiter")
+                .unwrap();
+        }
+        assert_eq!(
+            relay.route_acp(bridge.connection(), first).await.unwrap(),
+            RelayAcpDeliveryOutcome::Delivered
+        );
+        drop(worker_outbound.try_recv().unwrap());
+
+        let late = AcpMessageV1::new(json!({"sequence": 2})).unwrap();
+        let held_bytes = budget.hold_for_test(budget.available_bytes());
+        assert!(matches!(
+            relay.route_acp(bridge.connection(), late.clone()).await,
+            Ok(RelayAcpDeliveryOutcome::Backpressured {
+                reason: RelayBackpressure::ProcessBytes,
+                ..
+            })
+        ));
+        drop(held_bytes);
+        timeout(
+            Duration::from_secs(1),
+            relay.wait_for_route_capacity(bridge.connection(), &late),
+        )
+        .await
+        .expect("byte capacity released before waiting must be observed")
+        .unwrap();
+        assert_eq!(
+            relay.route_acp(bridge.connection(), late).await.unwrap(),
+            RelayAcpDeliveryOutcome::Delivered
+        );
+        drop(worker_outbound.try_recv().unwrap());
+    }
+
+    #[tokio::test]
+    async fn closed_peer_wakes_a_process_byte_waiter_before_budget_release() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let budget = RelayByteBudget::new(NonZeroUsize::new(4 * 64 * 1024).unwrap()).unwrap();
+        let (relay, registry) = orchestrator_with_budget(controller, budget.clone());
+        let (bridge, _worker, mut bridge_outbound, mut worker_outbound) =
+            install_original_active_pair(&registry);
+        drain_installed_handshake(&mut bridge_outbound, &mut worker_outbound);
+        let held_bytes = budget.hold_for_test(budget.available_bytes());
+        let retry = AcpMessageV1::new(json!({"sequence": 1})).unwrap();
+        assert!(matches!(
+            relay.route_acp(bridge.connection(), retry.clone()).await,
+            Ok(RelayAcpDeliveryOutcome::Backpressured {
+                reason: RelayBackpressure::ProcessBytes,
+                ..
+            })
+        ));
+
+        {
+            let capacity = relay.wait_for_route_capacity(bridge.connection(), &retry);
+            tokio::pin!(capacity);
+            assert!(timeout(Duration::from_millis(20), &mut capacity)
+                .await
+                .is_err());
+            drop(worker_outbound);
+            timeout(Duration::from_secs(1), &mut capacity)
+                .await
+                .expect("a closed peer must wake the route waiter")
+                .unwrap();
+        }
+        assert_eq!(budget.available_bytes(), 0);
+        assert_eq!(
+            relay.route_acp(bridge.connection(), retry).await.unwrap(),
+            RelayAcpDeliveryOutcome::PeerContained(OrphanContainmentOutcome::ContainmentAccepted)
+        );
+        assert_eq!(budget.available_bytes(), 0);
+        drop(held_bytes);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_transition_wakes_a_process_byte_capacity_waiter() {
+        let controller = Arc::new(FakeController::new(binding()));
+        controller.set_lifecycle_outcome(LifecycleServiceOutcome::ReleasePending);
+        let budget = RelayByteBudget::new(NonZeroUsize::new(4 * 64 * 1024).unwrap()).unwrap();
+        let (relay, registry) = orchestrator_with_budget(Arc::clone(&controller), budget.clone());
+        let (bridge, worker, mut bridge_outbound, mut worker_outbound) =
+            install_original_active_pair(&registry);
+        drain_installed_handshake(&mut bridge_outbound, &mut worker_outbound);
+        let held_bytes = budget.hold_for_test(budget.available_bytes());
+        let retry = AcpMessageV1::new(json!({"sequence": 1})).unwrap();
+        assert_eq!(
+            relay
+                .route_acp(worker.connection(), retry.clone())
+                .await
+                .unwrap(),
+            RelayAcpDeliveryOutcome::Backpressured {
+                message: retry.clone(),
+                reason: RelayBackpressure::ProcessBytes,
+            }
+        );
+
+        let lifecycle = {
+            let capacity = relay.wait_for_route_capacity(worker.connection(), &retry);
+            tokio::pin!(capacity);
+            assert!(timeout(Duration::from_millis(20), &mut capacity)
+                .await
+                .is_err());
+            let lifecycle = tokio::spawn({
+                let relay = relay.clone();
+                let connection = bridge.connection().clone();
+                async move {
+                    relay
+                        .request_lifecycle(&connection, lifecycle_request("release", 0x40f))
+                        .await
+                }
+            });
+            timeout(Duration::from_secs(1), async {
+                while registry.route_target(worker.connection())
+                    != Err(RendezvousRouteError::LifecyclePending)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the lifecycle request must fence routing");
+            timeout(Duration::from_secs(1), &mut capacity)
+                .await
+                .expect("lifecycle fencing must wake ACP capacity waiters")
+                .unwrap();
+            lifecycle
+        };
+        assert!(matches!(
+            relay.route_acp(worker.connection(), retry).await,
+            Err(RelayDeliveryError::Rendezvous(
+                RendezvousRouteError::LifecyclePending
+            ))
+        ));
+
+        drop(held_bytes);
+        assert_eq!(
+            lifecycle.await.unwrap().unwrap(),
+            RelayLifecycleOutcome::ReleasePending
         );
     }
 

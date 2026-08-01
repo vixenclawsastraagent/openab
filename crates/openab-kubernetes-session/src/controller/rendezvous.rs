@@ -203,6 +203,17 @@ impl RelayByteBudget {
         Some(lease)
     }
 
+    fn acp_capacity_available(&self, bytes: usize) -> bool {
+        if self.inner.control_waiters.load(Ordering::Acquire) != 0 {
+            return false;
+        }
+        let available = self
+            .inner
+            .limit
+            .saturating_sub(self.inner.used.load(Ordering::Acquire));
+        available >= bytes && self.inner.control_waiters.load(Ordering::Acquire) == 0
+    }
+
     fn try_acquire_up_to(&self, bytes: usize, admission_limit: usize) -> Option<RelayByteLease> {
         let mut used = self.inner.used.load(Ordering::Acquire);
         loop {
@@ -267,6 +278,11 @@ impl Drop for RelayControlWaiter {
     fn drop(&mut self) {
         let previous = self.inner.control_waiters.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0);
+        if previous == 1 {
+            self.inner
+                .release_generation
+                .send_modify(|generation| *generation = generation.wrapping_add(1));
+        }
     }
 }
 
@@ -612,6 +628,20 @@ struct WorkerSlot {
     profile: ProfileRef,
 }
 
+enum RelayCapacityWaiter {
+    Bridge(mpsc::Sender<RelayOutboundItem<ControllerToBridgeV1>>),
+    Worker(mpsc::Sender<RelayOutboundItem<ControllerToWorkerV1>>),
+}
+
+impl RelayCapacityWaiter {
+    async fn closed(&self) {
+        match self {
+            Self::Bridge(sender) => sender.closed().await,
+            Self::Worker(sender) => sender.closed().await,
+        }
+    }
+}
+
 #[derive(Debug)]
 enum RelaySessionState {
     Pairing {
@@ -661,6 +691,9 @@ struct RelaySession {
     authority: OrphanAuthority,
     state: RelaySessionState,
     quiesced: watch::Sender<bool>,
+    // Lifecycle fences ACP while retaining the bridge for its final response,
+    // so routing readiness cannot reuse the stronger quiesce signal.
+    routing_stopped: watch::Sender<bool>,
 }
 
 #[derive(Debug, Default)]
@@ -774,6 +807,7 @@ impl RendezvousRegistry {
         }
         let session = state.sessions.entry(session_id).or_insert_with(|| {
             let (quiesced, _) = watch::channel(false);
+            let (routing_stopped, _) = watch::channel(false);
             RelaySession {
                 authority: authority.clone(),
                 state: RelaySessionState::Pairing {
@@ -782,6 +816,7 @@ impl RendezvousRegistry {
                     activation: None,
                 },
                 quiesced,
+                routing_stopped,
             }
         });
         validate_existing_session(session, &authority, RelayLane::Bridge)?;
@@ -839,6 +874,7 @@ impl RendezvousRegistry {
         }
         let session = state.sessions.entry(session_id).or_insert_with(|| {
             let (quiesced, _) = watch::channel(false);
+            let (routing_stopped, _) = watch::channel(false);
             RelaySession {
                 authority: authority.clone(),
                 state: RelaySessionState::Pairing {
@@ -847,6 +883,7 @@ impl RendezvousRegistry {
                     activation: None,
                 },
                 quiesced,
+                routing_stopped,
             }
         });
         validate_existing_session(session, &authority, RelayLane::Worker)?;
@@ -943,15 +980,30 @@ impl RendezvousRegistry {
             RelaySessionState::Lifecycle(_) => Err(RendezvousRouteError::LifecyclePending),
             RelaySessionState::Quiescing { .. } => Err(RendezvousRouteError::Quiescing),
             RelaySessionState::Active { bridge, worker } => {
-                let queued_bytes = message
-                    .encoded_payload_bytes()
-                    .checked_add(MAX_CONTROL_FRAME_BYTES)
-                    .expect("a validated ACP payload plus frame overhead fits usize");
+                let queued_bytes = acp_queue_bytes(&message);
                 if queued_bytes > self.byte_budget.inner.limit {
                     return Err(RendezvousRouteError::FrameExceedsByteBudget {
                         bytes: queued_bytes,
                         capacity: self.byte_budget.inner.limit,
                     });
+                }
+                let closed_peer = match connection.lane {
+                    RelayLane::Bridge if worker.outbound.is_closed() => Some(RelayConnection {
+                        session_id: connection.session_id,
+                        lane: RelayLane::Worker,
+                        connection_id: worker.connection_id,
+                    }),
+                    RelayLane::Worker if bridge.outbound.is_closed() => Some(RelayConnection {
+                        session_id: connection.session_id,
+                        lane: RelayLane::Bridge,
+                        connection_id: bridge.connection_id,
+                    }),
+                    RelayLane::Bridge | RelayLane::Worker => None,
+                };
+                if let Some(trigger) = closed_peer {
+                    return Ok(AcpRouteOutcome::ContainmentRequired(Box::new(quiesce(
+                        session, trigger,
+                    ))));
                 }
                 let permit = match self.byte_budget.try_acquire_acp(queued_bytes) {
                     Some(permit) => permit,
@@ -1020,6 +1072,112 @@ impl RendezvousRegistry {
                                 ))))
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Wait until retrying one backpressured ACP message can make progress.
+    ///
+    /// The caller must retain the exact message returned by [`Self::route_acp`]
+    /// and retry that method after this readiness hint resolves. Capacity is not
+    /// reserved across the return boundary, so a concurrent control frame or
+    /// relay may win the race and require another bounded wait. The subscription
+    /// and capacity check are ordered to avoid a lost wakeup.
+    pub(crate) async fn wait_for_route_capacity(
+        &self,
+        connection: &RelayConnection,
+        message: &AcpMessageV1,
+    ) -> Result<(), RendezvousRouteError> {
+        let queued_bytes = acp_queue_bytes(message);
+        if queued_bytes > self.byte_budget.inner.limit {
+            return Err(RendezvousRouteError::FrameExceedsByteBudget {
+                bytes: queued_bytes,
+                capacity: self.byte_budget.inner.limit,
+            });
+        }
+        let (waiter, mut releases, mut quiesced, mut routing_stopped) = {
+            let state = self.lock_state();
+            let Some(session) = state.sessions.get(&connection.session_id) else {
+                return Err(RendezvousRouteError::StaleConnection);
+            };
+            if !session.state.contains(connection) {
+                return Err(RendezvousRouteError::StaleConnection);
+            }
+            let RelaySessionState::Active { bridge, worker } = &session.state else {
+                return Err(match &session.state {
+                    RelaySessionState::Pairing { .. } => RendezvousRouteError::AwaitingPeer,
+                    RelaySessionState::Lifecycle(_) => RendezvousRouteError::LifecyclePending,
+                    RelaySessionState::Quiescing { .. } => RendezvousRouteError::Quiescing,
+                    RelaySessionState::Active { .. } => unreachable!(),
+                });
+            };
+            let waiter = match connection.lane {
+                RelayLane::Bridge => RelayCapacityWaiter::Worker(worker.outbound.clone()),
+                RelayLane::Worker => RelayCapacityWaiter::Bridge(bridge.outbound.clone()),
+            };
+            (
+                waiter,
+                self.byte_budget.subscribe_releases(),
+                session.quiesced.subscribe(),
+                session.routing_stopped.subscribe(),
+            )
+        };
+
+        self.wait_for_process_bytes(
+            queued_bytes,
+            &waiter,
+            &mut releases,
+            &mut quiesced,
+            &mut routing_stopped,
+        )
+        .await?;
+        match waiter {
+            RelayCapacityWaiter::Bridge(sender) => {
+                wait_for_lane_capacity(sender, quiesced, routing_stopped).await
+            }
+            RelayCapacityWaiter::Worker(sender) => {
+                wait_for_lane_capacity(sender, quiesced, routing_stopped).await
+            }
+        }
+    }
+
+    async fn wait_for_process_bytes(
+        &self,
+        queued_bytes: usize,
+        peer: &RelayCapacityWaiter,
+        releases: &mut watch::Receiver<u64>,
+        quiesced: &mut watch::Receiver<bool>,
+        routing_stopped: &mut watch::Receiver<bool>,
+    ) -> Result<(), RendezvousRouteError> {
+        loop {
+            if *quiesced.borrow() {
+                return Err(RendezvousRouteError::Quiescing);
+            }
+            if *routing_stopped.borrow() {
+                return Ok(());
+            }
+            if self.byte_budget.acp_capacity_available(queued_bytes) {
+                return Ok(());
+            }
+            tokio::select! {
+                biased;
+                changed = quiesced.changed() => {
+                    if changed.is_err() || *quiesced.borrow() {
+                        return Err(RendezvousRouteError::Quiescing);
+                    }
+                }
+                changed = routing_stopped.changed() => {
+                    if changed.is_err() {
+                        return Err(RendezvousRouteError::StaleConnection);
+                    }
+                    return Ok(());
+                }
+                () = peer.closed() => return Ok(()),
+                changed = releases.changed() => {
+                    if changed.is_err() {
+                        return Err(RendezvousRouteError::StaleConnection);
                     }
                 }
             }
@@ -1100,6 +1258,7 @@ impl RendezvousRegistry {
             let ticket =
                 synthetic_containment_ticket(authority.clone(), RelayContainmentOrigin::Installed);
             let (quiesced, _) = watch::channel(true);
+            let (routing_stopped, _) = watch::channel(true);
             state.sessions.insert(
                 session_id,
                 RelaySession {
@@ -1110,6 +1269,7 @@ impl RendezvousRegistry {
                         trigger: ticket.trigger.clone(),
                     },
                     quiesced,
+                    routing_stopped,
                 },
             );
             return RelayConnectionLoss::ContainmentRequired(Box::new(ticket));
@@ -1415,6 +1575,7 @@ fn quiesce(session: &mut RelaySession, trigger: RelayConnection) -> RelayContain
         worker,
         trigger: trigger.clone(),
     };
+    session.routing_stopped.send_replace(true);
     session.quiesced.send_replace(true);
     RelayContainmentTicket {
         authority: session.authority.clone(),
@@ -1463,10 +1624,70 @@ fn fresh_connection_id(state: &RelaySessionState) -> RelayConnectionId {
     }
 }
 
+fn acp_queue_bytes(message: &AcpMessageV1) -> usize {
+    message
+        .encoded_payload_bytes()
+        .checked_add(MAX_CONTROL_FRAME_BYTES)
+        .expect("a validated ACP payload plus frame overhead fits usize")
+}
+
+async fn wait_for_lane_capacity<M>(
+    sender: mpsc::Sender<RelayOutboundItem<M>>,
+    mut quiesced: watch::Receiver<bool>,
+    mut routing_stopped: watch::Receiver<bool>,
+) -> Result<(), RendezvousRouteError> {
+    if *quiesced.borrow() {
+        return Err(RendezvousRouteError::Quiescing);
+    }
+    if *routing_stopped.borrow() {
+        return Ok(());
+    }
+    tokio::select! {
+        biased;
+        changed = quiesced.changed() => {
+            if changed.is_err() || *quiesced.borrow() {
+                Err(RendezvousRouteError::Quiescing)
+            } else {
+                Ok(())
+            }
+        }
+        changed = routing_stopped.changed() => {
+            if changed.is_err() {
+                Err(RendezvousRouteError::StaleConnection)
+            } else {
+                Ok(())
+            }
+        }
+        capacity = sender.reserve_owned() => {
+            drop(capacity);
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn dropping_the_last_control_waiter_wakes_acp_capacity_waiters() {
+        let budget =
+            RelayByteBudget::new(NonZeroUsize::new(MIN_RELAY_BYTE_BUDGET).unwrap()).unwrap();
+        let mut releases = budget.subscribe_releases();
+        let waiter = budget.begin_control_wait();
+        assert!(!budget.acp_capacity_available(1));
+
+        drop(waiter);
+
+        timeout(Duration::from_secs(1), releases.changed())
+            .await
+            .expect("dropping the final control waiter must publish capacity")
+            .expect("the byte-budget publisher remains alive");
+        assert!(budget.acp_capacity_available(1));
+    }
 
     #[test]
     fn mutex_poison_latches_process_fatal_health_during_unwind() {

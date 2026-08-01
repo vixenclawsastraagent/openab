@@ -348,6 +348,7 @@ impl RendezvousRegistry {
                     release_accepted: false,
                     phase: LifecyclePhase::ReservingQueue { reservation_id },
                 });
+                session.routing_stopped.send_replace(true);
                 LifecycleAdmission::Reserve(Box::new(LifecycleReservation {
                     registry: self.clone(),
                     key: LifecycleReservationKey {
