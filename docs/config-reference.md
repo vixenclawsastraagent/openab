@@ -322,10 +322,10 @@ agent process.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `controller_url` | string | required | Authenticated controller relay URL. Must use `wss://`. |
+| `controller_url` | string | required | Authenticated controller relay URL. Must use `wss://`, include a host, and contain no URL user credentials. |
 | `profile` | string | required | Cluster-owned worker profile name as a lowercase Kubernetes DNS label. |
-| `scope` | string | required | Stable team/agent state-ownership scope as a lowercase Kubernetes DNS label. |
-| `credential_file` | string | `/var/run/secrets/openab-session/token` | Path to the projected broker-to-controller credential. The credential value is not stored in TOML. |
+| `scope` | string | required | Non-empty stable team/agent state-ownership scope without edge whitespace, up to 253 bytes. It is hashed before use in Kubernetes resource identity. |
+| `credential_file` | string | `/var/run/secrets/openab-session/token` | Absolute path to the projected broker-to-controller credential. The credential value is not stored in TOML. |
 
 ```toml
 [kubernetes_session]
@@ -338,6 +338,11 @@ scope = "team-a-openab-codex"
 explicit `[agent].command`. The internal `OPENAB_SESSION_KEY` and
 `OPENAB_SESSION_ATTEMPT_ID` environment names are broker-owned in this mode
 and cannot appear in `[agent.env]` or `agent.inherit_env`.
+
+An `[agent]` section without `command` may still set `working_dir`, `env`, or
+`inherit_env`; those values configure only the trusted broker-side bridge and
+are not forwarded to the session worker Pod. Unknown keys inside
+`[kubernetes_session]` are rejected instead of being silently ignored.
 
 Broker filesystem workspace directives such as `[[ws:/path]]` are rejected in
 this mode. Worker checkout selection belongs to the administrator-owned

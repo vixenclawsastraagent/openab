@@ -171,9 +171,11 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 # runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent"
 # cancel_strategy = "stop"       # "stop" (default) or "noop"
 
-# --- Kubernetes session isolation add-on (alternative to [agent]/[agentcore]) ---
+# --- Kubernetes session isolation add-on (alternative runtime backend) ---
 # Entire section is optional and default-off. It requires the add-on-flavoured
 # broker image plus a separately installed controller for this scope.
+# When enabling it, comment out the explicit [agent].command block below;
+# [agent].env/inherit_env may still configure the trusted bridge process.
 # [kubernetes_session]
 # controller_url = "wss://openab-session-controller.openab-system.svc/relay"
 # profile = "codex-strict"
