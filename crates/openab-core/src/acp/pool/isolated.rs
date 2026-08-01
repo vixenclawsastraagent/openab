@@ -1,6 +1,6 @@
 use super::{
     better_candidate, classify_hung, classify_idle, kill_pgid_after_grace, purge_session_entries,
-    PoolState, SessionGate, SessionPool,
+    CancelHandle, PoolState, SessionGate, SessionPool,
 };
 use crate::acp::connection::{
     AcpConnection, BrokerMappingExpectation, LifecycleHandle, SessionActivity, SessionSpawnContext,
@@ -307,6 +307,147 @@ pub(super) fn write_mapping_file(path: &Path, mapping: &HashMap<String, String>)
     }
 
     Ok(())
+}
+
+pub(super) struct StrictSessionSnapshot {
+    persisted_session_id: Option<String>,
+    suspended_session_id: Option<String>,
+    active: Option<Arc<Mutex<AcpConnection>>>,
+    cancel_handle: Option<CancelHandle>,
+    lifecycle_handle: Option<LifecycleHandle>,
+    activity: Option<Arc<SessionActivity>>,
+    pgid: Option<i32>,
+    session_workdir: Option<String>,
+    creation_gate: Option<SessionGate>,
+}
+
+pub(super) fn strict_session_snapshot(state: &PoolState, thread_id: &str) -> StrictSessionSnapshot {
+    StrictSessionSnapshot {
+        persisted_session_id: state.persisted.get(thread_id).cloned(),
+        suspended_session_id: state.suspended.get(thread_id).cloned(),
+        active: state.active.get(thread_id).cloned(),
+        cancel_handle: state.cancel_handles.get(thread_id).cloned(),
+        lifecycle_handle: state.lifecycle_handles.get(thread_id).cloned(),
+        activity: state.activity.get(thread_id).cloned(),
+        pgid: state.pgids.get(thread_id).copied(),
+        session_workdir: state.session_workdirs.get(thread_id).cloned(),
+        creation_gate: state.creating.get(thread_id).cloned(),
+    }
+}
+
+fn same_arc<T: ?Sized>(current: Option<&Arc<T>>, expected: Option<&Arc<T>>) -> bool {
+    match (current, expected) {
+        (None, None) => true,
+        (Some(current), Some(expected)) => Arc::ptr_eq(current, expected),
+        _ => false,
+    }
+}
+
+fn same_cancel_handle(current: Option<&CancelHandle>, expected: Option<&CancelHandle>) -> bool {
+    match (current, expected) {
+        (None, None) => true,
+        (Some((current_stdin, current_id)), Some((expected_stdin, expected_id))) => {
+            Arc::ptr_eq(current_stdin, expected_stdin) && current_id == expected_id
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn ensure_strict_session_snapshot(
+    state: &PoolState,
+    thread_id: &str,
+    snapshot: &StrictSessionSnapshot,
+) -> Result<()> {
+    if state.persisted.get(thread_id) != snapshot.persisted_session_id.as_ref() {
+        return Err(anyhow!(
+            "isolated session mapping changed during strict activation"
+        ));
+    }
+
+    if state.suspended.get(thread_id) != snapshot.suspended_session_id.as_ref() {
+        return Err(anyhow!(
+            "isolated suspended session changed during strict activation"
+        ));
+    }
+
+    if !same_arc(state.active.get(thread_id), snapshot.active.as_ref()) {
+        return Err(anyhow!(
+            "isolated active session changed during strict activation"
+        ));
+    }
+
+    if !same_cancel_handle(
+        state.cancel_handles.get(thread_id),
+        snapshot.cancel_handle.as_ref(),
+    ) || !same_arc(
+        state.lifecycle_handles.get(thread_id),
+        snapshot.lifecycle_handle.as_ref(),
+    ) || !same_arc(state.activity.get(thread_id), snapshot.activity.as_ref())
+        || state.pgids.get(thread_id) != snapshot.pgid.as_ref()
+        || state.session_workdirs.get(thread_id) != snapshot.session_workdir.as_ref()
+    {
+        return Err(anyhow!(
+            "isolated session handles changed during strict activation"
+        ));
+    }
+
+    if !same_arc(
+        state.creating.get(thread_id),
+        snapshot.creation_gate.as_ref(),
+    ) {
+        return Err(anyhow!(
+            "isolated session creation gate changed during strict activation"
+        ));
+    }
+
+    if snapshot.active.is_none()
+        && (snapshot.cancel_handle.is_some()
+            || snapshot.lifecycle_handle.is_some()
+            || snapshot.activity.is_some()
+            || snapshot.pgid.is_some()
+            || snapshot.session_workdir.is_some())
+    {
+        return Err(anyhow!(
+            "isolated session has handles without an active connection"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Remove one controller-confirmed stale broker mapping before a fresh
+/// activation retry.
+///
+/// The caller holds the per-thread creation gate. This helper additionally
+/// compares every mutable pool entry captured before activation, writes the
+/// repaired durable map first, and only then publishes the same transition in
+/// memory. It never waits on a connection while holding `state`.
+pub(super) fn repair_absent_mapping(
+    state: &mut PoolState,
+    mapping_path: &Path,
+    thread_id: &str,
+    expected_persisted_session_id: &str,
+    snapshot: &StrictSessionSnapshot,
+) -> Result<StrictSessionSnapshot> {
+    if snapshot.persisted_session_id.as_deref() != Some(expected_persisted_session_id) {
+        return Err(anyhow!(
+            "mapping repair snapshot does not contain the expected durable session"
+        ));
+    }
+    ensure_strict_session_snapshot(state, thread_id, snapshot)?;
+
+    let mut repaired_persisted = state.persisted.clone();
+    repaired_persisted.remove(thread_id);
+    write_mapping_file(mapping_path, &repaired_persisted)?;
+
+    state.persisted = repaired_persisted;
+    state.suspended.remove(thread_id);
+    if snapshot.active.is_some() {
+        state.active.remove(thread_id);
+        purge_session_entries(state, thread_id);
+    }
+
+    Ok(strict_session_snapshot(state, thread_id))
 }
 
 pub(super) fn session_spawn_context(
@@ -1267,12 +1408,14 @@ impl SessionPool {
 mod tests {
     use super::super::{classify_hung, resolve_effective_workdir, SessionPool};
     use super::{
-        orphan_hung_strict_session, reset_strict_session, rollback_uncommitted_session,
-        session_spawn_context, shutdown_strict_with_limits, write_mapping_file, StrictCapacity,
-        StrictSuspendOutcome, UncommittedSessionProvenance,
+        orphan_hung_strict_session, repair_absent_mapping, reset_strict_session,
+        rollback_uncommitted_session, session_spawn_context, shutdown_strict_with_limits,
+        strict_session_snapshot, write_mapping_file, StrictCapacity, StrictSuspendOutcome,
+        UncommittedSessionProvenance,
     };
     use crate::acp::connection::{
-        BrokerMappingExpectation, LifecycleCapabilities, LifecycleHandle, SessionLifecycleControl,
+        AcpConnection, BrokerMappingExpectation, LifecycleCapabilities, LifecycleHandle,
+        SessionActivity, SessionLifecycleControl,
     };
     use crate::acp::lifecycle::MappingAbsentInitialization;
     use crate::acp::SessionContextMode;
@@ -1281,6 +1424,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+    use tokio::sync::Mutex;
 
     #[derive(Clone, Copy)]
     enum ReleaseBehavior {
@@ -1380,6 +1524,91 @@ while IFS= read -r line; do
 done
 "#;
         strict_pool_from_script(temp, max_sessions, script, HashMap::new())
+    }
+
+    #[cfg(unix)]
+    const MAPPING_REPAIR_SCRIPT: &str = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf 'initialize:%s:%s\n' "$OPENAB_SESSION_MAPPING_EXPECTATION" "$OPENAB_SESSION_ATTEMPT_ID" >> "$ATTEMPT_LOG"
+      if [ "$OPENAB_SESSION_MAPPING_EXPECTATION" = "present" ]; then
+        if [ -n "${INITIALIZE_STARTED:-}" ]; then
+          printf '%s' started > "$INITIALIZE_STARTED"
+          while [ ! -f "$INITIALIZE_CONTINUE" ]; do sleep 0.01; done
+        fi
+        printf '{"jsonrpc":"2.0","id":1,"error":{"code":-32041,"message":"controller mapping absent","data":{"version":1,"outcome":"mapping_absent","attemptId":"%s"}}}\n' "$OPENAB_SESSION_ATTEMPT_ID"
+      else
+        if [ -n "${SECOND_INITIALIZE_STARTED:-}" ]; then
+          printf '%s' started > "$SECOND_INITIALIZE_STARTED"
+          while [ ! -f "$SECOND_INITIALIZE_CONTINUE" ]; do sleep 0.01; done
+        fi
+        if grep -q 'outer-session' "$MAPPING_PATH"; then
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"stale mapping was not durably removed"}}'
+        else
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"sessionCapabilities":{"close":{},"_meta":{"openab.dev":{"sessionRelease":{"version":1}}}}}}}'
+        fi
+      fi
+      ;;
+    *'"method":"session/load"'*)
+      printf '%s' load > "$LOAD_MARKER"
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
+      ;;
+    *'"method":"session/new"'*)
+      printf '%s\n' new >> "$ATTEMPT_LOG"
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"replacement-session"}}'
+      ;;
+    *'"method":"_openab/session/release"'*)
+      printf '%s\n' release >> "$ATTEMPT_LOG"
+      printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{}}'
+      ;;
+  esac
+done
+"#;
+
+    #[cfg(unix)]
+    fn mapping_repair_pool(temp: &std::path::Path, max_sessions: usize) -> SessionPool {
+        mapping_repair_pool_with_env(temp, max_sessions, HashMap::new())
+    }
+
+    #[cfg(unix)]
+    fn mapping_repair_pool_with_env(
+        temp: &std::path::Path,
+        max_sessions: usize,
+        mut env: HashMap<String, String>,
+    ) -> SessionPool {
+        let mapping_path = temp.join("thread_map.json");
+        write_mapping_file(
+            &mapping_path,
+            &HashMap::from([("discord:thread".to_string(), "outer-session".to_string())]),
+        )
+        .unwrap();
+        env.extend([
+            (
+                "ATTEMPT_LOG".to_string(),
+                temp.join("attempts.log").display().to_string(),
+            ),
+            (
+                "MAPPING_PATH".to_string(),
+                mapping_path.display().to_string(),
+            ),
+            (
+                "LOAD_MARKER".to_string(),
+                temp.join("unexpected-load").display().to_string(),
+            ),
+        ]);
+        strict_pool_from_script(temp, max_sessions, MAPPING_REPAIR_SCRIPT, env)
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_file(path: &std::path::Path) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !path.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("bridge should create synchronization marker");
     }
 
     #[test]
@@ -1740,26 +1969,137 @@ done
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn strict_mapping_absence_is_typed_without_mutating_durable_mapping() {
+    async fn strict_mapping_absence_repairs_mapping_and_retries_once() {
         let temp = tempfile::tempdir().unwrap();
         let mapping_path = temp.path().join("thread_map.json");
-        let expected_mapping =
-            HashMap::from([("discord:thread".to_string(), "outer-session".to_string())]);
-        write_mapping_file(&mapping_path, &expected_mapping).unwrap();
+        let attempt_log = temp.path().join("attempts.log");
+        let load_marker = temp.path().join("unexpected-load");
+        let pool = mapping_repair_pool(temp.path(), 1);
+
+        assert!(!pool.get_or_create("discord:thread", None).await.unwrap());
+
+        let attempts = std::fs::read_to_string(attempt_log)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(attempts.len(), 3);
+        assert!(attempts[0].starts_with("initialize:present:"));
+        assert!(attempts[1].starts_with("initialize:absent:"));
+        assert_eq!(attempts[2], "new");
+        let first_attempt = attempts[0].rsplit_once(':').unwrap().1;
+        let second_attempt = attempts[1].rsplit_once(':').unwrap().1;
+        assert_ne!(first_attempt, second_attempt);
+        assert!(uuid::Uuid::parse_str(first_attempt).is_ok());
+        assert!(uuid::Uuid::parse_str(second_attempt).is_ok());
+        assert!(
+            !load_marker.exists(),
+            "repair must not load the stale ACP ID"
+        );
+
+        let state = pool.state.read().await;
+        assert_eq!(
+            state.persisted.get("discord:thread").map(String::as_str),
+            Some("replacement-session")
+        );
+        assert!(!state.suspended.contains_key("discord:thread"));
+        let connection = Arc::clone(state.active.get("discord:thread").unwrap());
+        drop(state);
+        assert!(connection.lock().await.session_reset);
+        let on_disk: HashMap<String, String> =
+            serde_json::from_str(&std::fs::read_to_string(mapping_path).unwrap()).unwrap();
+        assert_eq!(
+            on_disk.get("discord:thread").map(String::as_str),
+            Some("replacement-session")
+        );
+        assert!(pool.strict_capacity.contains("discord:thread"));
+        let capacity = pool
+            .strict_capacity
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(capacity.occupied.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn strict_mapping_repair_does_not_retry_untyped_or_mismatched_errors() {
         let script = r#"
 while IFS= read -r line; do
   case "$line" in
     *'"method":"initialize"'*)
-      if [ "$OPENAB_SESSION_MAPPING_EXPECTATION" = "present" ]; then
-        printf '{"jsonrpc":"2.0","id":1,"error":{"code":-32041,"message":"untrusted controller detail","data":{"version":1,"outcome":"mapping_absent","attemptId":"%s"}}}\n' "$OPENAB_SESSION_ATTEMPT_ID"
+      printf '%s\n' "$OPENAB_SESSION_MAPPING_EXPECTATION" >> "$ATTEMPT_LOG"
+      if [ "$FAILURE_KIND" = "generic" ]; then
+        printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"worker unavailable"}}'
       else
-        printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"wrong mapping expectation"}}'
+        printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32041,"message":"mapping absent","data":{"version":1,"outcome":"mapping_absent","attemptId":"00000000-0000-0000-0000-000000000000"}}}'
       fi
       ;;
   esac
 done
 "#;
-        let pool = strict_pool_from_script(temp.path(), 1, script, HashMap::new());
+
+        for failure_kind in ["generic", "mismatched"] {
+            let temp = tempfile::tempdir().unwrap();
+            let mapping_path = temp.path().join("thread_map.json");
+            let expected =
+                HashMap::from([("discord:thread".to_string(), "outer-session".to_string())]);
+            write_mapping_file(&mapping_path, &expected).unwrap();
+            let attempt_log = temp.path().join("attempts.log");
+            let pool = strict_pool_from_script(
+                temp.path(),
+                1,
+                script,
+                HashMap::from([
+                    ("ATTEMPT_LOG".to_string(), attempt_log.display().to_string()),
+                    ("FAILURE_KIND".to_string(), failure_kind.to_string()),
+                ]),
+            );
+
+            let error = pool
+                .get_or_create("discord:thread", None)
+                .await
+                .unwrap_err();
+
+            assert!(error
+                .downcast_ref::<MappingAbsentInitialization>()
+                .is_none());
+            assert_eq!(std::fs::read_to_string(attempt_log).unwrap(), "present\n");
+            assert_eq!(pool.state.read().await.persisted, expected);
+            let on_disk: HashMap<String, String> =
+                serde_json::from_str(&std::fs::read_to_string(mapping_path).unwrap()).unwrap();
+            assert_eq!(on_disk, expected);
+            assert!(pool.strict_capacity.contains("discord:thread"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn strict_mapping_repair_never_retries_a_second_absence_signal() {
+        let temp = tempfile::tempdir().unwrap();
+        let mapping_path = temp.path().join("thread_map.json");
+        let attempt_log = temp.path().join("attempts.log");
+        write_mapping_file(
+            &mapping_path,
+            &HashMap::from([("discord:thread".to_string(), "outer-session".to_string())]),
+        )
+        .unwrap();
+        let script = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' "$OPENAB_SESSION_MAPPING_EXPECTATION" >> "$ATTEMPT_LOG"
+      printf '{"jsonrpc":"2.0","id":1,"error":{"code":-32041,"message":"mapping absent","data":{"version":1,"outcome":"mapping_absent","attemptId":"%s"}}}\n' "$OPENAB_SESSION_ATTEMPT_ID"
+      ;;
+  esac
+done
+"#;
+        let pool = strict_pool_from_script(
+            temp.path(),
+            1,
+            script,
+            HashMap::from([("ATTEMPT_LOG".to_string(), attempt_log.display().to_string())]),
+        );
 
         let error = pool
             .get_or_create("discord:thread", None)
@@ -1768,15 +2108,787 @@ done
 
         assert!(error
             .downcast_ref::<MappingAbsentInitialization>()
-            .is_some());
-        assert!(!error.to_string().contains("untrusted controller detail"));
+            .is_none());
+        assert_eq!(
+            std::fs::read_to_string(attempt_log)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            vec!["present", "absent"]
+        );
+        assert!(!pool
+            .state
+            .read()
+            .await
+            .persisted
+            .contains_key("discord:thread"));
+        let on_disk: HashMap<String, String> =
+            serde_json::from_str(&std::fs::read_to_string(mapping_path).unwrap()).unwrap();
+        assert!(!on_disk.contains_key("discord:thread"));
+        assert!(pool.strict_capacity.contains("discord:thread"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn strict_absent_expectation_never_treats_mapping_signal_as_retryable() {
+        let temp = tempfile::tempdir().unwrap();
+        let attempt_log = temp.path().join("attempts.log");
+        let script = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' "$OPENAB_SESSION_MAPPING_EXPECTATION" >> "$ATTEMPT_LOG"
+      printf '{"jsonrpc":"2.0","id":1,"error":{"code":-32041,"message":"mapping absent","data":{"version":1,"outcome":"mapping_absent","attemptId":"%s"}}}\n' "$OPENAB_SESSION_ATTEMPT_ID"
+      ;;
+  esac
+done
+"#;
+        let pool = strict_pool_from_script(
+            temp.path(),
+            1,
+            script,
+            HashMap::from([("ATTEMPT_LOG".to_string(), attempt_log.display().to_string())]),
+        );
+
+        let error = pool
+            .get_or_create("discord:thread", None)
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .downcast_ref::<MappingAbsentInitialization>()
+            .is_none());
+        assert_eq!(std::fs::read_to_string(attempt_log).unwrap(), "absent\n");
+        assert!(!pool
+            .state
+            .read()
+            .await
+            .persisted
+            .contains_key("discord:thread"));
+        assert!(pool.strict_capacity.contains("discord:thread"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dead_in_memory_acp_id_does_not_claim_a_durable_mapping() {
+        let temp = tempfile::tempdir().unwrap();
+        let attempt_log = temp.path().join("attempts.log");
+        let script = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf 'initialize:%s\n' "$OPENAB_SESSION_MAPPING_EXPECTATION" >> "$ATTEMPT_LOG"
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"sessionCapabilities":{"close":{},"_meta":{"openab.dev":{"sessionRelease":{"version":1}}}}}}}'
+      ;;
+    *'"method":"session/load"'*)
+      printf '%s\n' load >> "$ATTEMPT_LOG"
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
+      ;;
+    *'"method":"session/new"'*)
+      printf '%s\n' new >> "$ATTEMPT_LOG"
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"replacement-session"}}'
+      ;;
+  esac
+done
+"#;
+        let pool = strict_pool_from_script(
+            temp.path(),
+            1,
+            script,
+            HashMap::from([("ATTEMPT_LOG".to_string(), attempt_log.display().to_string())]),
+        );
+        let mut dead_connection = AcpConnection::spawn(
+            "/bin/sh",
+            &["-c".to_string(), "exit 0".to_string()],
+            temp.path().to_str().unwrap(),
+            &HashMap::new(),
+            &[],
+        )
+        .await
+        .unwrap();
+        dead_connection.acp_session_id = Some("memory-only-session".to_string());
+        let dead_connection = Arc::new(Mutex::new(dead_connection));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while dead_connection.lock().await.alive() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("test connection should exit");
+        pool.state
+            .write()
+            .await
+            .active
+            .insert("discord:thread".to_string(), Arc::clone(&dead_connection));
+
+        assert!(!pool.get_or_create("discord:thread", None).await.unwrap());
+
+        assert_eq!(
+            std::fs::read_to_string(attempt_log).unwrap(),
+            "initialize:absent\nnew\n"
+        );
         let state = pool.state.read().await;
-        assert_eq!(state.persisted, expected_mapping);
+        assert_eq!(
+            state.persisted.get("discord:thread").map(String::as_str),
+            Some("replacement-session")
+        );
+        let replacement = Arc::clone(state.active.get("discord:thread").unwrap());
+        assert!(!Arc::ptr_eq(&replacement, &dead_connection));
+        drop(state);
+        assert!(replacement.lock().await.session_reset);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn strict_suspended_state_requires_an_identical_durable_mapping() {
+        for durable_session_id in [None, Some("outer-session")] {
+            let temp = tempfile::tempdir().unwrap();
+            let mapping_path = temp.path().join("thread_map.json");
+            if let Some(session_id) = durable_session_id {
+                write_mapping_file(
+                    &mapping_path,
+                    &HashMap::from([("discord:thread".to_string(), session_id.to_string())]),
+                )
+                .unwrap();
+            }
+            let spawned = temp.path().join("unexpected-spawn");
+            let script = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s' spawned > "$SPAWNED"
+      ;;
+  esac
+done
+"#;
+            let pool = strict_pool_from_script(
+                temp.path(),
+                1,
+                script,
+                HashMap::from([("SPAWNED".to_string(), spawned.display().to_string())]),
+            );
+            pool.state.write().await.suspended.insert(
+                "discord:thread".to_string(),
+                "untrusted-memory-session".to_string(),
+            );
+
+            let error = pool
+                .get_or_create("discord:thread", None)
+                .await
+                .unwrap_err();
+
+            assert!(error
+                .to_string()
+                .contains("does not match its durable mapping"));
+            assert!(!spawned.exists());
+            let state = pool.state.read().await;
+            assert_eq!(
+                state.suspended.get("discord:thread").map(String::as_str),
+                Some("untrusted-memory-session")
+            );
+            assert_eq!(
+                state.persisted.get("discord:thread").map(String::as_str),
+                durable_session_id
+            );
+            assert!(!pool.strict_capacity.contains("discord:thread"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn strict_mapping_repair_write_failure_retains_exact_mapping_without_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        // The original file name fits common NAME_MAX limits, while the
+        // durable writer's unique temporary suffix does not. This forces the
+        // pre-rename write to fail without modifying the existing file.
+        let mapping_path = temp.path().join("m".repeat(250));
+        let expected = HashMap::from([("discord:thread".to_string(), "outer-session".to_string())]);
+        std::fs::write(&mapping_path, serde_json::to_vec_pretty(&expected).unwrap()).unwrap();
+        let attempt_log = temp.path().join("attempts.log");
+        let script = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' "$OPENAB_SESSION_MAPPING_EXPECTATION" >> "$ATTEMPT_LOG"
+      printf '{"jsonrpc":"2.0","id":1,"error":{"code":-32041,"message":"mapping absent","data":{"version":1,"outcome":"mapping_absent","attemptId":"%s"}}}\n' "$OPENAB_SESSION_ATTEMPT_ID"
+      ;;
+  esac
+done
+"#;
+        let config = AgentConfig {
+            command: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            working_dir: temp.path().display().to_string(),
+            env: HashMap::from([("ATTEMPT_LOG".to_string(), attempt_log.display().to_string())]),
+            ..AgentConfig::default()
+        };
+        let pool = SessionPool::new_with_paths(
+            config,
+            1,
+            60,
+            HashMap::new(),
+            mapping_path.clone(),
+            temp.path().join("session_meta.json"),
+        )
+        .try_with_session_context(SessionContextMode::OpenabV1)
+        .unwrap();
+
+        let error = pool
+            .get_or_create("discord:thread", None)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("failed to persist"));
+        assert_eq!(std::fs::read_to_string(attempt_log).unwrap(), "present\n");
+        assert_eq!(pool.state.read().await.persisted, expected);
+        let on_disk: HashMap<String, String> =
+            serde_json::from_str(&std::fs::read_to_string(mapping_path).unwrap()).unwrap();
+        assert_eq!(on_disk, expected);
+        assert!(pool.strict_capacity.contains("discord:thread"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn strict_mapping_repair_rejects_changed_pool_state() {
+        for mutation in [
+            "mapping",
+            "suspended",
+            "suspended-removed",
+            "suspended-inserted",
+            "active",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let initialize_started = temp.path().join("initialize-started");
+            let initialize_continue = temp.path().join("initialize-continue");
+            let attempt_log = temp.path().join("attempts.log");
+            let mapping_path = temp.path().join("thread_map.json");
+            let pool = Arc::new(mapping_repair_pool_with_env(
+                temp.path(),
+                1,
+                HashMap::from([
+                    (
+                        "INITIALIZE_STARTED".to_string(),
+                        initialize_started.display().to_string(),
+                    ),
+                    (
+                        "INITIALIZE_CONTINUE".to_string(),
+                        initialize_continue.display().to_string(),
+                    ),
+                ]),
+            ));
+            if mutation == "suspended-inserted" {
+                pool.state.write().await.suspended.remove("discord:thread");
+            }
+            let create = tokio::spawn({
+                let pool = Arc::clone(&pool);
+                async move { pool.get_or_create("discord:thread", None).await }
+            });
+            wait_for_file(&initialize_started).await;
+
+            let mut expected_replacement = None;
+            match mutation {
+                "mapping" => {
+                    pool.state
+                        .write()
+                        .await
+                        .persisted
+                        .insert("discord:thread".to_string(), "racing-session".to_string());
+                }
+                "suspended" => {
+                    pool.state
+                        .write()
+                        .await
+                        .suspended
+                        .insert("discord:thread".to_string(), "racing-session".to_string());
+                }
+                "suspended-removed" => {
+                    pool.state.write().await.suspended.remove("discord:thread");
+                }
+                "suspended-inserted" => {
+                    pool.state
+                        .write()
+                        .await
+                        .suspended
+                        .insert("discord:thread".to_string(), "outer-session".to_string());
+                }
+                "active" => {
+                    let replacement = Arc::new(Mutex::new(
+                        AcpConnection::spawn(
+                            "/bin/sh",
+                            &[
+                                "-c".to_string(),
+                                "while IFS= read -r line; do :; done".to_string(),
+                            ],
+                            temp.path().to_str().unwrap(),
+                            &HashMap::new(),
+                            &[],
+                        )
+                        .await
+                        .unwrap(),
+                    ));
+                    pool.state
+                        .write()
+                        .await
+                        .active
+                        .insert("discord:thread".to_string(), Arc::clone(&replacement));
+                    expected_replacement = Some(replacement);
+                }
+                _ => unreachable!(),
+            }
+            std::fs::write(&initialize_continue, "continue").unwrap();
+
+            let error = create.await.unwrap().unwrap_err();
+            assert!(error.to_string().contains("changed"));
+            assert_eq!(
+                std::fs::read_to_string(&attempt_log)
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1,
+                "{mutation} race must not spawn a retry"
+            );
+            let on_disk: HashMap<String, String> =
+                serde_json::from_str(&std::fs::read_to_string(&mapping_path).unwrap()).unwrap();
+            assert_eq!(
+                on_disk.get("discord:thread").map(String::as_str),
+                Some("outer-session")
+            );
+            let state = pool.state.read().await;
+            match mutation {
+                "mapping" => {
+                    assert_eq!(
+                        state.persisted.get("discord:thread").map(String::as_str),
+                        Some("racing-session")
+                    );
+                    assert_eq!(
+                        state.suspended.get("discord:thread").map(String::as_str),
+                        Some("outer-session")
+                    );
+                    assert!(!state.active.contains_key("discord:thread"));
+                }
+                "suspended" => {
+                    assert_eq!(
+                        state.persisted.get("discord:thread").map(String::as_str),
+                        Some("outer-session")
+                    );
+                    assert_eq!(
+                        state.suspended.get("discord:thread").map(String::as_str),
+                        Some("racing-session")
+                    );
+                    assert!(!state.active.contains_key("discord:thread"));
+                }
+                "suspended-removed" => {
+                    assert_eq!(
+                        state.persisted.get("discord:thread").map(String::as_str),
+                        Some("outer-session")
+                    );
+                    assert!(!state.suspended.contains_key("discord:thread"));
+                    assert!(!state.active.contains_key("discord:thread"));
+                }
+                "suspended-inserted" => {
+                    assert_eq!(
+                        state.persisted.get("discord:thread").map(String::as_str),
+                        Some("outer-session")
+                    );
+                    assert_eq!(
+                        state.suspended.get("discord:thread").map(String::as_str),
+                        Some("outer-session")
+                    );
+                    assert!(!state.active.contains_key("discord:thread"));
+                }
+                "active" => {
+                    let expected_replacement = expected_replacement.as_ref().unwrap();
+                    assert_eq!(
+                        state.persisted.get("discord:thread").map(String::as_str),
+                        Some("outer-session")
+                    );
+                    assert_eq!(
+                        state.suspended.get("discord:thread").map(String::as_str),
+                        Some("outer-session")
+                    );
+                    assert!(state
+                        .active
+                        .get("discord:thread")
+                        .is_some_and(|current| Arc::ptr_eq(current, expected_replacement)));
+                }
+                _ => unreachable!(),
+            }
+            drop(state);
+            assert!(pool.strict_capacity.contains("discord:thread"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn strict_mapping_repair_keeps_same_thread_calls_behind_creation_gate() {
+        let temp = tempfile::tempdir().unwrap();
+        let initialize_started = temp.path().join("initialize-started");
+        let initialize_continue = temp.path().join("initialize-continue");
+        let attempt_log = temp.path().join("attempts.log");
+        let pool = Arc::new(mapping_repair_pool_with_env(
+            temp.path(),
+            1,
+            HashMap::from([
+                (
+                    "INITIALIZE_STARTED".to_string(),
+                    initialize_started.display().to_string(),
+                ),
+                (
+                    "INITIALIZE_CONTINUE".to_string(),
+                    initialize_continue.display().to_string(),
+                ),
+            ]),
+        ));
+        let first = tokio::spawn({
+            let pool = Arc::clone(&pool);
+            async move { pool.get_or_create("discord:thread", None).await }
+        });
+        wait_for_file(&initialize_started).await;
+        let second = tokio::spawn({
+            let pool = Arc::clone(&pool);
+            async move { pool.get_or_create("discord:thread", None).await }
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!second.is_finished());
+        assert_eq!(
+            std::fs::read_to_string(&attempt_log)
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        std::fs::write(initialize_continue, "continue").unwrap();
+
+        assert!(!first.await.unwrap().unwrap());
+        assert!(!second.await.unwrap().unwrap());
+        assert_eq!(
+            std::fs::read_to_string(attempt_log)
+                .unwrap()
+                .lines()
+                .count(),
+            3
+        );
+        assert_eq!(pool.state.read().await.active.len(), 1);
+        let capacity = pool
+            .strict_capacity
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(capacity.occupied.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn strict_mapping_repair_publish_conflict_preserves_replacement_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let second_initialize_started = temp.path().join("second-initialize-started");
+        let second_initialize_continue = temp.path().join("second-initialize-continue");
+        let attempt_log = temp.path().join("attempts.log");
+        let mapping_path = temp.path().join("thread_map.json");
+        let pool = Arc::new(mapping_repair_pool_with_env(
+            temp.path(),
+            1,
+            HashMap::from([
+                (
+                    "SECOND_INITIALIZE_STARTED".to_string(),
+                    second_initialize_started.display().to_string(),
+                ),
+                (
+                    "SECOND_INITIALIZE_CONTINUE".to_string(),
+                    second_initialize_continue.display().to_string(),
+                ),
+            ]),
+        ));
+        let create = tokio::spawn({
+            let pool = Arc::clone(&pool);
+            async move { pool.get_or_create("discord:thread", None).await }
+        });
+        wait_for_file(&second_initialize_started).await;
+
+        let mut replacement_connection = AcpConnection::spawn(
+            "/bin/sh",
+            &["-c".to_string(), "exit 0".to_string()],
+            temp.path().to_str().unwrap(),
+            &HashMap::new(),
+            &[],
+        )
+        .await
+        .unwrap();
+        replacement_connection.acp_session_id = Some("racing-session".to_string());
+        let replacement_cancel = (
+            replacement_connection.cancel_handle(),
+            "racing-session".to_string(),
+        );
+        let replacement_activity = replacement_connection.activity_handle();
+        let replacement_pgid = replacement_connection.child_pgid().unwrap();
+        let replacement_connection = Arc::new(Mutex::new(replacement_connection));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while replacement_connection.lock().await.alive() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement bridge should exit");
+        let replacement_lifecycle = FakeLifecycle::new(ReleaseBehavior::Succeed).handle();
+        let create_gate = {
+            let mut state = pool.state.write().await;
+            let replacement_mapping =
+                HashMap::from([("discord:thread".to_string(), "racing-session".to_string())]);
+            write_mapping_file(&mapping_path, &replacement_mapping).unwrap();
+            state.persisted = replacement_mapping;
+            state
+                .suspended
+                .insert("discord:thread".to_string(), "racing-session".to_string());
+            state.active.insert(
+                "discord:thread".to_string(),
+                Arc::clone(&replacement_connection),
+            );
+            state
+                .cancel_handles
+                .insert("discord:thread".to_string(), replacement_cancel.clone());
+            state.lifecycle_handles.insert(
+                "discord:thread".to_string(),
+                Arc::clone(&replacement_lifecycle),
+            );
+            state.activity.insert(
+                "discord:thread".to_string(),
+                Arc::clone(&replacement_activity),
+            );
+            state
+                .pgids
+                .insert("discord:thread".to_string(), replacement_pgid);
+            state.session_workdirs.insert(
+                "discord:thread".to_string(),
+                "/replacement/worktree".to_string(),
+            );
+            Arc::clone(state.creating.get("discord:thread").unwrap())
+        };
+        std::fs::write(second_initialize_continue, "continue").unwrap();
+
+        let error = create.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("mapping changed"));
+        let attempts = std::fs::read_to_string(attempt_log).unwrap();
+        assert_eq!(
+            attempts
+                .lines()
+                .filter(|line| line.starts_with("initialize:"))
+                .count(),
+            2
+        );
+        assert!(attempts.lines().any(|line| line == "new"));
+        assert!(attempts.lines().any(|line| line == "release"));
+
+        let state = pool.state.read().await;
+        assert_eq!(
+            state.persisted.get("discord:thread").map(String::as_str),
+            Some("racing-session")
+        );
+        assert_eq!(
+            state.suspended.get("discord:thread").map(String::as_str),
+            Some("racing-session")
+        );
+        assert!(state
+            .active
+            .get("discord:thread")
+            .is_some_and(|current| Arc::ptr_eq(current, &replacement_connection)));
+        assert!(state
+            .cancel_handles
+            .get("discord:thread")
+            .is_some_and(|(stdin, session_id)| {
+                Arc::ptr_eq(stdin, &replacement_cancel.0) && session_id == &replacement_cancel.1
+            }));
+        assert!(state
+            .lifecycle_handles
+            .get("discord:thread")
+            .is_some_and(|current| Arc::ptr_eq(current, &replacement_lifecycle)));
+        assert!(state
+            .activity
+            .get("discord:thread")
+            .is_some_and(|current| Arc::ptr_eq(current, &replacement_activity)));
+        assert_eq!(state.pgids.get("discord:thread"), Some(&replacement_pgid));
+        assert_eq!(
+            state
+                .session_workdirs
+                .get("discord:thread")
+                .map(String::as_str),
+            Some("/replacement/worktree")
+        );
+        assert!(state
+            .creating
+            .get("discord:thread")
+            .is_some_and(|current| Arc::ptr_eq(current, &create_gate)));
         drop(state);
         let on_disk: HashMap<String, String> =
             serde_json::from_str(&std::fs::read_to_string(mapping_path).unwrap()).unwrap();
-        assert_eq!(on_disk, expected_mapping);
+        assert_eq!(
+            on_disk.get("discord:thread").map(String::as_str),
+            Some("racing-session")
+        );
         assert!(pool.strict_capacity.contains("discord:thread"));
+        let capacity = pool
+            .strict_capacity
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(capacity.occupied.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mapping_repair_purges_exact_dead_connection_but_preserves_creation_gate() {
+        let temp = tempfile::tempdir().unwrap();
+        let mapping_path = temp.path().join("thread_map.json");
+        let script = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"sessionCapabilities":{"close":{},"_meta":{"openab.dev":{"sessionRelease":{"version":1}}}}}}}'
+      ;;
+    *'"method":"session/new"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"outer-session"}}'
+      exit 0
+      ;;
+  esac
+done
+"#;
+        let pool = strict_pool_from_script(temp.path(), 1, script, HashMap::new());
+        assert!(pool.get_or_create("discord:thread", None).await.unwrap());
+        let (dead_connection, create_gate) = {
+            let state = pool.state.read().await;
+            (
+                Arc::clone(state.active.get("discord:thread").unwrap()),
+                Arc::clone(state.creating.get("discord:thread").unwrap()),
+            )
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if !dead_connection.lock().await.alive() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("test bridge should exit");
+
+        let _gate_guard = create_gate.lock().await;
+        let mut state = pool.state.write().await;
+        state
+            .suspended
+            .insert("discord:thread".to_string(), "outer-session".to_string());
+        state
+            .session_workdirs
+            .insert("discord:thread".to_string(), "/stale/worktree".to_string());
+        assert!(state.cancel_handles.contains_key("discord:thread"));
+        assert!(state.lifecycle_handles.contains_key("discord:thread"));
+        assert!(state.activity.contains_key("discord:thread"));
+        assert!(state.pgids.contains_key("discord:thread"));
+        let removed_active_snapshot = strict_session_snapshot(&state, "discord:thread");
+        state.active.remove("discord:thread");
+        let error = repair_absent_mapping(
+            &mut state,
+            &mapping_path,
+            "discord:thread",
+            "outer-session",
+            &removed_active_snapshot,
+        )
+        .err()
+        .expect("removed active connection must fail snapshot validation");
+        assert!(error.to_string().contains("active session changed"));
+        assert!(!state.active.contains_key("discord:thread"));
+        assert_eq!(
+            state.persisted.get("discord:thread").map(String::as_str),
+            Some("outer-session")
+        );
+        let orphaned_handles_snapshot = strict_session_snapshot(&state, "discord:thread");
+        let error = repair_absent_mapping(
+            &mut state,
+            &mapping_path,
+            "discord:thread",
+            "outer-session",
+            &orphaned_handles_snapshot,
+        )
+        .err()
+        .expect("orphaned auxiliary handles must fail snapshot validation");
+        assert!(error
+            .to_string()
+            .contains("handles without an active connection"));
+        assert_eq!(
+            state.persisted.get("discord:thread").map(String::as_str),
+            Some("outer-session")
+        );
+        state
+            .active
+            .insert("discord:thread".to_string(), Arc::clone(&dead_connection));
+
+        let rejected_snapshot = strict_session_snapshot(&state, "discord:thread");
+        let replacement_activity = Arc::new(SessionActivity::new());
+        state.activity.insert(
+            "discord:thread".to_string(),
+            Arc::clone(&replacement_activity),
+        );
+
+        let error = repair_absent_mapping(
+            &mut state,
+            &mapping_path,
+            "discord:thread",
+            "outer-session",
+            &rejected_snapshot,
+        )
+        .err()
+        .expect("replaced activity handle must fail snapshot validation");
+        assert!(error.to_string().contains("handles changed"));
+        assert_eq!(
+            state.persisted.get("discord:thread").map(String::as_str),
+            Some("outer-session")
+        );
+        assert!(state
+            .active
+            .get("discord:thread")
+            .is_some_and(|current| Arc::ptr_eq(current, &dead_connection)));
+        assert!(state
+            .activity
+            .get("discord:thread")
+            .is_some_and(|current| Arc::ptr_eq(current, &replacement_activity)));
+        let still_on_disk: HashMap<String, String> =
+            serde_json::from_str(&std::fs::read_to_string(&mapping_path).unwrap()).unwrap();
+        assert_eq!(
+            still_on_disk.get("discord:thread").map(String::as_str),
+            Some("outer-session")
+        );
+
+        state.activity.insert(
+            "discord:thread".to_string(),
+            Arc::clone(rejected_snapshot.activity.as_ref().unwrap()),
+        );
+        let accepted_snapshot = strict_session_snapshot(&state, "discord:thread");
+
+        repair_absent_mapping(
+            &mut state,
+            &mapping_path,
+            "discord:thread",
+            "outer-session",
+            &accepted_snapshot,
+        )
+        .unwrap();
+
+        assert!(!state.active.contains_key("discord:thread"));
+        assert!(!state.cancel_handles.contains_key("discord:thread"));
+        assert!(!state.lifecycle_handles.contains_key("discord:thread"));
+        assert!(!state.activity.contains_key("discord:thread"));
+        assert!(!state.pgids.contains_key("discord:thread"));
+        assert!(!state.suspended.contains_key("discord:thread"));
+        assert!(!state.persisted.contains_key("discord:thread"));
+        assert!(!state.session_workdirs.contains_key("discord:thread"));
+        assert!(state
+            .creating
+            .get("discord:thread")
+            .is_some_and(|current| Arc::ptr_eq(current, &create_gate)));
+        drop(state);
+        let on_disk: HashMap<String, String> =
+            serde_json::from_str(&std::fs::read_to_string(mapping_path).unwrap()).unwrap();
+        assert!(!on_disk.contains_key("discord:thread"));
     }
 
     #[cfg(unix)]

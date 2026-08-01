@@ -3,6 +3,7 @@ mod isolated;
 use crate::acp::connection::{
     AcpConnection, BrokerMappingExpectation, LifecycleHandle, SessionActivity,
 };
+use crate::acp::lifecycle::MappingAbsentInitialization;
 use crate::acp::protocol::ConfigOption;
 use crate::acp::SessionContextMode;
 use crate::config::AgentConfig;
@@ -229,10 +230,9 @@ fn get_or_insert_gate(map: &mut HashMap<String, Arc<Mutex<()>>>, key: &str) -> A
 }
 
 fn durable_mapping_expectation(
-    persisted: &HashMap<String, String>,
-    thread_id: &str,
+    expected_persisted_session_id: Option<&str>,
 ) -> BrokerMappingExpectation {
-    if persisted.contains_key(thread_id) {
+    if expected_persisted_session_id.is_some() {
         BrokerMappingExpectation::Present
     } else {
         BrokerMappingExpectation::Absent
@@ -599,17 +599,36 @@ impl SessionPool {
                 .ensure_session_admission_open(thread_id)?;
         }
 
-        let (existing, saved_session_id, broker_mapping_expectation) = {
+        let (
+            existing,
+            saved_session_id,
+            expected_persisted_session_id,
+            broker_mapping_expectation,
+            mut strict_session_snapshot,
+        ) = {
             let state = self.state.read().await;
-            let saved_session_id = state.suspended.get(thread_id).cloned().or_else(|| {
-                (self.session_context == SessionContextMode::OpenabV1)
-                    .then(|| state.persisted.get(thread_id).cloned())
-                    .flatten()
-            });
+            let expected_persisted_session_id = state.persisted.get(thread_id).cloned();
+            let suspended_session_id = state.suspended.get(thread_id).cloned();
+            let saved_session_id = if self.session_context == SessionContextMode::OpenabV1 {
+                if suspended_session_id.as_ref().is_some_and(|suspended| {
+                    Some(suspended) != expected_persisted_session_id.as_ref()
+                }) {
+                    return Err(anyhow!(
+                        "isolated suspended session does not match its durable mapping"
+                    ));
+                }
+                expected_persisted_session_id.clone()
+            } else {
+                suspended_session_id
+            };
+            let strict_session_snapshot = (self.session_context == SessionContextMode::OpenabV1)
+                .then(|| isolated::strict_session_snapshot(&state, thread_id));
             (
                 state.active.get(thread_id).cloned(),
                 saved_session_id,
-                durable_mapping_expectation(&state.persisted, thread_id),
+                expected_persisted_session_id.clone(),
+                durable_mapping_expectation(expected_persisted_session_id.as_deref()),
+                strict_session_snapshot,
             )
         };
 
@@ -627,7 +646,7 @@ impl SessionPool {
             if conn.alive() {
                 return Ok(false);
             }
-            if saved_session_id.is_none() {
+            if self.session_context == SessionContextMode::None && saved_session_id.is_none() {
                 saved_session_id = conn.acp_session_id.clone();
             }
         }
@@ -690,29 +709,71 @@ impl SessionPool {
 
         // Build the replacement connection outside the state lock so one stuck
         // initialization does not block all unrelated sessions.
-        let session_spawn_context = isolated::session_spawn_context(
-            self.session_context,
-            thread_id,
-            broker_mapping_expectation,
-        );
-        let mut new_conn = AcpConnection::spawn_with_context(
-            &self.config.command,
-            &self.config.args,
-            &effective_workdir,
-            &self.config.env,
-            &self.config.inherit_env,
-            session_spawn_context.as_ref(),
-        )
-        .await?;
+        let mut broker_mapping_expectation = broker_mapping_expectation;
+        let mut mapping_was_repaired = false;
+        // This loop can spawn at most twice. The only retry flips both the
+        // expectation to Absent and the repair marker before the next spawn.
+        let mut new_conn = loop {
+            let session_spawn_context = isolated::session_spawn_context(
+                self.session_context,
+                thread_id,
+                broker_mapping_expectation,
+            );
+            let mut candidate = AcpConnection::spawn_with_context(
+                &self.config.command,
+                &self.config.args,
+                &effective_workdir,
+                &self.config.env,
+                &self.config.inherit_env,
+                session_spawn_context.as_ref(),
+            )
+            .await?;
 
-        // Once the bridge process has started, a worker may exist even if ACP
-        // initialization fails. Keep the strict slot occupied until a later
-        // controller-acknowledged release proves that capacity is free.
-        if let Some(reservation) = strict_reservation.as_mut() {
-            reservation.mark_uncertain();
-        }
+            // Once the bridge process has started, a worker may exist even if ACP
+            // initialization fails. Keep the strict slot occupied until a later
+            // controller-acknowledged release proves that capacity is free.
+            if let Some(reservation) = strict_reservation.as_mut() {
+                reservation.mark_uncertain();
+            }
 
-        new_conn.initialize().await?;
+            match candidate.initialize().await {
+                Ok(()) => break candidate,
+                Err(error)
+                    if self.session_context == SessionContextMode::OpenabV1
+                        && !mapping_was_repaired
+                        && broker_mapping_expectation == BrokerMappingExpectation::Present
+                        && error
+                            .downcast_ref::<MappingAbsentInitialization>()
+                            .is_some() =>
+                {
+                    // The typed response proves this activation did not attach
+                    // to the broker's retained outer session. Drop the bridge
+                    // before repairing broker state and starting a fresh,
+                    // independently fenced activation attempt.
+                    drop(candidate);
+                    let expected_session_id = expected_persisted_session_id
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("mapping repair requires a captured durable ID"))?;
+                    let mut state = self.state.write().await;
+                    let repaired_snapshot = isolated::repair_absent_mapping(
+                        &mut state,
+                        &self.mapping_path,
+                        thread_id,
+                        expected_session_id,
+                        strict_session_snapshot
+                            .as_ref()
+                            .expect("strict sessions capture a mapping repair snapshot"),
+                    )?;
+                    strict_session_snapshot = Some(repaired_snapshot);
+                    drop(state);
+
+                    saved_session_id = None;
+                    broker_mapping_expectation = BrokerMappingExpectation::Absent;
+                    mapping_was_repaired = true;
+                }
+                Err(error) => return Err(error),
+            }
+        };
 
         let mut resumed = false;
         let mut load_failed: Option<String> = None;
@@ -768,7 +829,7 @@ impl SessionPool {
             // live entries that died before we could recover a resumable
             // session id. In both cases the caller is continuing after an
             // unexpected session loss.
-            if had_existing || saved_session_id.is_some() {
+            if had_existing || saved_session_id.is_some() || mapping_was_repaired {
                 new_conn.session_reset = true;
             }
         }
@@ -793,6 +854,29 @@ impl SessionPool {
         let new_conn = Arc::new(Mutex::new(new_conn));
 
         let mut state = self.state.write().await;
+
+        if self.session_context == SessionContextMode::OpenabV1 {
+            let snapshot = strict_session_snapshot
+                .as_ref()
+                .expect("strict sessions capture a publication snapshot");
+            if let Err(error) =
+                isolated::ensure_strict_session_snapshot(&state, thread_id, snapshot)
+            {
+                drop(state);
+                let lifecycle = lifecycle_handle
+                    .as_ref()
+                    .expect("strict sessions always have a lifecycle handle");
+                // A competing state may own this thread's worker. Release only
+                // our unpublished candidate and retain the uncertain slot.
+                return Err(isolated::rollback_uncommitted_session(
+                    lifecycle,
+                    error,
+                    None,
+                    uncommitted_provenance,
+                )
+                .await);
+            }
+        }
 
         // This check and the active-map publish are linearized by the state
         // write lock. Shutdown closes strict admission before taking its
@@ -968,9 +1052,10 @@ impl SessionPool {
         }
 
         // Return true only for genuinely new sessions — not resumed or reconnected ones.
-        // A session with prior state (saved_session_id or had_existing) is a resume,
-        // even if we had to spawn a new ACP process. ADR §2.2: directives are first-message-only.
-        let is_fresh = !had_existing && saved_session_id.is_none();
+        // A session with prior state (saved_session_id, had_existing, or a
+        // repaired durable mapping) is a continuation even if a replacement
+        // ACP session was created. ADR §2.2: directives are first-message-only.
+        let is_fresh = !had_existing && saved_session_id.is_none() && !mapping_was_repaired;
         Ok(is_fresh)
     }
 
@@ -1413,7 +1498,7 @@ done
     fn mapping_expectation_uses_only_the_durable_broker_mapping() {
         let mut persisted = HashMap::new();
         assert_eq!(
-            durable_mapping_expectation(&persisted, "discord:thread"),
+            durable_mapping_expectation(persisted.get("discord:thread").map(String::as_str)),
             BrokerMappingExpectation::Absent
         );
 
@@ -1422,11 +1507,11 @@ done
             "durable-outer-session".to_string(),
         );
         assert_eq!(
-            durable_mapping_expectation(&persisted, "discord:thread"),
+            durable_mapping_expectation(persisted.get("discord:thread").map(String::as_str)),
             BrokerMappingExpectation::Present
         );
         assert_eq!(
-            durable_mapping_expectation(&persisted, "discord:other-thread"),
+            durable_mapping_expectation(persisted.get("discord:other-thread").map(String::as_str)),
             BrokerMappingExpectation::Absent
         );
     }
