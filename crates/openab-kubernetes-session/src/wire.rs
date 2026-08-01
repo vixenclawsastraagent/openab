@@ -1,0 +1,791 @@
+//! Versioned, data-only messages for the add-on relay transport.
+//!
+//! Authentication credentials belong to the transport handshake, never these
+//! JSON messages. Every decoded object rejects unknown fields and version
+//! values other than `1`.
+//!
+//! A structurally valid worker registration is not authorization. The future
+//! controller transport must bind a single-use bootstrap credential to the
+//! expected binding, compare that binding with the current durable anchor,
+//! and consume the credential before accepting any worker ACP traffic.
+
+use crate::bridge::{BridgeIdentity, ControllerLifecycleAction, LifecycleKind, SessionBinding};
+use crate::identity::{ScopeId, SessionId};
+use crate::state::{Fence, ProfileRef};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
+use std::num::NonZeroU64;
+use thiserror::Error;
+use uuid::Uuid;
+
+pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024;
+pub const MAX_ACP_FRAME_BYTES: usize =
+    crate::bridge::MAX_LOGICAL_MESSAGE_BYTES + MAX_CONTROL_FRAME_BYTES;
+pub const MAX_WORKER_CWD_BYTES: usize = 4 * 1024;
+pub const MAX_WORKER_SESSION_ID_BYTES: usize = 4 * 1024;
+pub const MAX_PROFILE_VERSION_BYTES: usize = 1024;
+
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// Closed set of messages accepted by [`encode_frame`] and [`decode_frame`].
+///
+/// A WebSocket adapter can inspect `MAX_FRAME_BYTES` before allocating or
+/// accumulating a complete message. Only [`AcpMessageV1`] receives the large
+/// ACP data-plane allowance; every control-plane type is limited to 64 KiB.
+pub trait WireMessage: sealed::Sealed + Serialize + DeserializeOwned {
+    const MAX_FRAME_BYTES: usize;
+}
+
+#[derive(Debug, Error)]
+pub enum WireProtocolError {
+    #[error("wire frame is {bytes} bytes; maximum is {maximum}")]
+    FrameTooLarge { bytes: usize, maximum: usize },
+    #[error("ACP payload is {bytes} bytes; maximum is {maximum}")]
+    AcpPayloadTooLarge { bytes: usize, maximum: usize },
+    #[error("wire message is not valid JSON")]
+    InvalidJson(#[source] serde_json::Error),
+    #[error("attempt UUID must not be nil")]
+    NilAttemptId,
+    #[error("request UUID must not be nil")]
+    NilRequestId,
+    #[error("requested profile name must be a lowercase Kubernetes DNS label")]
+    InvalidProfileName,
+    #[error("worker cwd must be bounded, absolute, canonical, and free of control characters")]
+    InvalidWorkerCwd,
+    #[error("worker session ID must be non-empty and within its byte limit")]
+    InvalidWorkerSessionId,
+    #[error("selected profile version exceeds its byte limit")]
+    ProfileVersionTooLong,
+    #[error("session binding is invalid")]
+    InvalidBinding,
+    #[error("activated binding does not match activation field {0}")]
+    BindingMismatch(&'static str),
+    #[error("activated profile does not match the requested profile name")]
+    ProfileMismatch,
+    #[error("protocol result requestId does not match the lifecycle request")]
+    ResultRequestIdMismatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Version1;
+
+impl Serialize for Version1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_u8(1)
+    }
+}
+
+impl<'de> Deserialize<'de> for Version1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let version = u8::deserialize(deserializer)?;
+        if version == 1 {
+            Ok(Self)
+        } else {
+            Err(serde::de::Error::custom(format!(
+                "unsupported wire protocol version {version}"
+            )))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NonNilUuid(Uuid);
+
+impl NonNilUuid {
+    fn attempt(value: Uuid) -> Result<Self, WireProtocolError> {
+        if value.is_nil() {
+            return Err(WireProtocolError::NilAttemptId);
+        }
+        Ok(Self(value))
+    }
+
+    fn request(value: Uuid) -> Result<Self, WireProtocolError> {
+        if value.is_nil() {
+            return Err(WireProtocolError::NilRequestId);
+        }
+        Ok(Self(value))
+    }
+}
+
+impl Serialize for NonNilUuid {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for NonNilUuid {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Uuid::deserialize(deserializer)?;
+        if value.is_nil() {
+            return Err(serde::de::Error::custom("UUID must not be nil"));
+        }
+        Ok(Self(value))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RequestedProfileName(String);
+
+impl RequestedProfileName {
+    fn new(value: impl Into<String>) -> Result<Self, WireProtocolError> {
+        let value = value.into();
+        ProfileRef::new(value.clone(), "wire-validation")
+            .map_err(|_| WireProtocolError::InvalidProfileName)?;
+        Ok(Self(value))
+    }
+}
+
+impl Serialize for RequestedProfileName {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for RequestedProfileName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AbsoluteWorkerCwd(String);
+
+impl AbsoluteWorkerCwd {
+    fn new(value: impl Into<String>) -> Result<Self, WireProtocolError> {
+        let value = value.into();
+        if !value.starts_with('/')
+            || value.len() > MAX_WORKER_CWD_BYTES
+            || value.chars().any(char::is_control)
+            || value
+                .split('/')
+                .any(|component| matches!(component, "." | ".."))
+        {
+            return Err(WireProtocolError::InvalidWorkerCwd);
+        }
+        Ok(Self(value))
+    }
+}
+
+impl Serialize for AbsoluteWorkerCwd {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for AbsoluteWorkerCwd {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkerSessionId(String);
+
+impl WorkerSessionId {
+    fn new(value: impl Into<String>) -> Result<Self, WireProtocolError> {
+        let value = value.into();
+        if value.is_empty() || value.len() > MAX_WORKER_SESSION_ID_BYTES {
+            return Err(WireProtocolError::InvalidWorkerSessionId);
+        }
+        Ok(Self(value))
+    }
+}
+
+impl Serialize for WorkerSessionId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkerSessionId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectedProfile(ProfileRef);
+
+impl SelectedProfile {
+    fn new(value: ProfileRef) -> Result<Self, WireProtocolError> {
+        if value.version().len() > MAX_PROFILE_VERSION_BYTES {
+            return Err(WireProtocolError::ProfileVersionTooLong);
+        }
+        Ok(Self(value))
+    }
+}
+
+impl Serialize for SelectedProfile {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SelectedProfile {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = ProfileRef::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AcpPayload(Value);
+
+impl AcpPayload {
+    fn new(value: Value) -> Result<Self, WireProtocolError> {
+        validate_acp_payload(&value)?;
+        Ok(Self(value))
+    }
+}
+
+impl Serialize for AcpPayload {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for AcpPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// First bridge message used to activate or resume one broker-derived
+/// session. Transport credentials are deliberately absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ActivationRequestV1 {
+    version: Version1,
+    scope_id: ScopeId,
+    session_id: SessionId,
+    attempt_id: NonNilUuid,
+    requested_profile_name: RequestedProfileName,
+}
+
+impl ActivationRequestV1 {
+    pub fn new(
+        scope_id: ScopeId,
+        session_id: SessionId,
+        attempt_id: Uuid,
+        requested_profile_name: impl Into<String>,
+    ) -> Result<Self, WireProtocolError> {
+        Ok(Self {
+            version: Version1,
+            scope_id,
+            session_id,
+            attempt_id: NonNilUuid::attempt(attempt_id)?,
+            requested_profile_name: RequestedProfileName::new(requested_profile_name)?,
+        })
+    }
+
+    pub fn from_identity(identity: &BridgeIdentity) -> Self {
+        Self::new(
+            identity.scope_id(),
+            identity.session_id(),
+            identity.broker_attempt_id(),
+            identity.profile().name(),
+        )
+        .expect("BridgeIdentity already contains validated activation values")
+    }
+
+    pub fn scope_id(&self) -> ScopeId {
+        self.scope_id
+    }
+
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub fn attempt_id(&self) -> Uuid {
+        self.attempt_id.0
+    }
+
+    pub fn requested_profile_name(&self) -> &str {
+        &self.requested_profile_name.0
+    }
+}
+
+/// Serializable form of the controller-issued worker authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionBindingV1 {
+    version: Version1,
+    scope_id: ScopeId,
+    session_id: SessionId,
+    generation: NonZeroU64,
+    attempt_id: NonNilUuid,
+    incarnation_id: NonNilUuid,
+}
+
+impl SessionBindingV1 {
+    /// Rebuild the authority type and rerun all structural binding checks.
+    /// The controller must additionally compare it with the current durable
+    /// anchor before using it to select or mutate resources.
+    pub fn to_binding(&self) -> Result<SessionBinding, WireProtocolError> {
+        let fence = Fence::new(self.generation.get(), self.attempt_id.0)
+            .map_err(|_| WireProtocolError::InvalidBinding)?;
+        SessionBinding::new(self.scope_id, self.session_id, fence, self.incarnation_id.0)
+            .map_err(|_| WireProtocolError::InvalidBinding)
+    }
+
+    pub fn scope_id(&self) -> ScopeId {
+        self.scope_id
+    }
+
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.get()
+    }
+
+    pub fn attempt_id(&self) -> Uuid {
+        self.attempt_id.0
+    }
+
+    pub fn incarnation_id(&self) -> Uuid {
+        self.incarnation_id.0
+    }
+
+    fn validate_for(&self, activation: &ActivationRequestV1) -> Result<(), WireProtocolError> {
+        if self.scope_id != activation.scope_id {
+            return Err(WireProtocolError::BindingMismatch("scopeId"));
+        }
+        if self.session_id != activation.session_id {
+            return Err(WireProtocolError::BindingMismatch("sessionId"));
+        }
+        if self.attempt_id.0 != activation.attempt_id.0 {
+            return Err(WireProtocolError::BindingMismatch("attemptId"));
+        }
+        Ok(())
+    }
+}
+
+impl From<&SessionBinding> for SessionBindingV1 {
+    fn from(binding: &SessionBinding) -> Self {
+        Self {
+            version: Version1,
+            scope_id: binding.scope_id(),
+            session_id: binding.session_id(),
+            generation: NonZeroU64::new(binding.fence().generation())
+                .expect("SessionBinding generations are non-zero"),
+            attempt_id: NonNilUuid(binding.fence().attempt_id()),
+            incarnation_id: NonNilUuid(binding.incarnation_id()),
+        }
+    }
+}
+
+impl TryFrom<&SessionBindingV1> for SessionBinding {
+    type Error = WireProtocolError;
+
+    fn try_from(binding: &SessionBindingV1) -> Result<Self, Self::Error> {
+        binding.to_binding()
+    }
+}
+
+/// Controller response that pins both the selected profile version and the
+/// worker-owned filesystem root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ActivatedSessionV1 {
+    version: Version1,
+    profile: SelectedProfile,
+    binding: SessionBindingV1,
+    worker_cwd: AbsoluteWorkerCwd,
+}
+
+impl ActivatedSessionV1 {
+    pub fn new(
+        activation: &ActivationRequestV1,
+        profile: ProfileRef,
+        binding: &SessionBinding,
+        worker_cwd: impl Into<String>,
+    ) -> Result<Self, WireProtocolError> {
+        let response = Self {
+            version: Version1,
+            profile: SelectedProfile::new(profile)?,
+            binding: SessionBindingV1::from(binding),
+            worker_cwd: AbsoluteWorkerCwd::new(worker_cwd)?,
+        };
+        response.validate_for(activation)?;
+        Ok(response)
+    }
+
+    /// Revalidate an untrusted controller response against the exact request
+    /// that caused it. Call this before constructing a `BridgeKernel`.
+    fn validate_for(&self, activation: &ActivationRequestV1) -> Result<(), WireProtocolError> {
+        self.binding.validate_for(activation)?;
+        if self.profile.0.name() != activation.requested_profile_name() {
+            return Err(WireProtocolError::ProfileMismatch);
+        }
+        Ok(())
+    }
+
+    /// Consume an untrusted activation response and expose its contents only
+    /// after exact request correlation succeeds.
+    pub fn into_validated_parts(
+        self,
+        activation: &ActivationRequestV1,
+    ) -> Result<(ProfileRef, SessionBinding, String), WireProtocolError> {
+        self.validate_for(activation)?;
+        let binding = self.binding.to_binding()?;
+        Ok((self.profile.0, binding, self.worker_cwd.0))
+    }
+}
+
+/// Opaque ACP JSON carried after bridge activation or worker registration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AcpMessageV1 {
+    version: Version1,
+    payload: AcpPayload,
+}
+
+impl AcpMessageV1 {
+    pub fn new(payload: Value) -> Result<Self, WireProtocolError> {
+        Ok(Self {
+            version: Version1,
+            payload: AcpPayload::new(payload)?,
+        })
+    }
+
+    pub fn payload(&self) -> &Value {
+        &self.payload.0
+    }
+
+    pub fn into_payload(self) -> Value {
+        self.payload.0
+    }
+}
+
+/// Fenced bridge request for non-destructive suspension or destructive
+/// release. `worker_session_id` is opaque ACP data, never controller authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LifecycleRequestV1 {
+    version: Version1,
+    request_id: NonNilUuid,
+    #[serde(with = "lifecycle_kind_serde")]
+    kind: LifecycleKind,
+    binding: SessionBindingV1,
+    worker_session_id: WorkerSessionId,
+}
+
+impl LifecycleRequestV1 {
+    fn new(
+        request_id: Uuid,
+        kind: LifecycleKind,
+        binding: &SessionBinding,
+        worker_session_id: impl Into<String>,
+    ) -> Result<Self, WireProtocolError> {
+        Ok(Self {
+            version: Version1,
+            request_id: NonNilUuid::request(request_id)?,
+            kind,
+            binding: SessionBindingV1::from(binding),
+            worker_session_id: WorkerSessionId::new(worker_session_id)?,
+        })
+    }
+
+    /// Build one controller request using the bridge action's stable
+    /// idempotency key. Retain the resulting request across delivery retries.
+    pub fn from_bridge_action(
+        action: &ControllerLifecycleAction,
+    ) -> Result<Self, WireProtocolError> {
+        Self::new(
+            action.action_id(),
+            action.kind(),
+            action.binding(),
+            action.worker_session_id(),
+        )
+    }
+
+    pub fn request_id(&self) -> Uuid {
+        self.request_id.0
+    }
+
+    pub fn kind(&self) -> LifecycleKind {
+        self.kind
+    }
+
+    pub fn binding_wire(&self) -> &SessionBindingV1 {
+        &self.binding
+    }
+
+    pub fn to_binding(&self) -> Result<SessionBinding, WireProtocolError> {
+        self.binding.to_binding()
+    }
+
+    pub fn worker_session_id(&self) -> &str {
+        &self.worker_session_id.0
+    }
+}
+
+/// First outbound worker message. Bootstrap credentials remain in the
+/// authenticated transport and are not represented in JSON.
+///
+/// Deserialization proves only that the binding is structurally valid. Before
+/// accepting ACP traffic, the controller must authenticate and consume the
+/// binding's single-use bootstrap credential, compare the expected binding
+/// with the current durable anchor, then call [`Self::into_validated_binding`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkerRegistrationV1 {
+    version: Version1,
+    binding: SessionBindingV1,
+}
+
+impl WorkerRegistrationV1 {
+    pub fn new(binding: &SessionBinding) -> Self {
+        Self {
+            version: Version1,
+            binding: SessionBindingV1::from(binding),
+        }
+    }
+
+    /// Consume a registration and expose its binding only after an exact
+    /// comparison with transport-authenticated, anchor-checked authority.
+    pub fn into_validated_binding(
+        self,
+        expected_binding: &SessionBinding,
+    ) -> Result<SessionBinding, WireProtocolError> {
+        let actual = self.binding.to_binding()?;
+        if actual != *expected_binding {
+            return Err(WireProtocolError::BindingMismatch("binding"));
+        }
+        Ok(actual)
+    }
+}
+
+/// Stable public failure classes. There is intentionally no free-form error
+/// detail field that could expose controller, Kubernetes, or storage internals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FatalCode {
+    InvalidMessage,
+    Unauthorized,
+    StaleBinding,
+    Unavailable,
+    Internal,
+}
+
+/// ACK when `fatal_code` is absent; sanitized fatal result when it is present.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProtocolResultV1 {
+    version: Version1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<NonNilUuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fatal_code: Option<FatalCode>,
+}
+
+impl ProtocolResultV1 {
+    pub fn ack(request_id: Option<Uuid>) -> Result<Self, WireProtocolError> {
+        Ok(Self {
+            version: Version1,
+            request_id: request_id.map(NonNilUuid::request).transpose()?,
+            fatal_code: None,
+        })
+    }
+
+    pub fn fatal(request_id: Option<Uuid>, code: FatalCode) -> Result<Self, WireProtocolError> {
+        Ok(Self {
+            version: Version1,
+            request_id: request_id.map(NonNilUuid::request).transpose()?,
+            fatal_code: Some(code),
+        })
+    }
+
+    fn request_id(&self) -> Option<Uuid> {
+        self.request_id.map(|request_id| request_id.0)
+    }
+
+    /// Correlate a controller result with one exact lifecycle request.
+    /// Missing IDs and IDs belonging to another request fail closed.
+    pub fn into_lifecycle_outcome(
+        self,
+        request: &LifecycleRequestV1,
+    ) -> Result<Option<FatalCode>, WireProtocolError> {
+        if self.request_id() != Some(request.request_id()) {
+            return Err(WireProtocolError::ResultRequestIdMismatch);
+        }
+        Ok(self.fatal_code)
+    }
+}
+
+macro_rules! control_wire_messages {
+    ($($message:ty),+ $(,)?) => {
+        $(
+            impl sealed::Sealed for $message {}
+
+            impl WireMessage for $message {
+                const MAX_FRAME_BYTES: usize = MAX_CONTROL_FRAME_BYTES;
+            }
+        )+
+    };
+}
+
+control_wire_messages!(
+    ActivationRequestV1,
+    SessionBindingV1,
+    ActivatedSessionV1,
+    LifecycleRequestV1,
+    WorkerRegistrationV1,
+    ProtocolResultV1,
+);
+
+impl sealed::Sealed for AcpMessageV1 {}
+
+impl WireMessage for AcpMessageV1 {
+    const MAX_FRAME_BYTES: usize = MAX_ACP_FRAME_BYTES;
+}
+
+/// Return the allocation ceiling for a concrete, sealed wire message type.
+pub const fn max_frame_len<T: WireMessage>() -> usize {
+    T::MAX_FRAME_BYTES
+}
+
+/// Validate a declared or accumulated frame length before allocating more
+/// relay buffer space.
+pub fn validate_frame_len<T: WireMessage>(bytes: usize) -> Result<(), WireProtocolError> {
+    if bytes > T::MAX_FRAME_BYTES {
+        return Err(WireProtocolError::FrameTooLarge {
+            bytes,
+            maximum: T::MAX_FRAME_BYTES,
+        });
+    }
+    Ok(())
+}
+
+pub fn encode_frame<T: WireMessage>(message: &T) -> Result<Vec<u8>, WireProtocolError> {
+    let encoded = serde_json::to_vec(message).map_err(WireProtocolError::InvalidJson)?;
+    validate_frame_len::<T>(encoded.len())?;
+    Ok(encoded)
+}
+
+pub fn decode_frame<T: WireMessage>(bytes: &[u8]) -> Result<T, WireProtocolError> {
+    validate_frame_len::<T>(bytes.len())?;
+    serde_json::from_slice(bytes).map_err(WireProtocolError::InvalidJson)
+}
+
+fn validate_acp_payload(payload: &Value) -> Result<(), WireProtocolError> {
+    let bytes = serde_json::to_vec(payload)
+        .map_err(WireProtocolError::InvalidJson)?
+        .len();
+    validate_acp_payload_len(bytes)
+}
+
+fn validate_acp_payload_len(bytes: usize) -> Result<(), WireProtocolError> {
+    let maximum = crate::bridge::MAX_LOGICAL_MESSAGE_BYTES;
+    if bytes > maximum {
+        return Err(WireProtocolError::AcpPayloadTooLarge { bytes, maximum });
+    }
+    Ok(())
+}
+
+mod lifecycle_kind_serde {
+    use super::*;
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum WireKind {
+        Suspend,
+        Release,
+    }
+
+    pub(super) fn serialize<S>(kind: &LifecycleKind, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match kind {
+            LifecycleKind::Suspend => WireKind::Suspend,
+            LifecycleKind::Release => WireKind::Release,
+        }
+        .serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<LifecycleKind, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match WireKind::deserialize(deserializer)? {
+            WireKind::Suspend => LifecycleKind::Suspend,
+            WireKind::Release => LifecycleKind::Release,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn payload_and_frame_length_checks_include_the_boundary() {
+        assert!(validate_acp_payload_len(crate::bridge::MAX_LOGICAL_MESSAGE_BYTES).is_ok());
+        assert!(matches!(
+            validate_acp_payload_len(crate::bridge::MAX_LOGICAL_MESSAGE_BYTES + 1),
+            Err(WireProtocolError::AcpPayloadTooLarge { .. })
+        ));
+        assert!(validate_frame_len::<AcpMessageV1>(MAX_ACP_FRAME_BYTES).is_ok());
+        assert!(matches!(
+            validate_frame_len::<AcpMessageV1>(MAX_ACP_FRAME_BYTES + 1),
+            Err(WireProtocolError::FrameTooLarge { .. })
+        ));
+        assert!(validate_frame_len::<ProtocolResultV1>(MAX_CONTROL_FRAME_BYTES).is_ok());
+        assert!(matches!(
+            validate_frame_len::<ProtocolResultV1>(MAX_CONTROL_FRAME_BYTES + 1),
+            Err(WireProtocolError::FrameTooLarge { .. })
+        ));
+    }
+}

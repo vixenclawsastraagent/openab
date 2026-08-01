@@ -221,6 +221,12 @@ impl ControllerLifecycleAction {
         }
     }
 
+    /// Stable transport correlation ID for this controller action.
+    /// Retries of the same action must reuse this value.
+    pub fn action_id(&self) -> Uuid {
+        self.action_id
+    }
+
     pub fn kind(&self) -> LifecycleKind {
         self.kind
     }
