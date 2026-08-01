@@ -169,6 +169,11 @@ impl ConfigMapAnchorStore {
         })
     }
 
+    /// The deployment scope that every anchor read and write is bound to.
+    pub fn scope_id(&self) -> ScopeId {
+        self.scope_id
+    }
+
     pub async fn create(&self, state: &SessionAnchorV1) -> Result<StoredAnchor, AnchorStoreError> {
         self.validate_scope(state)?;
         let name = ResourceNames::new(state.session_id()).anchor();

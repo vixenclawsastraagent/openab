@@ -145,6 +145,15 @@ async fn store_rejects_invalid_namespace() {
 }
 
 #[tokio::test]
+async fn store_exposes_its_single_scope_binding() {
+    let (service, _handle) = mock::pair::<Request<Body>, Response<Body>>();
+    let client = Client::new(service, "default");
+    let store = ConfigMapAnchorStore::new(client, NAMESPACE, scope_id()).unwrap();
+
+    assert_eq!(store.scope_id(), scope_id());
+}
+
+#[tokio::test]
 async fn create_rejects_another_scope_without_an_api_request() {
     let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
     let client = Client::new(service, "default");

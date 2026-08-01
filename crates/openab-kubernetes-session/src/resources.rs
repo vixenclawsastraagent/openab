@@ -684,6 +684,12 @@ impl MvpWorkerProfile {
             skills,
         })
     }
+
+    /// The immutable profile revision selected by trusted controller
+    /// configuration.
+    pub fn profile(&self) -> &ProfileRef {
+        &self.profile
+    }
 }
 
 #[derive(Clone)]
