@@ -201,6 +201,21 @@ The controller:
 Knowing another session's resource name or session digest is not authorization
 to access it.
 
+The transport calls one controller-service facade rather than selecting domain
+coordinators itself. That facade maps each configured profile name to exactly
+one current, fully versioned profile for new sessions, derives activation
+timestamps and deadlines from the controller's own policy, and exposes only
+closed, sanitized failure codes. Existing sessions continue on the exact
+profile revision pinned in their durable anchor, so a configuration update does
+not silently migrate or strand retained state. Historical revisions may remain
+loaded for that purpose. Activation and worker registration treat a session
+identifier only as a routing hint: the composition root re-reads the lifecycle
+anchor under the shared session lock, selects the exact profile revision stored
+there, then performs a second authoritative read while validating the complete
+activation or registration authority. A worker or transport cannot choose its
+durable profile revision. Scope mismatches are rejected before profile lookup
+or Kubernetes access.
+
 ### 4.3 Worker
 
 Each worker Pod runs a small supervisor and one selected ACP/CLI process. The

@@ -7,6 +7,7 @@ mod lifecycle;
 mod locks;
 mod registration;
 mod release;
+mod service;
 
 pub use activation::{
     ActivationCoordinator, ActivationError, ActivationPreparation, ActivationTiming,
@@ -38,3 +39,7 @@ pub use registration::{
     WorkerBootstrapAuthError,
 };
 pub use release::{ReleaseCoordinator, ReleaseError, ReleaseOutcome};
+pub use service::{
+    ControllerService, ControllerServiceConfigError, ControllerServiceError,
+    LifecycleServiceOutcome,
+};

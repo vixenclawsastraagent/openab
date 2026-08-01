@@ -722,6 +722,23 @@ impl WorkerRegistrationV1 {
         }
     }
 
+    /// Return the structurally validated session identifier for routing only.
+    ///
+    /// This value is not registration authority. The trusted controller must
+    /// use it to re-read the durable anchor, route by that anchor's exact
+    /// profile revision, and then validate the complete binding and bootstrap
+    /// credential before accepting the worker.
+    pub fn session_id(&self) -> SessionId {
+        self.binding.session_id()
+    }
+
+    /// Return the structurally validated scope identifier for early routing
+    /// rejection only. The complete binding and bootstrap credential remain
+    /// mandatory registration authority.
+    pub fn scope_id(&self) -> ScopeId {
+        self.binding.scope_id()
+    }
+
     /// Consume a registration and expose its binding only after an exact
     /// comparison with transport-authenticated, anchor-checked authority.
     pub fn into_validated_binding(

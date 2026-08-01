@@ -187,9 +187,20 @@ pub struct ControllerCoordinators {
     store: ConfigMapAnchorStore,
     locks: SessionLocks,
     profiles: BTreeMap<ProfileKey, ProfileCoordinators>,
+    policy: ControllerPolicy,
     activity: ActivityCoordinator,
     lifecycle: LifecycleCoordinator,
     release: ReleaseCoordinator,
+}
+
+pub(super) enum RegistrationDispatchError {
+    ProfileUnavailable,
+    Registration(RegistrationError),
+}
+
+pub(super) enum ActivationDispatchError {
+    ProfileUnavailable,
+    Activation(ActivationError),
 }
 
 impl ControllerCoordinators {
@@ -246,6 +257,7 @@ impl ControllerCoordinators {
             store,
             locks,
             profiles: profile_coordinators,
+            policy,
             activity,
             lifecycle,
             release,
@@ -274,6 +286,81 @@ impl ControllerCoordinators {
 
     pub fn release(&self) -> &ReleaseCoordinator {
         &self.release
+    }
+
+    pub(super) fn policy(&self) -> ControllerPolicy {
+        self.policy
+    }
+
+    pub(super) fn scope_id(&self) -> crate::identity::ScopeId {
+        self.store.scope_id()
+    }
+
+    /// Route a new session to its configured current profile and an existing
+    /// session to the exact revision pinned in its durable anchor.
+    ///
+    /// As with registration routing, the preflight lock is released before
+    /// entering the selected self-locking coordinator. Its fresh read is the
+    /// mutation authority and safely rejects any intervening replacement.
+    pub(super) async fn prepare_activation(
+        &self,
+        request: &crate::wire::ActivationRequestV1,
+        timing: super::ActivationTiming,
+        current_profile: &ProfileRef,
+    ) -> Result<ActivationPreparation, ActivationDispatchError> {
+        let routed_profile = {
+            let _guard = self.locks.lock(request.session_id()).await;
+            self.store
+                .get(request.session_id())
+                .await
+                .map_err(ActivationError::Store)
+                .map_err(ActivationDispatchError::Activation)?
+                .map_or_else(
+                    || current_profile.clone(),
+                    |anchor| anchor.state().profile().clone(),
+                )
+        };
+        let coordinator = self
+            .activation(&routed_profile)
+            .ok_or(ActivationDispatchError::ProfileUnavailable)?;
+        coordinator
+            .prepare(request, timing)
+            .await
+            .map_err(ActivationDispatchError::Activation)
+    }
+
+    /// Route a registration by the exact profile revision retained in the
+    /// durable anchor, never by current configuration or worker input.
+    ///
+    /// The routing read and the selected registration coordinator share this
+    /// root's lock registry. The first lock must be released before calling
+    /// the self-locking coordinator; its fresh read then authoritatively
+    /// revalidates the complete binding and bootstrap credential.
+    pub(super) async fn register_worker(
+        &self,
+        registration: crate::wire::WorkerRegistrationV1,
+        auth: super::WorkerBootstrapAuth,
+    ) -> Result<super::RegisteredWorker, RegistrationDispatchError> {
+        let session_id = registration.session_id();
+        let profile = {
+            let _guard = self.locks.lock(session_id).await;
+            let observed = self
+                .store
+                .get(session_id)
+                .await
+                .map_err(RegistrationError::Store)
+                .map_err(RegistrationDispatchError::Registration)?
+                .ok_or(RegistrationError::AnchorNotFound)
+                .map_err(RegistrationDispatchError::Registration)?;
+            observed.state().profile().clone()
+        };
+        let coordinator = self
+            .registration(&profile)
+            .ok_or(RegistrationDispatchError::ProfileUnavailable)?;
+        coordinator
+            .register(session_id, registration, auth)
+            .await
+            .map_err(RegistrationDispatchError::Registration)
     }
 
     /// Continue only intents that were already durable before this pass.
