@@ -73,6 +73,21 @@ The first version is intentionally bounded:
 - a deterministic fake ACP worker for integration and isolation tests; and
 - Kubernetes-native state rather than a new database or CRD.
 
+### 3.1 Current MVP lifecycle target
+
+- automatically persist non-destructive compute suspension only for a
+  `Ready` session whose compute-idle deadline has expired;
+- report a `Suspended` session whose storage deadline has expired as eligible
+  for release, without mutating or deleting its resources; and
+- begin destructive release only after an explicit, fenced request.
+
+### 3.2 Deferred lifecycle behavior
+
+Automatic destructive release based only on storage-retention expiry is
+deferred. A later opt-in policy may add it after operators have validated
+retention, backup, reclaim-policy, observability, and recovery behavior. An
+expired deadline is not deletion authority in the MVP.
+
 A scope is the stable ownership boundary for one configured team or agent.
 The controller combines it with OpenAB's logical session key so identical
 Discord or Slack thread identifiers in different deployments cannot collide.
@@ -264,14 +279,17 @@ writer from recreating perfectly matching resources between proofs.
                               v
                        Provisioning
 
- Suspended -- retention expiry or explicit reset --> Deleting --> Absent
+ Suspended -- explicit reset ---------------------> Deleting --> Absent
+      |
+      +-- retention expiry --> report release eligibility (no mutation)
 ```
 
 Compute idle expiry suspends the worker Pod but retains resumable private
-storage. Storage retention expiry or explicit reset performs fenced,
-controller-managed cleanup. Broker shutdown follows the non-destructive path.
-Bridge or broker failure leaves the session reconcilable; it never implies
-destructive release.
+storage. In the MVP, storage retention expiry is advisory: reconciliation
+reports release eligibility but does not mutate the anchor, PVC, or generation
+resources. Only an explicit reset starts fenced, controller-managed destructive
+cleanup. Broker shutdown follows the non-destructive path. Bridge or broker
+failure leaves the session reconcilable; it never implies destructive release.
 
 `Released` proves that the Kubernetes PVC API object is absent; it does not by
 itself prove that a backing PersistentVolume or cloud disk has been physically
@@ -287,7 +305,8 @@ This separation addresses the cost concern without weakening isolation:
 
 - an active-worker cap and namespace quota bound concurrent compute;
 - an idle deadline bounds unused Pods;
-- a storage-retention deadline bounds abandoned PVCs;
+- a storage-retention deadline identifies abandoned PVCs for release, while
+  namespace storage quota bounds aggregate retained capacity;
 - controller reconciliation handles resources left by crashes; and
 - metrics and alerts expose active workers, retained storage, cleanup failure,
   and sessions blocked on policy.
