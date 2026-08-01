@@ -7,7 +7,8 @@ use kube::Client;
 use openab_kubernetes_session::identity::{ResourceNames, ScopeId, SessionId};
 use openab_kubernetes_session::state::{ProfileRef, SessionAnchorV1, SessionPhase};
 use openab_kubernetes_session::store::{
-    AnchorStoreError, ConfigMapAnchorStore, DeleteOutcome, StoreOperation, WriteRecovery,
+    AnchorDeletionObservation, AnchorStoreError, ConfigMapAnchorStore, DeleteOutcome,
+    StoreOperation, WriteRecovery,
 };
 use serde_json::{json, Value};
 use std::time::Duration as StdDuration;
@@ -39,6 +40,25 @@ fn test_anchor(session_id: SessionId, scope_id: ScopeId) -> SessionAnchorV1 {
         now + Duration::hours(72),
     )
     .unwrap()
+}
+
+fn deleting_anchor(session_id: SessionId, scope_id: ScopeId) -> SessionAnchorV1 {
+    let mut anchor = test_anchor(session_id, scope_id);
+    let fence = anchor.fence().clone();
+    anchor.transition(&fence, SessionPhase::Deleting).unwrap();
+    anchor
+}
+
+fn deleting_anchor_with_pod(
+    session_id: SessionId,
+    scope_id: ScopeId,
+    pod_uid: &str,
+) -> SessionAnchorV1 {
+    let mut anchor = test_anchor(session_id, scope_id);
+    let fence = anchor.fence().clone();
+    anchor.observe_pod(&fence, pod_uid).unwrap();
+    anchor.transition(&fence, SessionPhase::Deleting).unwrap();
+    anchor
 }
 
 fn config_map(
@@ -95,6 +115,22 @@ fn failure_response(status: StatusCode, reason: &str) -> Response<Body> {
 async fn request_body(request: Request<Body>) -> Value {
     let bytes = request.into_body().collect_bytes().await.unwrap();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+async fn observe_deletion_response(
+    body: Value,
+) -> Result<AnchorDeletionObservation, AnchorStoreError> {
+    let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+    let client = Client::new(service, "default");
+    let store = ConfigMapAnchorStore::new(client, NAMESPACE, scope_id()).unwrap();
+    let observe_task =
+        tokio::spawn(async move { store.observe_deletion(session_id(), "uid-a").await });
+
+    let mut handle = std::pin::pin!(handle);
+    let (_request, send) = handle.next_request().await.expect("observation request");
+    send.send_response(json_response(StatusCode::OK, body));
+
+    observe_task.await.unwrap()
 }
 
 #[tokio::test]
@@ -394,7 +430,7 @@ async fn stale_replace_maps_conflict_without_retry() {
 }
 
 #[tokio::test]
-async fn delete_sends_uid_and_resource_version_preconditions() {
+async fn delete_rejects_a_non_deleting_anchor_without_an_api_request() {
     let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
     let client = Client::new(service, "default");
     let store = ConfigMapAnchorStore::new(client, NAMESPACE, scope_id()).unwrap();
@@ -407,6 +443,66 @@ async fn delete_sends_uid_and_resource_version_preconditions() {
         StatusCode::OK,
         config_map(
             &test_anchor(session_id(), scope_id()),
+            Some("uid-a"),
+            Some("rv-10"),
+        ),
+    ));
+    let stored = get_task.await.unwrap().unwrap().unwrap();
+
+    assert!(matches!(
+        store.delete(&stored).await,
+        Err(AnchorStoreError::DeletePhaseNotDeleting {
+            actual: SessionPhase::Provisioning
+        })
+    ));
+    let unexpected =
+        tokio::time::timeout(StdDuration::from_millis(20), handle.next_request()).await;
+    assert!(!matches!(unexpected, Ok(Some(_))));
+}
+
+#[tokio::test]
+async fn delete_rejects_an_anchor_with_a_worker_pod_without_an_api_request() {
+    let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+    let client = Client::new(service, "default");
+    let store = ConfigMapAnchorStore::new(client, NAMESPACE, scope_id()).unwrap();
+    let store_for_get = store.clone();
+    let get_task = tokio::spawn(async move { store_for_get.get(session_id()).await });
+
+    let mut handle = std::pin::pin!(handle);
+    let (_request, send) = handle.next_request().await.expect("get request");
+    send.send_response(json_response(
+        StatusCode::OK,
+        config_map(
+            &deleting_anchor_with_pod(session_id(), scope_id(), "pod-uid-a"),
+            Some("uid-a"),
+            Some("rv-10"),
+        ),
+    ));
+    let stored = get_task.await.unwrap().unwrap().unwrap();
+
+    assert!(matches!(
+        store.delete(&stored).await,
+        Err(AnchorStoreError::DeletePodStillPresent { pod_uid }) if pod_uid == "pod-uid-a"
+    ));
+    let unexpected =
+        tokio::time::timeout(StdDuration::from_millis(20), handle.next_request()).await;
+    assert!(!matches!(unexpected, Ok(Some(_))));
+}
+
+#[tokio::test]
+async fn delete_sends_uid_and_resource_version_preconditions() {
+    let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+    let client = Client::new(service, "default");
+    let store = ConfigMapAnchorStore::new(client, NAMESPACE, scope_id()).unwrap();
+    let store_for_get = store.clone();
+    let get_task = tokio::spawn(async move { store_for_get.get(session_id()).await });
+
+    let mut handle = std::pin::pin!(handle);
+    let (_request, send) = handle.next_request().await.expect("get request");
+    send.send_response(json_response(
+        StatusCode::OK,
+        config_map(
+            &deleting_anchor(session_id(), scope_id()),
             Some("uid-a"),
             Some("opaque-rv-10"),
         ),
@@ -440,7 +536,7 @@ async fn delete_response_with_a_finalizer_is_only_a_request_to_delete() {
     let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
     let client = Client::new(service, "default");
     let store = ConfigMapAnchorStore::new(client, NAMESPACE, scope_id()).unwrap();
-    let anchor = test_anchor(session_id(), scope_id());
+    let anchor = deleting_anchor(session_id(), scope_id());
     let response_anchor = anchor.clone();
     let store_for_get = store.clone();
     let get_task = tokio::spawn(async move { store_for_get.get(session_id()).await });
@@ -523,6 +619,184 @@ async fn get_rejects_unexpected_anchor_lifecycle_metadata() {
             Err(AnchorStoreError::MalformedObject { .. })
         ));
     }
+}
+
+#[tokio::test]
+async fn observe_deletion_rejects_an_empty_expected_uid_without_an_api_request() {
+    let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+    let client = Client::new(service, "default");
+    let store = ConfigMapAnchorStore::new(client, NAMESPACE, scope_id()).unwrap();
+
+    let result = tokio::time::timeout(
+        StdDuration::from_millis(20),
+        store.observe_deletion(session_id(), " \t"),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Ok(Err(AnchorStoreError::InvalidExpectedUid))
+    ));
+
+    let mut handle = std::pin::pin!(handle);
+    let unexpected =
+        tokio::time::timeout(StdDuration::from_millis(20), handle.next_request()).await;
+    assert!(!matches!(unexpected, Ok(Some(_))));
+}
+
+#[tokio::test]
+async fn observe_deletion_returns_authoritative_absence_for_not_found() {
+    let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+    let client = Client::new(service, "default");
+    let store = ConfigMapAnchorStore::new(client, NAMESPACE, scope_id()).unwrap();
+    let observe_task =
+        tokio::spawn(async move { store.observe_deletion(session_id(), "uid-a").await });
+
+    let mut handle = std::pin::pin!(handle);
+    let (request, send) = handle.next_request().await.expect("observation request");
+    assert_eq!(request.method(), Method::GET);
+    assert_eq!(
+        request.uri().path(),
+        format!(
+            "/api/v1/namespaces/{NAMESPACE}/configmaps/{}",
+            ResourceNames::new(session_id()).anchor()
+        )
+    );
+    send.send_response(failure_response(StatusCode::NOT_FOUND, "NotFound"));
+
+    assert_eq!(
+        observe_task.await.unwrap().unwrap(),
+        AnchorDeletionObservation::Absent
+    );
+}
+
+#[tokio::test]
+async fn observe_deletion_classifies_a_valid_same_uid_anchor_as_present() {
+    let observed = observe_deletion_response(config_map(
+        &deleting_anchor(session_id(), scope_id()),
+        Some("uid-a"),
+        Some("rv-10"),
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(observed, AnchorDeletionObservation::Present);
+}
+
+#[tokio::test]
+async fn observe_deletion_requires_a_deletion_ready_same_uid_anchor() {
+    assert!(matches!(
+        observe_deletion_response(config_map(
+            &test_anchor(session_id(), scope_id()),
+            Some("uid-a"),
+            Some("rv-10")
+        ))
+        .await,
+        Err(AnchorStoreError::DeletePhaseNotDeleting {
+            actual: SessionPhase::Provisioning
+        })
+    ));
+
+    assert!(matches!(
+        observe_deletion_response(config_map(
+            &deleting_anchor_with_pod(session_id(), scope_id(), "pod-uid-a"),
+            Some("uid-a"),
+            Some("rv-10")
+        ))
+        .await,
+        Err(AnchorStoreError::DeletePodStillPresent { pod_uid }) if pod_uid == "pod-uid-a"
+    ));
+}
+
+#[tokio::test]
+async fn observe_deletion_allows_finalizers_only_on_a_same_uid_terminating_anchor() {
+    let anchor = deleting_anchor(session_id(), scope_id());
+    let mut terminating = config_map(&anchor, Some("uid-a"), Some("rv-11"));
+    terminating["metadata"]["deletionTimestamp"] = json!("2026-07-31T08:01:00Z");
+    terminating["metadata"]["finalizers"] = json!(["admission.example.test/hold"]);
+
+    assert_eq!(
+        observe_deletion_response(terminating).await.unwrap(),
+        AnchorDeletionObservation::Terminating
+    );
+
+    let mut not_terminating = config_map(&anchor, Some("uid-a"), Some("rv-10"));
+    not_terminating["metadata"]["finalizers"] = json!(["admission.example.test/hold"]);
+    assert!(matches!(
+        observe_deletion_response(not_terminating).await,
+        Err(AnchorStoreError::MalformedObject { .. })
+    ));
+}
+
+#[tokio::test]
+async fn observe_deletion_rejects_a_replacement_uid_before_decoding_its_state() {
+    let mut replacement = config_map(
+        &deleting_anchor(session_id(), scope_id()),
+        Some("uid-replacement"),
+        Some("rv-20"),
+    );
+    replacement["data"]["anchor.json"] = json!("not valid anchor JSON");
+
+    assert!(matches!(
+        observe_deletion_response(replacement).await,
+        Err(AnchorStoreError::Conflict {
+            operation: StoreOperation::ObserveDeletion,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn observe_deletion_validates_every_same_uid_anchor_field() {
+    let anchor = deleting_anchor(session_id(), scope_id());
+    let expected_name = ResourceNames::new(session_id()).anchor();
+
+    let mut wrong_name = config_map(&anchor, Some("uid-a"), Some("rv-10"));
+    wrong_name["metadata"]["name"] = json!("wrong-anchor-name");
+
+    let mut wrong_namespace = config_map(&anchor, Some("uid-a"), Some("rv-10"));
+    wrong_namespace["metadata"]["namespace"] = json!("other-workers");
+
+    let mut wrong_labels = config_map(&anchor, Some("uid-a"), Some("rv-10"));
+    wrong_labels["metadata"]["labels"]["openab.dev/resource"] = json!("replacement");
+
+    let mut extra_data = config_map(&anchor, Some("uid-a"), Some("rv-10"));
+    extra_data["data"]["unexpected"] = json!("must fail closed");
+
+    let missing_resource_version = config_map(&anchor, Some("uid-a"), None);
+
+    for (case, object) in [
+        ("name", wrong_name),
+        ("namespace", wrong_namespace),
+        ("labels", wrong_labels),
+        ("data", extra_data),
+        ("resourceVersion", missing_resource_version),
+    ] {
+        assert!(
+            matches!(
+                observe_deletion_response(object).await,
+                Err(AnchorStoreError::MalformedObject { .. })
+            ),
+            "same-UID {case} validation must fail closed"
+        );
+    }
+
+    let wrong_scope = deleting_anchor(session_id(), ScopeId::derive("another-team"));
+    assert!(matches!(
+        observe_deletion_response(config_map(&wrong_scope, Some("uid-a"), Some("rv-10"))).await,
+        Err(AnchorStoreError::ScopeMismatch { .. })
+    ));
+
+    let other_session = SessionId::derive(RAW_SCOPE, "discord:another-thread");
+    let mut wrong_session = config_map(
+        &deleting_anchor(other_session, scope_id()),
+        Some("uid-a"),
+        Some("rv-10"),
+    );
+    wrong_session["metadata"]["name"] = json!(expected_name);
+    assert!(matches!(
+        observe_deletion_response(wrong_session).await,
+        Err(AnchorStoreError::SessionMismatch { .. })
+    ));
 }
 
 #[tokio::test]
@@ -611,7 +885,7 @@ async fn delete_is_idempotent_when_the_observed_anchor_is_absent() {
     send.send_response(json_response(
         StatusCode::OK,
         config_map(
-            &test_anchor(session_id(), scope_id()),
+            &deleting_anchor(session_id(), scope_id()),
             Some("uid-old"),
             Some("rv-10"),
         ),
@@ -641,7 +915,7 @@ async fn stale_delete_maps_conflict_without_retrying_a_new_object() {
     send.send_response(json_response(
         StatusCode::OK,
         config_map(
-            &test_anchor(session_id(), scope_id()),
+            &deleting_anchor(session_id(), scope_id()),
             Some("uid-old"),
             Some("rv-stale"),
         ),

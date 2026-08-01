@@ -1,5 +1,5 @@
 use crate::identity::{ResourceNames, ScopeId, SessionId};
-use crate::state::{SessionAnchorV1, StateError};
+use crate::state::{SessionAnchorV1, SessionPhase, StateError};
 use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{DeleteParams, PostParams, Preconditions};
@@ -18,6 +18,7 @@ const MAX_ANCHOR_BYTES: usize = 64 * 1024;
 pub enum StoreOperation {
     Create,
     Get,
+    ObserveDeletion,
     Replace,
     Delete,
 }
@@ -62,6 +63,12 @@ pub enum AnchorStoreError {
         operation: StoreOperation,
         name: String,
     },
+    #[error("anchor deletion requires phase Deleting, but the observed phase is {actual:?}")]
+    DeletePhaseNotDeleting { actual: SessionPhase },
+    #[error("anchor deletion requires the worker Pod to be absent, but Pod {pod_uid} remains")]
+    DeletePodStillPresent { pod_uid: String },
+    #[error("expected anchor UID must not be empty")]
+    InvalidExpectedUid,
     #[error("could not encode anchor state")]
     Encode(#[source] serde_json::Error),
     #[error(
@@ -131,6 +138,13 @@ pub enum DeleteOutcome {
     AlreadyAbsent,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorDeletionObservation {
+    Absent,
+    Present,
+    Terminating,
+}
+
 #[derive(Clone)]
 pub struct ConfigMapAnchorStore {
     api: Api<ConfigMap>,
@@ -187,6 +201,27 @@ impl ConfigMapAnchorStore {
             .transpose()
     }
 
+    pub async fn observe_deletion(
+        &self,
+        session_id: SessionId,
+        expected_uid: &str,
+    ) -> Result<AnchorDeletionObservation, AnchorStoreError> {
+        if expected_uid.trim().is_empty() {
+            return Err(AnchorStoreError::InvalidExpectedUid);
+        }
+        let name = ResourceNames::new(session_id).anchor();
+        let object = self
+            .api
+            .get_opt(&name)
+            .await
+            .map_err(|error| map_api_error(error, StoreOperation::ObserveDeletion, &name))?;
+        let Some(object) = object else {
+            return Ok(AnchorDeletionObservation::Absent);
+        };
+
+        self.validate_deletion_observation(object, session_id, expected_uid)
+    }
+
     pub async fn replace(
         &self,
         observed: &StoredAnchor,
@@ -222,6 +257,7 @@ impl ConfigMapAnchorStore {
 
     pub async fn delete(&self, observed: &StoredAnchor) -> Result<DeleteOutcome, AnchorStoreError> {
         self.validate_observation(observed)?;
+        self.validate_delete_ready(observed.state())?;
         let name = observed.name.clone();
         let params = DeleteParams::default().preconditions(Preconditions {
             resource_version: Some(observed.resource_version.clone()),
@@ -477,10 +513,57 @@ impl ConfigMapAnchorStore {
         self.validate_write_response(repaired, intended, Some(&observed.uid))
     }
 
+    fn validate_deletion_observation(
+        &self,
+        object: ConfigMap,
+        expected_session_id: SessionId,
+        expected_uid: &str,
+    ) -> Result<AnchorDeletionObservation, AnchorStoreError> {
+        let expected_name = ResourceNames::new(expected_session_id).anchor();
+        if object.metadata.name.as_deref() != Some(expected_name.as_str()) {
+            return Err(malformed(&expected_name, "metadata.name does not match"));
+        }
+        if object.metadata.namespace.as_deref() != Some(self.namespace.as_str()) {
+            return Err(malformed(
+                &expected_name,
+                "metadata.namespace does not match",
+            ));
+        }
+        let uid = required_metadata(
+            object.metadata.uid.as_deref(),
+            &expected_name,
+            "metadata.uid",
+        )?;
+        if uid != expected_uid {
+            return Err(AnchorStoreError::Conflict {
+                operation: StoreOperation::ObserveDeletion,
+                name: expected_name,
+            });
+        }
+
+        let terminating = object.metadata.deletion_timestamp.is_some();
+        let stored = self.decode_with_lifecycle(object, expected_session_id, true)?;
+        self.validate_delete_ready(stored.state())?;
+        Ok(if terminating {
+            AnchorDeletionObservation::Terminating
+        } else {
+            AnchorDeletionObservation::Present
+        })
+    }
+
     fn decode(
         &self,
         object: ConfigMap,
         expected_session_id: SessionId,
+    ) -> Result<StoredAnchor, AnchorStoreError> {
+        self.decode_with_lifecycle(object, expected_session_id, false)
+    }
+
+    fn decode_with_lifecycle(
+        &self,
+        object: ConfigMap,
+        expected_session_id: SessionId,
+        allow_terminating: bool,
     ) -> Result<StoredAnchor, AnchorStoreError> {
         let expected_name = ResourceNames::new(expected_session_id).anchor();
         if object.metadata.name.as_deref() != Some(expected_name.as_str()) {
@@ -492,7 +575,8 @@ impl ConfigMapAnchorStore {
                 "metadata.namespace does not match",
             ));
         }
-        if object.metadata.deletion_timestamp.is_some() {
+        let terminating = object.metadata.deletion_timestamp.is_some();
+        if terminating && !allow_terminating {
             return Err(malformed(&expected_name, "anchor is already terminating"));
         }
         if object
@@ -511,6 +595,7 @@ impl ConfigMapAnchorStore {
             .finalizers
             .as_ref()
             .is_some_and(|finalizers| !finalizers.is_empty())
+            && !(allow_terminating && terminating)
         {
             return Err(malformed(
                 &expected_name,
@@ -577,6 +662,20 @@ impl ConfigMapAnchorStore {
             uid,
             resource_version,
         })
+    }
+
+    fn validate_delete_ready(&self, state: &SessionAnchorV1) -> Result<(), AnchorStoreError> {
+        if state.phase() != SessionPhase::Deleting {
+            return Err(AnchorStoreError::DeletePhaseNotDeleting {
+                actual: state.phase(),
+            });
+        }
+        if let Some(pod_uid) = state.pod_uid() {
+            return Err(AnchorStoreError::DeletePodStillPresent {
+                pod_uid: pod_uid.to_string(),
+            });
+        }
+        Ok(())
     }
 
     fn validate_scope(&self, state: &SessionAnchorV1) -> Result<(), AnchorStoreError> {
