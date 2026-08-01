@@ -11,7 +11,7 @@ mod release;
 pub use activation::{
     ActivationCoordinator, ActivationError, ActivationPreparation, ActivationTiming,
     GenerationProvisioner, GenerationProvisionerError, GenerationResource, ObservedWorker,
-    ProvisionerOperation,
+    ProvisionerOperation, ScopeCapacityAdmission,
 };
 pub use activity::{
     ActivityCoordinator, ActivityError, ActivityEvent, ActivityOutcome, ActivityTurnId,

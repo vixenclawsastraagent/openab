@@ -1,6 +1,7 @@
 use super::{CleanupProgress, ComputeAbsentProof, LifecycleProvisioner, SessionLocks};
 use crate::bridge::{SessionBinding, SessionBindingError};
 use crate::identity::SessionId;
+use crate::profile_config::ControllerPolicy;
 use crate::resources::MvpWorkerProfile;
 use crate::state::{ProfileRef, SessionAnchorV1, SessionPhase, StateError};
 use crate::store::{AnchorStoreError, ConfigMapAnchorStore, StoredAnchor};
@@ -11,6 +12,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use uuid::Uuid;
 
 /// Deterministic lifecycle timestamps supplied by the trusted controller.
@@ -134,6 +136,45 @@ pub enum ActivationPreparation {
     MappingAbsent(ActivationResponseV1),
 }
 
+/// Process-local admission gate for one controller scope.
+///
+/// Every activation coordinator serving the same scope must receive a clone
+/// of the same instance. The durable `Provisioning` anchor is the reservation;
+/// this gate only serializes the inventory count with its CREATE or resume CAS
+/// in the single-controller MVP. Kubernetes quota remains the hard cluster
+/// backstop, and multi-replica controllers require leader election rather than
+/// additional instances of this process-local gate.
+#[derive(Clone)]
+pub struct ScopeCapacityAdmission {
+    max_active_workers: usize,
+    gate: Arc<Mutex<()>>,
+}
+
+impl ScopeCapacityAdmission {
+    pub fn from_policy(policy: &ControllerPolicy) -> Self {
+        Self {
+            max_active_workers: policy.max_active_workers(),
+            gate: Arc::new(Mutex::new(())),
+        }
+    }
+
+    async fn acquire(
+        &self,
+        store: &ConfigMapAnchorStore,
+    ) -> Result<OwnedMutexGuard<()>, ActivationError> {
+        let guard = Arc::clone(&self.gate).lock_owned().await;
+        let inventory = store.list_inventory().await?;
+        let active_workers = inventory
+            .iter()
+            .filter(|anchor| reserves_active_worker(anchor.state()))
+            .count();
+        if active_workers >= self.max_active_workers {
+            return Err(ActivationError::CapacityExhausted);
+        }
+        Ok(guard)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ActivationError {
     #[error("activation scope does not match this controller")]
@@ -154,6 +195,8 @@ pub enum ActivationError {
     ResumeCleanupPending,
     #[error("worker compute cleanup must finish before activation can resume")]
     ResumeCleanupRequired,
+    #[error("the configured active-worker capacity is exhausted")]
+    CapacityExhausted,
     #[error("the compute-absence proof does not match the durable session anchor")]
     ResumeProofMismatch,
     #[error("anchor state is invalid")]
@@ -172,6 +215,7 @@ pub enum ActivationError {
 pub struct ActivationCoordinator {
     store: ConfigMapAnchorStore,
     locks: SessionLocks,
+    capacity: ScopeCapacityAdmission,
     profile: MvpWorkerProfile,
     provisioner: Arc<dyn GenerationProvisioner>,
     lifecycle_provisioner: Arc<dyn LifecycleProvisioner>,
@@ -181,6 +225,7 @@ impl ActivationCoordinator {
     pub fn new(
         store: ConfigMapAnchorStore,
         locks: SessionLocks,
+        capacity: ScopeCapacityAdmission,
         profile: MvpWorkerProfile,
         provisioner: Arc<dyn GenerationProvisioner>,
         lifecycle_provisioner: Arc<dyn LifecycleProvisioner>,
@@ -188,6 +233,7 @@ impl ActivationCoordinator {
         Self {
             store,
             locks,
+            capacity,
             profile,
             provisioner,
             lifecycle_provisioner,
@@ -275,7 +321,9 @@ impl ActivationCoordinator {
             timing.compute_deadline_at,
             timing.storage_deadline_at,
         )?;
+        let capacity = self.capacity.acquire(&self.store).await?;
         let stored = self.store.create(&anchor).await?;
+        drop(capacity);
         self.ensure_generation(stored).await
     }
 
@@ -344,7 +392,9 @@ impl ActivationCoordinator {
             return Err(ActivationError::ResumeCleanupPending);
         };
         validate_resume_proof(&anchor, &proof)?;
+        let capacity = self.capacity.acquire(&self.store).await?;
         let advanced = self.store.replace(&anchor, &next).await?;
+        drop(capacity);
         self.ensure_generation(advanced).await
     }
 
@@ -385,6 +435,18 @@ impl ActivationCoordinator {
             profile: state.profile().clone(),
             pod_uid,
         })
+    }
+}
+
+fn reserves_active_worker(anchor: &SessionAnchorV1) -> bool {
+    match anchor.phase() {
+        SessionPhase::Provisioning
+        | SessionPhase::Ready
+        | SessionPhase::Busy
+        | SessionPhase::Suspending
+        | SessionPhase::Deleting => true,
+        SessionPhase::Blocked => anchor.pod_uid().is_some(),
+        SessionPhase::Suspended => false,
     }
 }
 
@@ -552,6 +614,16 @@ mod tests {
         .unwrap()
     }
 
+    fn capacity() -> ScopeCapacityAdmission {
+        capacity_with_limit(20)
+    }
+
+    fn capacity_with_limit(max_active_workers: usize) -> ScopeCapacityAdmission {
+        ScopeCapacityAdmission::from_policy(
+            &ControllerPolicy::new(900, 259_200, max_active_workers).unwrap(),
+        )
+    }
+
     fn initial_time() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 8, 1, 8, 0, 0).unwrap()
     }
@@ -613,6 +685,23 @@ mod tests {
         })
     }
 
+    fn config_map_list(anchors: &[SessionAnchorV1]) -> Value {
+        json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMapList",
+            "metadata": { "resourceVersion": "inventory-rv" },
+            "items": anchors
+                .iter()
+                .enumerate()
+                .map(|(index, anchor)| {
+                    let mut object = config_map(anchor, &format!("rv-{index}"));
+                    object["metadata"]["uid"] = json!(format!("anchor-uid-{index}"));
+                    object
+                })
+                .collect::<Vec<_>>()
+        })
+    }
+
     fn json_response(status: StatusCode, body: Value) -> Response<Body> {
         Response::builder()
             .status(status)
@@ -658,6 +747,15 @@ mod tests {
         attempt_id: Uuid,
         behavior: CleanupBehavior,
     ) -> (ResumeTask, MockHandle, FakeProvisioner) {
+        start_resume_with_capacity(existing, attempt_id, behavior, capacity())
+    }
+
+    fn start_resume_with_capacity(
+        existing: SessionAnchorV1,
+        attempt_id: Uuid,
+        behavior: CleanupBehavior,
+        capacity: ScopeCapacityAdmission,
+    ) -> (ResumeTask, MockHandle, FakeProvisioner) {
         let fake = FakeProvisioner::new(behavior);
         let shared = Arc::new(fake.clone());
         let generation: Arc<dyn GenerationProvisioner> = shared.clone();
@@ -669,6 +767,7 @@ mod tests {
         let coordinator = ActivationCoordinator::new(
             store,
             SessionLocks::new(),
+            capacity,
             profile(),
             generation,
             lifecycle,
@@ -698,6 +797,13 @@ mod tests {
         let (get, send) = handle.next_request().await.unwrap();
         assert_eq!(get.method(), Method::GET);
         send.send_response(json_response(StatusCode::OK, config_map(&existing, "rv-1")));
+
+        let (list, send) = handle.next_request().await.unwrap();
+        assert_eq!(list.method(), Method::GET);
+        send.send_response(json_response(
+            StatusCode::OK,
+            config_map_list(std::slice::from_ref(&existing)),
+        ));
 
         let (advance, send) = handle.next_request().await.unwrap();
         assert_eq!(advance.method(), Method::PUT);
@@ -872,6 +978,12 @@ mod tests {
         let mut handle = std::pin::pin!(handle);
         let (_get, send) = handle.next_request().await.unwrap();
         send.send_response(json_response(StatusCode::OK, config_map(&existing, "rv-1")));
+        let (list, send) = handle.next_request().await.unwrap();
+        assert_eq!(list.method(), Method::GET);
+        send.send_response(json_response(
+            StatusCode::OK,
+            config_map_list(std::slice::from_ref(&existing)),
+        ));
         let (replace, send) = handle.next_request().await.unwrap();
         assert_eq!(replace.method(), Method::PUT);
         send.send_response(conflict_response());
@@ -883,6 +995,70 @@ mod tests {
                 ..
             }))
         ));
+        assert_eq!(fake.lifecycle_calls(), 1);
+        assert!(fake.ensure_calls().is_empty());
+        assert_no_request(&mut handle).await;
+    }
+
+    #[test]
+    fn active_worker_reservation_table_is_conservative() {
+        for (index, (phase, pod_uid, expected)) in [
+            (SessionPhase::Provisioning, None, true),
+            (SessionPhase::Ready, Some(POD_UID), true),
+            (SessionPhase::Busy, Some(POD_UID), true),
+            (SessionPhase::Suspending, Some(POD_UID), true),
+            (SessionPhase::Deleting, None, true),
+            (SessionPhase::Blocked, Some(POD_UID), true),
+            (SessionPhase::Blocked, None, false),
+            (SessionPhase::Suspended, None, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let anchor = anchor_in_phase(
+                session_id(&format!("discord:capacity-table-{index}")),
+                phase,
+                pod_uid,
+            );
+            assert_eq!(reserves_active_worker(&anchor), expected, "phase {phase:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_fails_closed_when_active_worker_capacity_is_full() {
+        let existing = anchor_in_phase(
+            session_id("discord:capacity-resume"),
+            SessionPhase::Suspended,
+            None,
+        );
+        let active = anchor_in_phase(
+            session_id("discord:capacity-existing"),
+            SessionPhase::Ready,
+            Some(POD_UID),
+        );
+        let (task, handle, fake) = start_resume_with_capacity(
+            existing.clone(),
+            Uuid::from_u128(0x300),
+            CleanupBehavior::Matching,
+            capacity_with_limit(1),
+        );
+        let mut handle = std::pin::pin!(handle);
+
+        let (_get, send) = handle.next_request().await.unwrap();
+        send.send_response(json_response(StatusCode::OK, config_map(&existing, "rv-1")));
+        let (list, send) = handle.next_request().await.unwrap();
+        assert_eq!(list.method(), Method::GET);
+        send.send_response(json_response(
+            StatusCode::OK,
+            config_map_list(&[existing, active]),
+        ));
+
+        let error = task.await.unwrap().unwrap_err();
+        assert!(matches!(error, ActivationError::CapacityExhausted));
+        assert_eq!(
+            error.to_string(),
+            "the configured active-worker capacity is exhausted"
+        );
         assert_eq!(fake.lifecycle_calls(), 1);
         assert!(fake.ensure_calls().is_empty());
         assert_no_request(&mut handle).await;
@@ -904,6 +1080,7 @@ mod tests {
         let coordinator = ActivationCoordinator::new(
             store,
             SessionLocks::new(),
+            capacity(),
             profile(),
             shared.clone(),
             shared,
@@ -964,6 +1141,7 @@ mod tests {
             let coordinator = ActivationCoordinator::new(
                 store,
                 SessionLocks::new(),
+                capacity(),
                 profile(),
                 shared.clone(),
                 shared,

@@ -266,6 +266,52 @@ managed worker resources in its namespace. Session locks serialize operations
 inside the single controller replica; narrowly scoped RBAC prevents another
 writer from recreating perfectly matching resources between proofs.
 
+### 5.1 Active-worker capacity admission
+
+`max_active_workers` is the admission threshold for one controller scope across
+all worker profiles. Under the MVP's single-controller assumption, the
+controller treats the lifecycle anchor as the durable reservation and counts
+anchors as follows:
+
+| Anchor state | Reserves an active-worker slot? | Reason |
+|---|---|---|
+| `Provisioning` | Yes | Reservation must precede Pod creation, including before `pod_uid` is known. |
+| `Ready` | Yes | Worker compute is live. |
+| `Busy` | Yes | Worker compute is live and processing a prompt. |
+| `Suspending` | Yes | Compute absence has not yet been proven. |
+| `Deleting` | Yes | Count conservatively until the anchor disappears because V1 lacks a durable compute-absent marker for every crash point. |
+| `Blocked` | Only when `pod_uid` is present | A recorded Pod may still require cleanup; a clean blocked anchor must reacquire capacity before resume. |
+| `Suspended` | No | Compute absence was proven and only retained storage remains. |
+
+Only transitions that create a new reservation--an absent session or a
+`Suspended` or clean `Blocked` session entering `Provisioning`--perform
+admission. Retries of an existing `Provisioning` reservation continue even
+when the limit is currently reached.
+
+Within one controller scope, every profile shares one process-local admission
+gate. The gate serializes a complete inventory LIST and the subsequent durable
+anchor CREATE or compare-and-swap update; it is released before worker
+provisioning. This keeps different profiles from independently admitting past
+the scope-wide limit without holding the gate during Pod creation.
+
+This is intentionally a single-controller MVP admission guarantee, not a
+distributed hard quota. The add-on deployment must also configure a namespace
+`ResourceQuota` as the cluster-enforced backstop for Pod and resource
+consumption. That quota also covers an ambiguous Kubernetes write whose server
+outcome is unknown after client cancellation or transport failure. The
+process-local gate does not make multiple controller replicas safe. A future
+multi-replica controller must add Lease-based leader election or equivalent
+distributed coordination before relying on this admission contract.
+
+If an operator lowers `max_active_workers` below the current reservation count,
+existing reservations are grandfathered so their reconciliation and cleanup
+can continue. The controller rejects every new reservation until the count
+falls below the new limit; it does not evict or destructively release sessions
+to satisfy the policy. Cleanup may conservatively move an already stopped
+anchor into a counted state such as `Deleting` without admission; that can
+temporarily raise the tally, but it does not create worker compute and must
+never be blocked by the compute-cap policy.
+
 ## 6. Lifecycle and cost
 
 ```text
@@ -304,7 +350,8 @@ compatible storage policy outside this controller's API-object proof.
 
 This separation addresses the cost concern without weakening isolation:
 
-- an active-worker cap and namespace quota bound concurrent compute;
+- the [scope-wide active-worker admission policy](#51-active-worker-capacity-admission)
+  and namespace `ResourceQuota` bound concurrent compute;
 - an idle deadline bounds unused Pods;
 - a storage-retention deadline identifies abandoned PVCs for release, while
   namespace storage quota bounds aggregate retained capacity;

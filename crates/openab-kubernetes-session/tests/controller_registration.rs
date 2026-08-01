@@ -10,10 +10,11 @@ use openab_kubernetes_session::controller::{
     ActivationCoordinator, ActivationError, ActivationTiming, BootstrapPresence, CleanupProgress,
     ConsumedBootstrap, GenerationProvisioner, GenerationProvisionerError, LifecycleProvisioner,
     ObservedWorker, RegistrationCoordinator, RegistrationError, RegistrationProvisioner,
-    RegistrationProvisionerError, RegistrationRecovery, SessionLocks, VerifiedBootstrap,
-    WorkerBootstrapAuth,
+    RegistrationProvisionerError, RegistrationRecovery, ScopeCapacityAdmission, SessionLocks,
+    VerifiedBootstrap, WorkerBootstrapAuth,
 };
 use openab_kubernetes_session::identity::{ResourceNames, ScopeId, SessionId};
+use openab_kubernetes_session::profile_config::ControllerPolicy;
 use openab_kubernetes_session::resources::{
     EgressPort, EgressProtocol, MvpWorkerProfile, PersistentWorkspace, PvcAccessMode,
     RunAsIdentity, TrustedEgressRule, WorkerResources,
@@ -206,6 +207,10 @@ fn profile() -> MvpWorkerProfile {
     .unwrap()
 }
 
+fn capacity() -> ScopeCapacityAdmission {
+    ScopeCapacityAdmission::from_policy(&ControllerPolicy::new(900, 259_200, 20).unwrap())
+}
+
 fn provisioning_anchor(session_id: SessionId) -> SessionAnchorV1 {
     let now = Utc.with_ymd_and_hms(2026, 8, 1, 8, 0, 0).unwrap();
     let mut anchor = SessionAnchorV1::new(
@@ -367,6 +372,7 @@ async fn shared_session_locks_serialize_activation_and_registration_coordinators
     let activation_coordinator = Arc::new(ActivationCoordinator::new(
         ConfigMapAnchorStore::new(client, NAMESPACE, scope_id()).unwrap(),
         locks,
+        capacity(),
         profile(),
         activation_provisioner.clone(),
         activation_provisioner,

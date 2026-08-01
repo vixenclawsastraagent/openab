@@ -8,9 +8,10 @@ use kube::Client;
 use openab_kubernetes_session::controller::{
     ActivationCoordinator, ActivationError, ActivationPreparation, ActivationTiming,
     CleanupProgress, GenerationProvisioner, GenerationProvisionerError, LifecycleProvisioner,
-    ObservedWorker, ProvisionerOperation, SessionLocks,
+    ObservedWorker, ProvisionerOperation, ScopeCapacityAdmission, SessionLocks,
 };
 use openab_kubernetes_session::identity::{ResourceNames, ScopeId, SessionId};
+use openab_kubernetes_session::profile_config::ControllerPolicy;
 use openab_kubernetes_session::resources::{
     EgressPort, EgressProtocol, MvpWorkerProfile, PersistentWorkspace, PvcAccessMode,
     RunAsIdentity, TrustedEgressRule, WorkerResources,
@@ -210,6 +211,16 @@ fn profile() -> MvpWorkerProfile {
     .unwrap()
 }
 
+fn capacity() -> ScopeCapacityAdmission {
+    capacity_with_limit(20)
+}
+
+fn capacity_with_limit(max_active_workers: usize) -> ScopeCapacityAdmission {
+    ScopeCapacityAdmission::from_policy(
+        &ControllerPolicy::new(900, 259_200, max_active_workers).unwrap(),
+    )
+}
+
 fn request(session_id: SessionId, expectation: BrokerMappingExpectationV1) -> ActivationRequestV1 {
     ActivationRequestV1::new(
         scope_id(),
@@ -265,6 +276,19 @@ fn config_map(anchor: &SessionAnchorV1, uid: &str, resource_version: &str) -> Va
         "data": {
             "anchor.json": serde_json::to_string(anchor).unwrap()
         }
+    })
+}
+
+fn config_map_list(anchors: &[SessionAnchorV1]) -> Value {
+    json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMapList",
+        "metadata": { "resourceVersion": "inventory-rv" },
+        "items": anchors
+            .iter()
+            .enumerate()
+            .map(|(index, anchor)| config_map(anchor, &format!("uid-{index}"), &format!("rv-{index}")))
+            .collect::<Vec<_>>()
     })
 }
 
@@ -327,6 +351,19 @@ fn coordinator_with<P>(
 where
     P: GenerationProvisioner + LifecycleProvisioner + 'static,
 {
+    coordinator_with_capacity(provisioner, capacity())
+}
+
+fn coordinator_with_capacity<P>(
+    provisioner: Arc<P>,
+    capacity: ScopeCapacityAdmission,
+) -> (
+    Arc<ActivationCoordinator>,
+    mock::Handle<Request<Body>, Response<Body>>,
+)
+where
+    P: GenerationProvisioner + LifecycleProvisioner + 'static,
+{
     let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
     let client = Client::new(service, "default");
     let store = ConfigMapAnchorStore::new(client, NAMESPACE, scope_id()).unwrap();
@@ -334,6 +371,7 @@ where
         Arc::new(ActivationCoordinator::new(
             store,
             SessionLocks::new(),
+            capacity,
             profile(),
             provisioner.clone(),
             provisioner,
@@ -468,6 +506,9 @@ async fn absent_mapping_creates_generation_one_then_records_observed_pod() {
     send.send_response(missing_response());
     let (_second, send) = handle.next_request().await.unwrap();
     send.send_response(missing_response());
+    let (list, send) = handle.next_request().await.unwrap();
+    assert_eq!(list.method(), Method::GET);
+    send.send_response(json_response(StatusCode::OK, config_map_list(&[])));
 
     let (create, send) = handle.next_request().await.unwrap();
     assert_eq!(create.method(), Method::POST);
@@ -523,9 +564,89 @@ async fn absent_mapping_creates_generation_one_then_records_observed_pod() {
 }
 
 #[tokio::test]
-async fn matching_provisioning_attempt_idempotently_continues() {
+async fn absent_mapping_fails_closed_when_active_worker_capacity_is_full() {
+    let fake = FakeProvisioner::successful();
+    let (coordinator, handle) =
+        coordinator_with_capacity(Arc::new(fake.clone()), capacity_with_limit(1));
+    let activation = request(
+        session_id("discord:capacity-rejected"),
+        BrokerMappingExpectationV1::Absent,
+    );
+    let expected_session = activation.session_id();
+    let active = anchor_in_phase(session_id("discord:capacity-existing"), SessionPhase::Ready);
+    let task = tokio::spawn(async move { coordinator.prepare(&activation, timing()).await });
+
+    let mut handle = std::pin::pin!(handle);
+    let (_first, send) = handle.next_request().await.unwrap();
+    send.send_response(missing_response());
+    let (_second, send) = handle.next_request().await.unwrap();
+    send.send_response(missing_response());
+    let (list, send) = handle.next_request().await.unwrap();
+    assert_eq!(list.method(), Method::GET);
+    assert_eq!(
+        list.uri().path(),
+        format!("/api/v1/namespaces/{NAMESPACE}/configmaps")
+    );
+    send.send_response(json_response(
+        StatusCode::OK,
+        config_map_list(std::slice::from_ref(&active)),
+    ));
+
+    let error = task.await.unwrap().unwrap_err();
+    assert!(matches!(error, ActivationError::CapacityExhausted));
+    assert_eq!(
+        error.to_string(),
+        "the configured active-worker capacity is exhausted"
+    );
+    assert_eq!(fake.proof_calls(), vec![expected_session]);
+    assert!(fake.ensure_calls().is_empty());
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn capacity_inventory_failure_never_creates_or_provisions() {
     let fake = FakeProvisioner::successful();
     let (coordinator, handle) = coordinator(fake.clone());
+    let activation = request(
+        session_id("discord:capacity-inventory-failure"),
+        BrokerMappingExpectationV1::Absent,
+    );
+    let task = tokio::spawn(async move { coordinator.prepare(&activation, timing()).await });
+
+    let mut handle = std::pin::pin!(handle);
+    let (_first, send) = handle.next_request().await.unwrap();
+    send.send_response(missing_response());
+    let (_second, send) = handle.next_request().await.unwrap();
+    send.send_response(missing_response());
+    let (list, send) = handle.next_request().await.unwrap();
+    assert_eq!(list.method(), Method::GET);
+    send.send_response(json_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        json!({
+            "apiVersion": "v1",
+            "kind": "Status",
+            "status": "Failure",
+            "reason": "InternalError",
+            "code": 500
+        }),
+    ));
+
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(ActivationError::Store(AnchorStoreError::Kubernetes {
+            operation: StoreOperation::List,
+            ..
+        }))
+    ));
+    assert!(fake.ensure_calls().is_empty());
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn matching_provisioning_attempt_idempotently_continues() {
+    let fake = FakeProvisioner::successful();
+    let (coordinator, handle) =
+        coordinator_with_capacity(Arc::new(fake.clone()), capacity_with_limit(1));
     let session_id = session_id("discord:retry");
     let activation = request(session_id, BrokerMappingExpectationV1::Present);
     let existing = anchor(session_id, attempt_id(), PROFILE_VERSION);
@@ -718,6 +839,9 @@ async fn anchor_create_conflict_never_provisions_or_returns_success() {
     send.send_response(missing_response());
     let (_second_get, send) = handle.next_request().await.unwrap();
     send.send_response(missing_response());
+    let (list, send) = handle.next_request().await.unwrap();
+    assert_eq!(list.method(), Method::GET);
+    send.send_response(json_response(StatusCode::OK, config_map_list(&[])));
     let (create, send) = handle.next_request().await.unwrap();
     assert_eq!(create.method(), Method::POST);
     send.send_response(conflict_response());
@@ -748,6 +872,9 @@ async fn malformed_anchor_create_response_never_provisions_or_returns_success() 
     send.send_response(missing_response());
     let (_second_get, send) = handle.next_request().await.unwrap();
     send.send_response(missing_response());
+    let (list, send) = handle.next_request().await.unwrap();
+    assert_eq!(list.method(), Method::GET);
+    send.send_response(json_response(StatusCode::OK, config_map_list(&[])));
     let (create, send) = handle.next_request().await.unwrap();
     assert_eq!(create.method(), Method::POST);
     let mut malformed = request_body(create).await;
@@ -883,6 +1010,118 @@ async fn activation_serializes_the_full_absence_proof_for_one_session() {
         second.await.unwrap().unwrap(),
         ActivationPreparation::MappingAbsent(_)
     ));
+}
+
+#[tokio::test]
+async fn shared_scope_capacity_gate_serializes_inventory_and_durable_reservation() {
+    let fake = Arc::new(FakeProvisioner::successful());
+    let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+    let store =
+        ConfigMapAnchorStore::new(Client::new(service, "default"), NAMESPACE, scope_id()).unwrap();
+    let locks = SessionLocks::new();
+    let capacity = capacity_with_limit(1);
+    let first_coordinator = Arc::new(ActivationCoordinator::new(
+        store.clone(),
+        locks.clone(),
+        capacity.clone(),
+        profile(),
+        fake.clone(),
+        fake.clone(),
+    ));
+    let second_coordinator = Arc::new(ActivationCoordinator::new(
+        store,
+        locks,
+        capacity,
+        profile(),
+        fake.clone(),
+        fake.clone(),
+    ));
+    let first_session = session_id("discord:capacity-race-a");
+    let second_session = session_id("discord:capacity-race-b");
+    let first_request = request(first_session, BrokerMappingExpectationV1::Absent);
+    let first =
+        tokio::spawn(async move { first_coordinator.prepare(&first_request, timing()).await });
+
+    let mut handle = std::pin::pin!(handle);
+    let (_first_get, send) = handle.next_request().await.unwrap();
+    send.send_response(missing_response());
+    let (_first_recheck, send) = handle.next_request().await.unwrap();
+    send.send_response(missing_response());
+    let (first_list, first_list_response) = handle.next_request().await.unwrap();
+    assert_eq!(first_list.method(), Method::GET);
+
+    let second_request = request(second_session, BrokerMappingExpectationV1::Absent);
+    let second =
+        tokio::spawn(async move { second_coordinator.prepare(&second_request, timing()).await });
+    let (_second_get, send) = handle.next_request().await.unwrap();
+    send.send_response(missing_response());
+    let (_second_recheck, send) = handle.next_request().await.unwrap();
+    send.send_response(missing_response());
+
+    // The second session has finished its absence proof, but cannot perform
+    // its inventory LIST while the first admission owns the scope gate.
+    assert_no_request(&mut handle).await;
+    first_list_response.send_response(json_response(StatusCode::OK, config_map_list(&[])));
+
+    let (first_create, first_create_response) = handle.next_request().await.unwrap();
+    assert_eq!(first_create.method(), Method::POST);
+    let mut created_object = request_body(first_create).await;
+    let created_anchor: SessionAnchorV1 =
+        serde_json::from_str(created_object["data"]["anchor.json"].as_str().unwrap()).unwrap();
+    assert_eq!(created_anchor.session_id(), first_session);
+
+    // The gate covers the durable CREATE response, not just the preceding
+    // inventory snapshot.
+    assert_no_request(&mut handle).await;
+    created_object["metadata"]["uid"] = json!("capacity-race-anchor-uid");
+    created_object["metadata"]["resourceVersion"] = json!("rv-1");
+    first_create_response.send_response(json_response(StatusCode::CREATED, created_object));
+
+    let mut saw_second_inventory = false;
+    let mut saw_first_observation = false;
+    while !saw_second_inventory || !saw_first_observation {
+        let (request, send) =
+            tokio::time::timeout(StdDuration::from_secs(1), handle.next_request())
+                .await
+                .expect("both post-reservation operations should reach Kubernetes")
+                .unwrap();
+        match *request.method() {
+            Method::GET => {
+                assert!(!saw_second_inventory);
+                assert_eq!(
+                    request.uri().path(),
+                    format!("/api/v1/namespaces/{NAMESPACE}/configmaps")
+                );
+                saw_second_inventory = true;
+                send.send_response(json_response(
+                    StatusCode::OK,
+                    config_map_list(std::slice::from_ref(&created_anchor)),
+                ));
+            }
+            Method::PUT => {
+                assert!(!saw_first_observation);
+                saw_first_observation = true;
+                let mut body = request_body(request).await;
+                body["metadata"]["resourceVersion"] = json!("rv-2");
+                send.send_response(json_response(StatusCode::OK, body));
+            }
+            ref method => panic!("unexpected Kubernetes method {method}"),
+        }
+    }
+
+    assert!(matches!(
+        first.await.unwrap().unwrap(),
+        ActivationPreparation::AwaitingRegistration { .. }
+    ));
+    assert!(matches!(
+        second.await.unwrap(),
+        Err(ActivationError::CapacityExhausted)
+    ));
+    assert_eq!(
+        fake.ensure_calls(),
+        vec![(first_session, profile_ref(PROFILE_VERSION))]
+    );
+    assert_no_request(&mut handle).await;
 }
 
 #[tokio::test]

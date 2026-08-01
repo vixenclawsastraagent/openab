@@ -3,7 +3,7 @@ use super::{
     GenerationProvisioner, LifecycleCoordinator, LifecycleError, LifecycleProvisioner,
     LifecycleReconcileOutcome, RegistrationCoordinator, RegistrationError, RegistrationProvisioner,
     RegistrationRecovery, ReleaseCoordinator, ReleaseError, ReleaseOutcome, ReleaseProvisioner,
-    SessionLocks,
+    ScopeCapacityAdmission, SessionLocks,
 };
 use crate::identity::SessionId;
 use crate::profile_config::ControllerPolicy;
@@ -204,6 +204,7 @@ impl ControllerCoordinators {
         release_provisioner: Arc<dyn ReleaseProvisioner>,
     ) -> Result<Self, ControllerCoordinatorConfigError> {
         let locks = SessionLocks::new();
+        let capacity = ScopeCapacityAdmission::from_policy(&policy);
         let mut profile_coordinators = BTreeMap::new();
         for profile in profiles {
             let profile_ref = profile.profile().clone();
@@ -212,6 +213,7 @@ impl ControllerCoordinators {
                 activation: ActivationCoordinator::new(
                     store.clone(),
                     locks.clone(),
+                    capacity.clone(),
                     profile.clone(),
                     Arc::clone(&generation_provisioner),
                     Arc::clone(&lifecycle_provisioner),
