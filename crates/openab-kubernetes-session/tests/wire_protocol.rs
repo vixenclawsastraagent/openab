@@ -23,7 +23,7 @@ fn identity() -> BridgeIdentity {
         "team-a",
         "discord:thread-123",
         &ATTEMPT_ID.to_string(),
-        ProfileRef::new("codex-strict", "sha256-abc123").unwrap(),
+        "codex-strict",
     )
     .unwrap()
 }
@@ -127,18 +127,22 @@ fn activation_contains_only_derived_identity_and_requested_profile_name() {
     let encoded = encode_frame(&request).unwrap();
     let json: Value = serde_json::from_slice(&encoded).unwrap();
 
-    assert_eq!(json["version"], 1);
-    assert_eq!(json["scopeId"], identity().scope_id().as_hex());
-    assert_eq!(json["sessionId"], identity().session_id().as_hex());
-    assert_eq!(json["attemptId"], ATTEMPT_ID.to_string());
-    assert_eq!(json["brokerMappingExpectation"], "present");
-    assert_eq!(json["requestedProfileName"], "codex-strict");
-    assert!(!json.as_object().unwrap().contains_key("token"));
+    assert_eq!(
+        json,
+        json!({
+            "version": 1,
+            "scopeId": identity().scope_id().as_hex(),
+            "sessionId": identity().session_id().as_hex(),
+            "attemptId": ATTEMPT_ID.to_string(),
+            "brokerMappingExpectation": "present",
+            "requestedProfileName": "codex-strict",
+        })
+    );
 
     let text = String::from_utf8(encoded).unwrap();
     assert!(!text.contains("team-a"));
     assert!(!text.contains("discord:thread-123"));
-    assert!(!text.contains("sha256-abc123"));
+    assert!(!text.contains("sha256-image-v7"));
     assert_eq!(
         decode_frame::<ActivationRequestV1>(text.as_bytes()).unwrap(),
         request
@@ -210,6 +214,7 @@ fn activated_session_returns_validated_profile_binding_and_fixed_cwd() {
     let (actual_profile, actual_binding, actual_cwd) =
         decoded.into_validated_parts(&activation).unwrap();
     assert_eq!(actual_profile, profile);
+    assert_eq!(actual_profile.version(), "sha256-image-v7");
     assert_eq!(actual_binding, binding());
     assert_eq!(actual_cwd, "/workspace");
 
@@ -224,7 +229,7 @@ fn activated_session_returns_validated_profile_binding_and_fixed_cwd() {
         "team-b",
         "discord:thread-999",
         &ATTEMPT_ID.to_string(),
-        ProfileRef::new("codex-strict", "ignored").unwrap(),
+        "codex-strict",
     )
     .unwrap();
     let other_request =

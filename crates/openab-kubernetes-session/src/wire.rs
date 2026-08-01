@@ -11,7 +11,7 @@
 
 use crate::bridge::{BridgeIdentity, ControllerLifecycleAction, LifecycleKind, SessionBinding};
 use crate::identity::{ScopeId, SessionId};
-use crate::state::{Fence, ProfileRef};
+use crate::state::{validate_profile_name, Fence, ProfileRef};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
@@ -148,8 +148,7 @@ struct RequestedProfileName(String);
 impl RequestedProfileName {
     fn new(value: impl Into<String>) -> Result<Self, WireProtocolError> {
         let value = value.into();
-        ProfileRef::new(value.clone(), "wire-validation")
-            .map_err(|_| WireProtocolError::InvalidProfileName)?;
+        validate_profile_name(&value).map_err(|_| WireProtocolError::InvalidProfileName)?;
         Ok(Self(value))
     }
 }
@@ -355,7 +354,7 @@ impl ActivationRequestV1 {
             identity.scope_id(),
             identity.session_id(),
             identity.broker_attempt_id(),
-            identity.profile().name(),
+            identity.requested_profile_name(),
             broker_mapping_expectation,
         )
         .expect("BridgeIdentity already contains validated activation values")

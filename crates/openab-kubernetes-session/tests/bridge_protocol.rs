@@ -1,9 +1,9 @@
 use openab_kubernetes_session::bridge::{
-    BridgeAction, BridgeIdentity, BridgeKernel, BridgeProtocolError, BridgeState, ControllerError,
-    ControllerLifecycleAction, LifecycleKind, SessionBinding,
+    BridgeAction, BridgeIdentity, BridgeIdentityError, BridgeKernel, BridgeProtocolError,
+    BridgeState, ControllerError, ControllerLifecycleAction, LifecycleKind, SessionBinding,
 };
 use openab_kubernetes_session::identity::{ScopeId, SessionId};
-use openab_kubernetes_session::state::{Fence, ProfileRef};
+use openab_kubernetes_session::state::Fence;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -12,7 +12,7 @@ fn identity() -> BridgeIdentity {
         "team-a",
         "discord:thread-123",
         "00000000-0000-0000-0000-000000000064",
-        ProfileRef::new("codex-strict", "sha256-abc123").unwrap(),
+        "codex-strict",
     )
     .unwrap()
 }
@@ -625,19 +625,53 @@ fn bridge_identity_derives_only_from_the_exact_broker_values() {
         SessionId::derive("team-a", "discord:thread-123")
     );
     assert_eq!(expected.broker_attempt_id(), Uuid::from_u128(100));
+    assert_eq!(expected.requested_profile_name(), "codex-strict");
+    let debug = format!("{expected:?}");
+    assert!(debug.contains("codex-strict"));
+    assert!(!debug.contains("version"));
+    assert!(!debug.contains("ProfileRef"));
+    assert!(!debug.contains("sha256-abc123"));
 
     assert!(BridgeIdentity::from_values(
         "team-a",
         "",
         "00000000-0000-0000-0000-000000000064",
-        ProfileRef::new("codex-strict", "v1").unwrap(),
+        "codex-strict",
     )
     .is_err());
     assert!(BridgeIdentity::from_values(
         "team-a",
         "discord:thread-123",
         "not-a-uuid",
-        ProfileRef::new("codex-strict", "v1").unwrap(),
+        "codex-strict",
     )
     .is_err());
+}
+
+#[test]
+fn bridge_identity_rejects_invalid_profile_names_without_echoing_them() {
+    const SENTINEL: &str = "forged-bridge-log-line";
+    for invalid in [
+        String::new(),
+        "Not-A-DNS-Label".into(),
+        "profile/with/slash".into(),
+        format!("bad\n{SENTINEL}"),
+        "a".repeat(64),
+    ] {
+        let error = BridgeIdentity::from_values(
+            "team-a",
+            "discord:thread-123",
+            "00000000-0000-0000-0000-000000000064",
+            &invalid,
+        )
+        .unwrap_err();
+        assert_eq!(error, BridgeIdentityError::InvalidRequestedProfileName);
+        assert_eq!(
+            error.to_string(),
+            "requested profile name must be a lowercase Kubernetes DNS label"
+        );
+        assert_eq!(format!("{error:?}"), "InvalidRequestedProfileName");
+        assert!(!error.to_string().contains(SENTINEL));
+        assert!(!format!("{error:?}").contains(SENTINEL));
+    }
 }

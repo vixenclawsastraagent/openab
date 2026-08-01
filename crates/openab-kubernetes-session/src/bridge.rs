@@ -1,5 +1,5 @@
 use crate::identity::{ScopeId, SessionId};
-use crate::state::{Fence, ProfileRef};
+use crate::state::{validate_profile_name, Fence};
 use serde_json::{json, Map, Value};
 use std::env;
 use thiserror::Error;
@@ -27,6 +27,8 @@ pub enum BridgeIdentityError {
     EnvironmentVariable { name: &'static str },
     #[error("{SESSION_ATTEMPT_ID_ENV} must be a non-nil UUID")]
     InvalidAttemptId,
+    #[error("requested profile name must be a lowercase Kubernetes DNS label")]
+    InvalidRequestedProfileName,
 }
 
 /// Opaque identity derived from broker-owned values and trusted bridge
@@ -36,11 +38,14 @@ pub struct BridgeIdentity {
     scope_id: ScopeId,
     session_id: SessionId,
     broker_attempt_id: Uuid,
-    profile: ProfileRef,
+    requested_profile_name: String,
 }
 
 impl BridgeIdentity {
-    pub fn from_environment(scope: &str, profile: ProfileRef) -> Result<Self, BridgeIdentityError> {
+    pub fn from_environment(
+        scope: &str,
+        requested_profile_name: &str,
+    ) -> Result<Self, BridgeIdentityError> {
         let session_key =
             env::var(SESSION_KEY_ENV).map_err(|_| BridgeIdentityError::EnvironmentVariable {
                 name: SESSION_KEY_ENV,
@@ -50,7 +55,7 @@ impl BridgeIdentity {
                 name: SESSION_ATTEMPT_ID_ENV,
             }
         })?;
-        Self::from_values(scope, &session_key, &attempt_id, profile)
+        Self::from_values(scope, &session_key, &attempt_id, requested_profile_name)
     }
 
     /// Construct from already captured broker values.
@@ -61,7 +66,7 @@ impl BridgeIdentity {
         scope: &str,
         logical_session_key: &str,
         broker_attempt_id: &str,
-        profile: ProfileRef,
+        requested_profile_name: &str,
     ) -> Result<Self, BridgeIdentityError> {
         if scope.trim().is_empty() {
             return Err(BridgeIdentityError::EmptyScope);
@@ -69,6 +74,8 @@ impl BridgeIdentity {
         if logical_session_key.is_empty() {
             return Err(BridgeIdentityError::EmptySessionKey);
         }
+        validate_profile_name(requested_profile_name)
+            .map_err(|_| BridgeIdentityError::InvalidRequestedProfileName)?;
         let broker_attempt_id = Uuid::parse_str(broker_attempt_id)
             .ok()
             .filter(|value| !value.is_nil())
@@ -77,7 +84,7 @@ impl BridgeIdentity {
             scope_id: ScopeId::derive(scope),
             session_id: SessionId::derive(scope, logical_session_key),
             broker_attempt_id,
-            profile,
+            requested_profile_name: requested_profile_name.to_string(),
         })
     }
 
@@ -93,8 +100,8 @@ impl BridgeIdentity {
         self.broker_attempt_id
     }
 
-    pub fn profile(&self) -> &ProfileRef {
-        &self.profile
+    pub fn requested_profile_name(&self) -> &str {
+        &self.requested_profile_name
     }
 }
 

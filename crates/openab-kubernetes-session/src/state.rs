@@ -136,14 +136,19 @@ impl ProfileRef {
     }
 
     fn validate(&self) -> Result<(), StateError> {
-        if !is_dns_label(&self.name) {
-            return Err(StateError::InvalidProfileName);
-        }
+        validate_profile_name(&self.name)?;
         if self.version.trim().is_empty() {
             return Err(StateError::InvalidProfileVersion);
         }
         Ok(())
     }
+}
+
+pub(crate) fn validate_profile_name(value: &str) -> Result<(), StateError> {
+    if !is_dns_label(value) {
+        return Err(StateError::InvalidProfileName);
+    }
+    Ok(())
 }
 
 fn is_dns_label(value: &str) -> bool {
