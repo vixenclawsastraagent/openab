@@ -112,6 +112,17 @@ fn failure_response(status: StatusCode, reason: &str) -> Response<Body> {
     )
 }
 
+fn config_map_list(items: Vec<Value>) -> Value {
+    json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMapList",
+        "metadata": {
+            "resourceVersion": "inventory-rv-1"
+        },
+        "items": items
+    })
+}
+
 async fn request_body(request: Request<Body>) -> Value {
     let bytes = request.into_body().collect_bytes().await.unwrap();
     serde_json::from_slice(&bytes).unwrap()
@@ -151,6 +162,269 @@ async fn store_exposes_its_single_scope_binding() {
     let store = ConfigMapAnchorStore::new(client, NAMESPACE, scope_id()).unwrap();
 
     assert_eq!(store.scope_id(), scope_id());
+}
+
+#[tokio::test]
+async fn inventory_lists_the_namespace_ignores_unrelated_objects_and_sorts_anchors() {
+    let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+    let client = Client::new(service, "default");
+    let store = ConfigMapAnchorStore::new(client, NAMESPACE, scope_id()).unwrap();
+    let first_session = SessionId::derive(RAW_SCOPE, "discord:inventory-first");
+    let second_session = SessionId::derive(RAW_SCOPE, "discord:inventory-second");
+
+    let mut terminating = config_map(
+        &deleting_anchor(first_session, scope_id()),
+        Some("uid-first"),
+        Some("rv-first"),
+    );
+    terminating["metadata"]["deletionTimestamp"] = json!("2026-07-31T08:01:00Z");
+    terminating["metadata"]["finalizers"] = json!(["kubernetes.io/test-finalizer"]);
+    let active = config_map(
+        &test_anchor(second_session, scope_id()),
+        Some("uid-second"),
+        Some("rv-second"),
+    );
+    let unrelated = json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": "team-owned-settings",
+            "namespace": NAMESPACE,
+            "uid": "unrelated-uid",
+            "resourceVersion": "unrelated-rv",
+            "labels": {
+                "app.kubernetes.io/managed-by": "another-controller"
+            }
+        },
+        "data": {
+            "settings.toml": "unrelated"
+        }
+    });
+
+    let inventory_task = tokio::spawn(async move { store.list_inventory().await });
+    let mut handle = std::pin::pin!(handle);
+    let (request, send) = handle.next_request().await.expect("inventory LIST");
+    assert_eq!(request.method(), Method::GET);
+    assert_eq!(
+        request.uri().path(),
+        format!("/api/v1/namespaces/{NAMESPACE}/configmaps")
+    );
+    assert_eq!(request.uri().query().unwrap_or_default(), "");
+    send.send_response(json_response(
+        StatusCode::OK,
+        config_map_list(vec![active, unrelated, terminating]),
+    ));
+
+    let inventory = inventory_task.await.unwrap().unwrap();
+    let actual_names: Vec<_> = inventory
+        .iter()
+        .map(|anchor| anchor.name().to_string())
+        .collect();
+    let mut expected_names = vec![
+        ResourceNames::new(first_session).anchor(),
+        ResourceNames::new(second_session).anchor(),
+    ];
+    expected_names.sort();
+    assert_eq!(actual_names, expected_names);
+    assert_eq!(inventory.len(), 2);
+    assert!(inventory
+        .iter()
+        .any(|anchor| anchor.state().phase() == SessionPhase::Deleting));
+}
+
+#[tokio::test]
+async fn inventory_fails_closed_when_any_managed_anchor_is_invalid() {
+    let valid_session = SessionId::derive(RAW_SCOPE, "discord:inventory-valid");
+    let invalid_session = SessionId::derive(RAW_SCOPE, "discord:inventory-invalid");
+    let valid = config_map(
+        &test_anchor(valid_session, scope_id()),
+        Some("uid-valid"),
+        Some("rv-valid"),
+    );
+
+    let mut wrong_scope = config_map(
+        &test_anchor(invalid_session, ScopeId::derive("another-team")),
+        Some("uid-invalid"),
+        Some("rv-invalid"),
+    );
+    wrong_scope["metadata"]["name"] = json!(ResourceNames::new(invalid_session).anchor());
+
+    let mut wrong_name = config_map(
+        &test_anchor(invalid_session, scope_id()),
+        Some("uid-invalid"),
+        Some("rv-invalid"),
+    );
+    wrong_name["metadata"]["name"] = json!("oab-session-wrong");
+
+    let mut missing_uid = config_map(
+        &test_anchor(invalid_session, scope_id()),
+        Some("uid-invalid"),
+        Some("rv-invalid"),
+    );
+    missing_uid["metadata"]
+        .as_object_mut()
+        .unwrap()
+        .remove("uid");
+
+    let mut missing_resource_version = config_map(
+        &test_anchor(invalid_session, scope_id()),
+        Some("uid-invalid"),
+        Some("rv-invalid"),
+    );
+    missing_resource_version["metadata"]
+        .as_object_mut()
+        .unwrap()
+        .remove("resourceVersion");
+
+    let mut malformed_data = config_map(
+        &test_anchor(invalid_session, scope_id()),
+        Some("uid-invalid"),
+        Some("rv-invalid"),
+    );
+    malformed_data["data"]["unexpected"] = json!("not allowed");
+
+    let mut wrong_labels = config_map(
+        &test_anchor(invalid_session, scope_id()),
+        Some("uid-invalid"),
+        Some("rv-invalid"),
+    );
+    wrong_labels["metadata"]["labels"]["openab.dev/resource"] = json!("foreign");
+
+    let mut missing_labels = config_map(
+        &test_anchor(invalid_session, scope_id()),
+        Some("uid-invalid"),
+        Some("rv-invalid"),
+    );
+    missing_labels["metadata"]
+        .as_object_mut()
+        .unwrap()
+        .remove("labels");
+
+    let mut terminating_non_deleting = config_map(
+        &test_anchor(invalid_session, scope_id()),
+        Some("uid-invalid"),
+        Some("rv-invalid"),
+    );
+    terminating_non_deleting["metadata"]["deletionTimestamp"] = json!("2026-07-31T08:01:00Z");
+
+    let mut terminating_with_pod = config_map(
+        &deleting_anchor_with_pod(invalid_session, scope_id(), "pod-uid-invalid"),
+        Some("uid-invalid"),
+        Some("rv-invalid"),
+    );
+    terminating_with_pod["metadata"]["deletionTimestamp"] = json!("2026-07-31T08:01:00Z");
+
+    for (case, invalid) in [
+        ("scope", wrong_scope),
+        ("name", wrong_name),
+        ("uid", missing_uid),
+        ("resource version", missing_resource_version),
+        ("data", malformed_data),
+        ("labels", wrong_labels),
+        ("missing labels", missing_labels),
+        ("terminating phase", terminating_non_deleting),
+        ("terminating pod", terminating_with_pod),
+    ] {
+        let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+        let client = Client::new(service, "default");
+        let store = ConfigMapAnchorStore::new(client, NAMESPACE, scope_id()).unwrap();
+        let inventory_task = tokio::spawn(async move { store.list_inventory().await });
+
+        let mut handle = std::pin::pin!(handle);
+        let (_request, send) = handle.next_request().await.expect("inventory LIST");
+        send.send_response(json_response(
+            StatusCode::OK,
+            config_map_list(vec![valid.clone(), invalid]),
+        ));
+
+        assert!(inventory_task.await.unwrap().is_err(), "case {case}");
+    }
+}
+
+#[tokio::test]
+async fn inventory_errors_do_not_echo_malformed_anchor_data() {
+    let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+    let client = Client::new(service, "default");
+    let store = ConfigMapAnchorStore::new(client, NAMESPACE, scope_id()).unwrap();
+    let mut malformed = config_map(
+        &test_anchor(session_id(), scope_id()),
+        Some("uid-invalid"),
+        Some("rv-invalid"),
+    );
+    malformed["data"]["anchor.json"] = json!("private-json-sentinel");
+    let inventory_task = tokio::spawn(async move { store.list_inventory().await });
+
+    let mut handle = std::pin::pin!(handle);
+    let (_request, send) = handle.next_request().await.expect("inventory LIST");
+    send.send_response(json_response(
+        StatusCode::OK,
+        config_map_list(vec![malformed]),
+    ));
+
+    let error = inventory_task.await.unwrap().unwrap_err();
+    assert!(!error.to_string().contains("private-json-sentinel"));
+}
+
+#[tokio::test]
+async fn inventory_api_failure_is_not_treated_as_empty() {
+    let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+    let client = Client::new(service, "default");
+    let store = ConfigMapAnchorStore::new(client, NAMESPACE, scope_id()).unwrap();
+    let inventory_task = tokio::spawn(async move { store.list_inventory().await });
+
+    let mut handle = std::pin::pin!(handle);
+    let (_request, send) = handle.next_request().await.expect("inventory LIST");
+    send.send_response(failure_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "InternalError",
+    ));
+
+    assert!(matches!(
+        inventory_task.await.unwrap(),
+        Err(AnchorStoreError::Kubernetes {
+            operation: StoreOperation::List,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn inventory_rejects_an_unversioned_or_incomplete_collection() {
+    for (case, metadata) in [
+        ("missing resource version", json!({})),
+        (
+            "unexpected continuation",
+            json!({
+                "resourceVersion": "inventory-rv-1",
+                "continue": "opaque-next-page"
+            }),
+        ),
+    ] {
+        let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+        let client = Client::new(service, "default");
+        let store = ConfigMapAnchorStore::new(client, NAMESPACE, scope_id()).unwrap();
+        let inventory_task = tokio::spawn(async move { store.list_inventory().await });
+
+        let mut handle = std::pin::pin!(handle);
+        let (_request, send) = handle.next_request().await.expect("inventory LIST");
+        send.send_response(json_response(
+            StatusCode::OK,
+            json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMapList",
+                "metadata": metadata,
+                "items": []
+            }),
+        ));
+
+        assert!(
+            matches!(
+                inventory_task.await.unwrap(),
+                Err(AnchorStoreError::MalformedObject { .. })
+            ),
+            "case {case}"
+        );
+    }
 }
 
 #[tokio::test]

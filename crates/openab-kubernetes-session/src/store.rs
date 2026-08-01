@@ -3,7 +3,7 @@ use crate::identity::{ResourceNames, ScopeId, SessionId};
 use crate::state::{SessionAnchorV1, SessionPhase, StateError};
 use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use kube::api::{DeleteParams, PostParams, Preconditions};
+use kube::api::{DeleteParams, ListParams, PostParams, Preconditions};
 use kube::{Api, Client};
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -14,11 +14,13 @@ const MANAGED_BY_VALUE: &str = "openab-session-controller";
 const RESOURCE_LABEL: &str = "openab.dev/resource";
 const RESOURCE_VALUE: &str = "session-anchor";
 const MAX_ANCHOR_BYTES: usize = 64 * 1024;
+const INVENTORY_TARGET: &str = "session-anchor inventory";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreOperation {
     Create,
     Get,
+    List,
     ObserveDeletion,
     Replace,
     Delete,
@@ -211,6 +213,48 @@ impl ConfigMapAnchorStore {
         object
             .map(|object| self.decode(object, session_id))
             .transpose()
+    }
+
+    /// Return one fully validated snapshot of every managed anchor in scope.
+    ///
+    /// The dedicated worker namespace is listed without a positive selector:
+    /// a selector would hide an anchor whose labels were removed or changed.
+    /// Deterministically named objects and objects carrying either OpenAB
+    /// anchor label are strict candidates. One malformed candidate fails the
+    /// whole inventory so callers never undercount active workers. A
+    /// terminating object is accepted only when it is safe for deletion
+    /// recovery; unrelated ConfigMaps are ignored.
+    pub async fn list_inventory(&self) -> Result<Vec<StoredAnchor>, AnchorStoreError> {
+        let params = ListParams::default();
+        let objects = self
+            .api
+            .list(&params)
+            .await
+            .map_err(|error| map_api_error(error, StoreOperation::List, INVENTORY_TARGET))?;
+        required_metadata(
+            objects.metadata.resource_version.as_deref(),
+            INVENTORY_TARGET,
+            "metadata.resourceVersion",
+        )?;
+        if objects
+            .metadata
+            .continue_
+            .as_deref()
+            .is_some_and(|token| !token.is_empty())
+        {
+            return Err(malformed(
+                INVENTORY_TARGET,
+                "LIST response is an incomplete collection",
+            ));
+        }
+        let mut inventory = objects
+            .items
+            .into_iter()
+            .filter(is_inventory_candidate)
+            .map(|object| self.decode_inventory_object(object))
+            .collect::<Result<Vec<_>, _>>()?;
+        inventory.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+        Ok(inventory)
     }
 
     /// Deletion-only read that accepts a terminating, deletion-ready anchor.
@@ -600,6 +644,30 @@ impl ConfigMapAnchorStore {
         self.decode_with_lifecycle(object, expected_session_id, false)
     }
 
+    fn decode_inventory_object(&self, object: ConfigMap) -> Result<StoredAnchor, AnchorStoreError> {
+        let observed_name = object.metadata.name.as_deref().unwrap_or(INVENTORY_TARGET);
+        let data = object
+            .data
+            .as_ref()
+            .ok_or_else(|| malformed(observed_name, "data is missing"))?;
+        let serialized = data
+            .get(ANCHOR_DATA_KEY)
+            .ok_or_else(|| malformed(observed_name, "anchor.json is missing"))?;
+        if serialized.len() > MAX_ANCHOR_BYTES {
+            return Err(AnchorStoreError::AnchorTooLarge {
+                bytes: serialized.len(),
+                maximum: MAX_ANCHOR_BYTES,
+            });
+        }
+        let state: SessionAnchorV1 = serde_json::from_str(serialized)
+            .map_err(|error| malformed(observed_name, format!("invalid anchor state: {error}")))?;
+        let stored = self.decode_with_lifecycle(object, state.session_id(), true)?;
+        if stored.is_terminating() {
+            self.validate_delete_ready(stored.state())?;
+        }
+        Ok(stored)
+    }
+
     fn decode_with_lifecycle(
         &self,
         object: ConfigMap,
@@ -800,6 +868,18 @@ fn validate_labels(metadata: &ObjectMeta, name: &str) -> Result<(), AnchorStoreE
         return Err(malformed(name, "required labels do not match"));
     }
     Ok(())
+}
+
+fn is_inventory_candidate(object: &ConfigMap) -> bool {
+    object
+        .metadata
+        .name
+        .as_deref()
+        .is_some_and(|name| name.starts_with("oab-session-"))
+        || object.metadata.labels.as_ref().is_some_and(|labels| {
+            labels.get(MANAGED_BY_LABEL).map(String::as_str) == Some(MANAGED_BY_VALUE)
+                || labels.get(RESOURCE_LABEL).map(String::as_str) == Some(RESOURCE_VALUE)
+        })
 }
 
 fn required_metadata(
