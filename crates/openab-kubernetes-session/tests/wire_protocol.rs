@@ -637,7 +637,7 @@ fn every_top_level_message_rejects_an_unsupported_version() {
 }
 
 #[test]
-fn only_acp_frames_receive_the_large_data_plane_limit() {
+fn standalone_control_frames_keep_the_small_data_plane_limit() {
     assert_eq!(
         MAX_ACP_FRAME_BYTES,
         openab_kubernetes_session::bridge::MAX_LOGICAL_MESSAGE_BYTES + MAX_CONTROL_FRAME_BYTES

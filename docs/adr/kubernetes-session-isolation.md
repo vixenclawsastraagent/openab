@@ -182,6 +182,20 @@ All other valid ACP requests, notifications, responses, and non-host-capability
 agent requests pass through with bounded frames, messages, queues, and
 timeouts. Filesystem and terminal work executes inside the worker Pod.
 
+The relay protocol has four closed, role-specific directions: bridge to
+controller, controller to bridge, worker to controller, and controller to
+worker. Each direction reuses the versioned activation, registration,
+lifecycle, result, and ACP payloads; unknown variants and fields are rejected.
+Transport credentials, Pod UIDs, process-local connection IDs, orphan events,
+and activity events are never relay control fields and are never accepted from
+peer JSON as authority. Opaque ACP data may contain arbitrary application
+field names without changing that boundary. Mixed envelopes have one bounded
+ACP pre-allocation ceiling, then enforce the smaller 64 KiB limit on the
+complete encoded control frame after its variant is known. ACP frames keep
+their separate logical-message bound. Socket adapters must additionally use
+bounded queues and backpressure rather than accumulating valid frames without
+limit.
+
 ### 4.2 Controller and relay
 
 The controller and relay are one trusted process in the initial design. A

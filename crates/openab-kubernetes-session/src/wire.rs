@@ -19,6 +19,12 @@ use std::num::NonZeroU64;
 use thiserror::Error;
 use uuid::Uuid;
 
+mod envelope;
+
+pub use envelope::{
+    BridgeToControllerV1, ControllerToBridgeV1, ControllerToWorkerV1, WorkerToControllerV1,
+};
+
 pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_ACP_FRAME_BYTES: usize =
     crate::bridge::MAX_LOGICAL_MESSAGE_BYTES + MAX_CONTROL_FRAME_BYTES;
@@ -33,10 +39,20 @@ mod sealed {
 /// Closed set of messages accepted by [`encode_frame`] and [`decode_frame`].
 ///
 /// A WebSocket adapter can inspect `MAX_FRAME_BYTES` before allocating or
-/// accumulating a complete message. Only [`AcpMessageV1`] receives the large
-/// ACP data-plane allowance; every control-plane type is limited to 64 KiB.
+/// accumulating a complete message. Standalone control-plane types are
+/// limited to 64 KiB. Mixed direction envelopes use the ACP ceiling until the
+/// variant is known, then [`decode_frame`] applies the 64 KiB limit to their
+/// control variants using the complete outer-frame length.
 pub trait WireMessage: sealed::Sealed + Serialize + DeserializeOwned {
+    /// Pre-allocation ceiling for this message type. Mixed relay envelopes use
+    /// the ACP ceiling here, then apply a smaller variant-specific limit after
+    /// decoding identifies a control-plane variant.
     const MAX_FRAME_BYTES: usize;
+
+    /// Exact encoded-frame limit for this concrete value.
+    fn encoded_frame_limit(&self) -> usize {
+        Self::MAX_FRAME_BYTES
+    }
 }
 
 #[derive(Debug, Error)]
@@ -71,6 +87,8 @@ pub enum WireProtocolError {
     UnexpectedMappingAbsent,
     #[error("protocol result requestId does not match the lifecycle request")]
     ResultRequestIdMismatch,
+    #[error("handshake protocol results must not contain a requestId")]
+    UnexpectedHandshakeRequestId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -765,6 +783,13 @@ pub enum FatalCode {
     Internal,
 }
 
+/// Typed result accepted only by activation and registration handshakes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandshakeOutcomeV1 {
+    Ack,
+    Fatal(FatalCode),
+}
+
 /// ACK when `fatal_code` is absent; sanitized fatal result when it is present.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -808,6 +833,18 @@ impl ProtocolResultV1 {
         }
         Ok(self.fatal_code)
     }
+
+    /// Consume a handshake result only when it has no lifecycle correlation
+    /// identifier. Connection state must still decide whether an ACK is valid
+    /// for the pending activation or registration step.
+    pub fn into_handshake_outcome(self) -> Result<HandshakeOutcomeV1, WireProtocolError> {
+        if self.request_id().is_some() {
+            return Err(WireProtocolError::UnexpectedHandshakeRequestId);
+        }
+        Ok(self
+            .fatal_code
+            .map_or(HandshakeOutcomeV1::Ack, HandshakeOutcomeV1::Fatal))
+    }
 }
 
 macro_rules! control_wire_messages {
@@ -837,7 +874,8 @@ impl WireMessage for AcpMessageV1 {
     const MAX_FRAME_BYTES: usize = MAX_ACP_FRAME_BYTES;
 }
 
-/// Return the allocation ceiling for a concrete, sealed wire message type.
+/// Return the pre-allocation ceiling for a concrete, sealed wire message type.
+/// Mixed relay envelopes apply a smaller control-plane limit after decoding.
 pub const fn max_frame_len<T: WireMessage>() -> usize {
     T::MAX_FRAME_BYTES
 }
@@ -845,11 +883,12 @@ pub const fn max_frame_len<T: WireMessage>() -> usize {
 /// Validate a declared or accumulated frame length before allocating more
 /// relay buffer space.
 pub fn validate_frame_len<T: WireMessage>(bytes: usize) -> Result<(), WireProtocolError> {
-    if bytes > T::MAX_FRAME_BYTES {
-        return Err(WireProtocolError::FrameTooLarge {
-            bytes,
-            maximum: T::MAX_FRAME_BYTES,
-        });
+    validate_frame_len_against(bytes, T::MAX_FRAME_BYTES)
+}
+
+fn validate_frame_len_against(bytes: usize, maximum: usize) -> Result<(), WireProtocolError> {
+    if bytes > maximum {
+        return Err(WireProtocolError::FrameTooLarge { bytes, maximum });
     }
     Ok(())
 }
@@ -857,12 +896,15 @@ pub fn validate_frame_len<T: WireMessage>(bytes: usize) -> Result<(), WireProtoc
 pub fn encode_frame<T: WireMessage>(message: &T) -> Result<Vec<u8>, WireProtocolError> {
     let encoded = serde_json::to_vec(message).map_err(WireProtocolError::InvalidJson)?;
     validate_frame_len::<T>(encoded.len())?;
+    validate_frame_len_against(encoded.len(), message.encoded_frame_limit())?;
     Ok(encoded)
 }
 
 pub fn decode_frame<T: WireMessage>(bytes: &[u8]) -> Result<T, WireProtocolError> {
     validate_frame_len::<T>(bytes.len())?;
-    serde_json::from_slice(bytes).map_err(WireProtocolError::InvalidJson)
+    let message: T = serde_json::from_slice(bytes).map_err(WireProtocolError::InvalidJson)?;
+    validate_frame_len_against(bytes.len(), message.encoded_frame_limit())?;
+    Ok(message)
 }
 
 fn validate_acp_payload(payload: &Value) -> Result<(), WireProtocolError> {
