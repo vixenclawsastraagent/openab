@@ -1,3 +1,4 @@
+use crate::controller::AllChildrenAbsentProof;
 use crate::identity::{ResourceNames, ScopeId, SessionId};
 use crate::state::{SessionAnchorV1, SessionPhase, StateError};
 use k8s_openapi::api::core::v1::ConfigMap;
@@ -67,6 +68,8 @@ pub enum AnchorStoreError {
     DeletePhaseNotDeleting { actual: SessionPhase },
     #[error("anchor deletion requires the worker Pod to be absent, but Pod {pod_uid} remains")]
     DeletePodStillPresent { pod_uid: String },
+    #[error("anchor deletion requires an exact all-children absence proof")]
+    DeleteProofMismatch,
     #[error("expected anchor UID must not be empty")]
     InvalidExpectedUid,
     #[error("could not encode anchor state")]
@@ -129,6 +132,10 @@ impl StoredAnchor {
 
     pub fn resource_version(&self) -> &str {
         &self.resource_version
+    }
+
+    pub(crate) fn is_terminating(&self) -> bool {
+        self.object.metadata.deletion_timestamp.is_some()
     }
 }
 
@@ -206,6 +213,28 @@ impl ConfigMapAnchorStore {
             .transpose()
     }
 
+    /// Deletion-only read that accepts a terminating, deletion-ready anchor.
+    /// Normal callers must keep using [`Self::get`], which rejects terminating
+    /// objects so they cannot be adopted as live session state.
+    pub(crate) async fn get_for_deletion(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<StoredAnchor>, AnchorStoreError> {
+        let name = ResourceNames::new(session_id).anchor();
+        let object = self
+            .api
+            .get_opt(&name)
+            .await
+            .map_err(|error| map_api_error(error, StoreOperation::Get, &name))?;
+        let stored = object
+            .map(|object| self.decode_with_lifecycle(object, session_id, true))
+            .transpose()?;
+        if let Some(stored) = stored.as_ref().filter(|stored| stored.is_terminating()) {
+            self.validate_delete_ready(stored.state())?;
+        }
+        Ok(stored)
+    }
+
     pub async fn observe_deletion(
         &self,
         session_id: SessionId,
@@ -260,9 +289,16 @@ impl ConfigMapAnchorStore {
         }
     }
 
-    pub async fn delete(&self, observed: &StoredAnchor) -> Result<DeleteOutcome, AnchorStoreError> {
+    pub(crate) async fn delete(
+        &self,
+        observed: &StoredAnchor,
+        proof: &AllChildrenAbsentProof,
+    ) -> Result<DeleteOutcome, AnchorStoreError> {
         self.validate_observation(observed)?;
         self.validate_delete_ready(observed.state())?;
+        if !proof.matches_anchor(observed) {
+            return Err(AnchorStoreError::DeleteProofMismatch);
+        }
         let name = observed.name.clone();
         let params = DeleteParams::default().preconditions(Preconditions {
             resource_version: Some(observed.resource_version.clone()),

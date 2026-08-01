@@ -10,6 +10,7 @@ use kube::Client;
 use openab_kubernetes_session::controller::{
     CleanupProgress, GenerationProvisioner, GenerationProvisionerError, GenerationResource,
     KubernetesGenerationProvisioner, LifecycleProvisioner, ProvisionerOperation,
+    ReleaseCoordinator, ReleaseError, ReleaseOutcome, SessionLocks,
 };
 use openab_kubernetes_session::identity::{ResourceNames, ScopeId, SessionId};
 use openab_kubernetes_session::resources::{
@@ -19,7 +20,9 @@ use openab_kubernetes_session::resources::{
 };
 use openab_kubernetes_session::state::{ProfileRef, SessionAnchorV1, SessionPhase};
 use openab_kubernetes_session::store::ConfigMapAnchorStore;
+use openab_kubernetes_session::wire::LifecycleRequestV1;
 use serde_json::{json, Value};
+use std::sync::Arc;
 use std::time::Duration;
 use tower_test::mock;
 use uuid::Uuid;
@@ -107,6 +110,31 @@ fn suspended_anchor(session_id: SessionId) -> SessionAnchorV1 {
     let fence = anchor.fence().clone();
     anchor.transition(&fence, SessionPhase::Suspended).unwrap();
     anchor
+}
+
+fn deleting_anchor(session_id: SessionId) -> SessionAnchorV1 {
+    let mut anchor = anchor(session_id);
+    let fence = anchor.fence().clone();
+    anchor.transition(&fence, SessionPhase::Deleting).unwrap();
+    anchor
+}
+
+fn release_request(anchor: &SessionAnchorV1) -> LifecycleRequestV1 {
+    serde_json::from_value(json!({
+        "version": 1,
+        "requestId": Uuid::from_u128(0x40),
+        "kind": "release",
+        "binding": {
+            "version": 1,
+            "scopeId": anchor.scope_id(),
+            "sessionId": anchor.session_id(),
+            "generation": anchor.fence().generation(),
+            "attemptId": anchor.fence().attempt_id(),
+            "incarnationId": anchor.incarnation_id(),
+        },
+        "workerSessionId": "opaque-worker-session"
+    }))
+    .unwrap()
 }
 
 fn profile() -> MvpWorkerProfile {
@@ -2111,5 +2139,416 @@ async fn compute_cleanup_rejects_a_wrong_phase_without_a_kubernetes_api_call() {
             phase: SessionPhase::Provisioning,
         }
     );
+    assert_no_request(&mut handle).await;
+}
+
+async fn respond_initial_release_compute_absence(
+    handle: &mut std::pin::Pin<&mut mock::Handle<Request<Body>, Response<Body>>>,
+    session_id: SessionId,
+    generation: u64,
+) {
+    let names = ResourceNames::new(session_id);
+    for path in [
+        format!(
+            "/api/v1/namespaces/{NAMESPACE}/pods/{}",
+            names.pod(generation).unwrap()
+        ),
+        format!(
+            "/api/v1/namespaces/{NAMESPACE}/secrets/{}",
+            names.registration_secret(generation).unwrap()
+        ),
+        format!(
+            "/apis/networking.k8s.io/v1/namespaces/{NAMESPACE}/networkpolicies/{}-net",
+            names.pod(generation).unwrap()
+        ),
+        format!(
+            "/api/v1/namespaces/{NAMESPACE}/serviceaccounts/{}",
+            names.service_account(generation).unwrap()
+        ),
+    ] {
+        let (request, send) = handle.next_request().await.expect("release cleanup GET");
+        assert_eq!(request.method(), Method::GET);
+        assert_eq!(request.uri().path(), path);
+        send.send_response(missing_response());
+    }
+    respond_compute_absence_proof(handle, session_id, generation).await;
+}
+
+async fn respond_release_children_absence_after_pvc(
+    handle: &mut std::pin::Pin<&mut mock::Handle<Request<Body>, Response<Body>>>,
+    session_id: SessionId,
+    generation: u64,
+) {
+    respond_compute_absence_proof(handle, session_id, generation).await;
+    let claims_path = format!("/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims");
+    respond_list(
+        handle,
+        &claims_path,
+        "v1",
+        "PersistentVolumeClaimList",
+        vec![],
+    )
+    .await;
+    let (request, send) = handle
+        .next_request()
+        .await
+        .expect("workspace PVC proof GET");
+    assert_eq!(request.method(), Method::GET);
+    assert_eq!(
+        request.uri().path(),
+        format!("{claims_path}/{}", ResourceNames::new(session_id).pvc())
+    );
+    send.send_response(missing_response());
+}
+
+async fn respond_post_anchor_absence(
+    handle: &mut std::pin::Pin<&mut mock::Handle<Request<Body>, Response<Body>>>,
+    session_id: SessionId,
+    generation: u64,
+) {
+    let names = ResourceNames::new(session_id);
+    let claims_path = format!("/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims");
+    let policy_path = format!("/apis/networking.k8s.io/v1/namespaces/{NAMESPACE}/networkpolicies");
+    let account_path = format!("/api/v1/namespaces/{NAMESPACE}/serviceaccounts");
+    let secret_path = format!("/api/v1/namespaces/{NAMESPACE}/secrets");
+    let pod_path = format!("/api/v1/namespaces/{NAMESPACE}/pods");
+    for (path, api_version, kind) in [
+        (claims_path.as_str(), "v1", "PersistentVolumeClaimList"),
+        (
+            policy_path.as_str(),
+            "networking.k8s.io/v1",
+            "NetworkPolicyList",
+        ),
+        (account_path.as_str(), "v1", "ServiceAccountList"),
+        (secret_path.as_str(), "v1", "SecretList"),
+        (pod_path.as_str(), "v1", "PodList"),
+    ] {
+        respond_list(handle, path, api_version, kind, vec![]).await;
+    }
+    for path in [
+        format!("{claims_path}/{}", names.pvc()),
+        format!("{policy_path}/{}-net", names.pod(generation).unwrap()),
+        format!(
+            "{account_path}/{}",
+            names.service_account(generation).unwrap()
+        ),
+        format!(
+            "{secret_path}/{}",
+            names.registration_secret(generation).unwrap()
+        ),
+        format!("{pod_path}/{}", names.pod(generation).unwrap()),
+    ] {
+        let (request, send) = handle
+            .next_request()
+            .await
+            .expect("post-anchor deterministic GET");
+        assert_eq!(request.method(), Method::GET);
+        assert_eq!(request.uri().path(), path);
+        send.send_response(missing_response());
+    }
+}
+
+fn real_release_coordinator(
+    client: Client,
+) -> Result<ReleaseCoordinator, GenerationProvisionerError> {
+    let store = ConfigMapAnchorStore::new(client.clone(), NAMESPACE, scope_id()).unwrap();
+    let provisioner = KubernetesGenerationProvisioner::new(client, NAMESPACE, scope_id())?;
+    Ok(ReleaseCoordinator::new(
+        store,
+        SessionLocks::new(),
+        Arc::new(provisioner),
+    ))
+}
+
+async fn respond_release_anchor_get(
+    handle: &mut std::pin::Pin<&mut mock::Handle<Request<Body>, Response<Body>>>,
+    anchor: &SessionAnchorV1,
+) {
+    let (request, send) = handle.next_request().await.expect("release anchor GET");
+    assert_eq!(request.method(), Method::GET);
+    assert_eq!(
+        request.uri().path(),
+        format!(
+            "/api/v1/namespaces/{NAMESPACE}/configmaps/{}",
+            ResourceNames::new(anchor.session_id()).anchor()
+        )
+    );
+    send.send_response(json_response(StatusCode::OK, anchor_config_map(anchor)));
+}
+
+async fn respond_release_anchor_delete(
+    handle: &mut std::pin::Pin<&mut mock::Handle<Request<Body>, Response<Body>>>,
+    anchor: &SessionAnchorV1,
+) {
+    let (request, send) = handle.next_request().await.expect("release anchor DELETE");
+    assert_eq!(request.method(), Method::DELETE);
+    assert_eq!(
+        request.uri().path(),
+        format!(
+            "/api/v1/namespaces/{NAMESPACE}/configmaps/{}",
+            ResourceNames::new(anchor.session_id()).anchor()
+        )
+    );
+    let body = request_body(request).await;
+    assert_eq!(body["preconditions"]["uid"], ANCHOR_UID);
+    assert_eq!(body["preconditions"]["resourceVersion"], "anchor-rv-1");
+    send.send_response(delete_accepted_response());
+}
+
+#[tokio::test]
+async fn release_deletes_exact_pvc_then_proves_every_child_and_anchor_absent() {
+    let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+    let client = Client::new(service, "default");
+    let session_id = session_id("discord:release-happy");
+    let anchor = deleting_anchor(session_id);
+    let request = release_request(&anchor);
+    let pvc = observed_value(
+        desired_for(&anchor, profile(), [0x5a; 32]).persistent_volume_claim(),
+        "pvc-uid",
+    );
+    let coordinator = real_release_coordinator(client).unwrap();
+    let task = tokio::spawn(async move { coordinator.release(&request).await });
+    let mut handle = std::pin::pin!(handle);
+
+    respond_release_anchor_get(&mut handle, &anchor).await;
+    respond_initial_release_compute_absence(&mut handle, session_id, 1).await;
+    let pvc_path = format!(
+        "/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims/{}",
+        ResourceNames::new(session_id).pvc()
+    );
+    respond_get(&mut handle, &pvc_path, pvc).await;
+    respond_delete(&mut handle, &pvc_path, "pvc-uid").await;
+    let (request, send) = handle.next_request().await.expect("post-delete PVC GET");
+    assert_eq!(request.uri().path(), pvc_path);
+    send.send_response(missing_response());
+    respond_release_children_absence_after_pvc(&mut handle, session_id, 1).await;
+    respond_release_anchor_delete(&mut handle, &anchor).await;
+    let (request, send) = handle
+        .next_request()
+        .await
+        .expect("anchor deletion observation");
+    assert_eq!(request.method(), Method::GET);
+    send.send_response(missing_response());
+    respond_post_anchor_absence(&mut handle, session_id, 1).await;
+
+    assert_eq!(task.await.unwrap().unwrap(), ReleaseOutcome::Released);
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn release_returns_pending_for_an_exact_terminating_pvc() {
+    let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+    let client = Client::new(service, "default");
+    let session_id = session_id("discord:release-pvc-terminating");
+    let anchor = deleting_anchor(session_id);
+    let request = release_request(&anchor);
+    let mut pvc = observed_value(
+        desired_for(&anchor, profile(), [0x5a; 32]).persistent_volume_claim(),
+        "pvc-uid",
+    );
+    pvc["metadata"]["deletionTimestamp"] = json!("2026-08-01T08:01:00Z");
+    pvc["metadata"]["finalizers"] = json!(["kubernetes.io/pvc-protection"]);
+    let coordinator = real_release_coordinator(client).unwrap();
+    let task = tokio::spawn(async move { coordinator.release(&request).await });
+    let mut handle = std::pin::pin!(handle);
+
+    respond_release_anchor_get(&mut handle, &anchor).await;
+    respond_initial_release_compute_absence(&mut handle, session_id, 1).await;
+    respond_get(
+        &mut handle,
+        &format!(
+            "/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims/{}",
+            ResourceNames::new(session_id).pvc()
+        ),
+        pvc,
+    )
+    .await;
+
+    assert_eq!(task.await.unwrap().unwrap(), ReleaseOutcome::Pending);
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn release_rejects_a_same_name_pvc_replacement_after_exact_delete() {
+    let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+    let client = Client::new(service, "default");
+    let session_id = session_id("discord:release-pvc-replacement");
+    let anchor = deleting_anchor(session_id);
+    let request = release_request(&anchor);
+    let desired = desired_for(&anchor, profile(), [0x5a; 32]);
+    let pvc = observed_value(desired.persistent_volume_claim(), "pvc-uid");
+    let replacement = observed_value(desired.persistent_volume_claim(), "replacement-pvc-uid");
+    let coordinator = real_release_coordinator(client).unwrap();
+    let task = tokio::spawn(async move { coordinator.release(&request).await });
+    let mut handle = std::pin::pin!(handle);
+
+    respond_release_anchor_get(&mut handle, &anchor).await;
+    respond_initial_release_compute_absence(&mut handle, session_id, 1).await;
+    let pvc_path = format!(
+        "/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims/{}",
+        ResourceNames::new(session_id).pvc()
+    );
+    respond_get(&mut handle, &pvc_path, pvc).await;
+    respond_delete(&mut handle, &pvc_path, "pvc-uid").await;
+    respond_get(&mut handle, &pvc_path, replacement).await;
+
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(ReleaseError::Provisioner(
+            GenerationProvisionerError::ResourceRejected {
+                resource: GenerationResource::PersistentVolumeClaim
+            }
+        ))
+    ));
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn release_rejects_pvc_ownership_metadata_tampering_before_delete() {
+    let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+    let client = Client::new(service, "default");
+    let session_id = session_id("discord:release-pvc-tamper");
+    let anchor = deleting_anchor(session_id);
+    let request = release_request(&anchor);
+    let mut pvc = observed_value(
+        desired_for(&anchor, profile(), [0x5a; 32]).persistent_volume_claim(),
+        "pvc-uid",
+    );
+    pvc["metadata"]["annotations"]["openab.dev/anchor-uid"] = json!("replacement-anchor-uid");
+    let coordinator = real_release_coordinator(client).unwrap();
+    let task = tokio::spawn(async move { coordinator.release(&request).await });
+    let mut handle = std::pin::pin!(handle);
+
+    respond_release_anchor_get(&mut handle, &anchor).await;
+    respond_initial_release_compute_absence(&mut handle, session_id, 1).await;
+    respond_get(
+        &mut handle,
+        &format!(
+            "/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims/{}",
+            ResourceNames::new(session_id).pvc()
+        ),
+        pvc,
+    )
+    .await;
+
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(ReleaseError::Provisioner(
+            GenerationProvisionerError::ResourceRejected {
+                resource: GenerationResource::PersistentVolumeClaim
+            }
+        ))
+    ));
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn release_does_not_acknowledge_a_pvc_delete_precondition_conflict() {
+    let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+    let client = Client::new(service, "default");
+    let session_id = session_id("discord:release-pvc-conflict");
+    let anchor = deleting_anchor(session_id);
+    let request = release_request(&anchor);
+    let pvc = observed_value(
+        desired_for(&anchor, profile(), [0x5a; 32]).persistent_volume_claim(),
+        "pvc-uid",
+    );
+    let coordinator = real_release_coordinator(client).unwrap();
+    let task = tokio::spawn(async move { coordinator.release(&request).await });
+    let mut handle = std::pin::pin!(handle);
+
+    respond_release_anchor_get(&mut handle, &anchor).await;
+    respond_initial_release_compute_absence(&mut handle, session_id, 1).await;
+    let pvc_path = format!(
+        "/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims/{}",
+        ResourceNames::new(session_id).pvc()
+    );
+    respond_get(&mut handle, &pvc_path, pvc).await;
+    let (request, send) = handle.next_request().await.expect("PVC DELETE");
+    assert_eq!(request.method(), Method::DELETE);
+    assert_eq!(request.uri().path(), pvc_path);
+    let body = request_body(request).await;
+    assert_eq!(body["preconditions"]["uid"], "pvc-uid");
+    assert_eq!(body["preconditions"]["resourceVersion"], "rv-pvc-uid");
+    send.send_response(conflict_response());
+
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(ReleaseError::Provisioner(
+            GenerationProvisionerError::KubernetesApi {
+                operation: ProvisionerOperation::ReconcileStorageAbsence
+            }
+        ))
+    ));
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn absent_anchor_post_proof_uses_request_generation_and_blocks_any_child() {
+    let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+    let client = Client::new(service, "default");
+    let anchor = replacement_anchor(session_id("discord:release-post-anchor"));
+    let session_id = anchor.session_id();
+    assert_eq!(anchor.fence().generation(), 2);
+    let request = release_request(&anchor);
+    let coordinator = real_release_coordinator(client).unwrap();
+    let task = tokio::spawn(async move { coordinator.release(&request).await });
+    let mut handle = std::pin::pin!(handle);
+
+    let (request, send) = handle.next_request().await.expect("absent anchor GET");
+    assert_eq!(request.method(), Method::GET);
+    send.send_response(missing_response());
+    let claims_path = format!("/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims");
+    let policy_path = format!("/apis/networking.k8s.io/v1/namespaces/{NAMESPACE}/networkpolicies");
+    let account_path = format!("/api/v1/namespaces/{NAMESPACE}/serviceaccounts");
+    let secret_path = format!("/api/v1/namespaces/{NAMESPACE}/secrets");
+    let pod_path = format!("/api/v1/namespaces/{NAMESPACE}/pods");
+    for (path, api_version, kind) in [
+        (claims_path.as_str(), "v1", "PersistentVolumeClaimList"),
+        (
+            policy_path.as_str(),
+            "networking.k8s.io/v1",
+            "NetworkPolicyList",
+        ),
+        (account_path.as_str(), "v1", "ServiceAccountList"),
+        (secret_path.as_str(), "v1", "SecretList"),
+        (pod_path.as_str(), "v1", "PodList"),
+    ] {
+        respond_list(&mut handle, path, api_version, kind, vec![]).await;
+    }
+    let names = ResourceNames::new(session_id);
+    for path in [
+        format!("{claims_path}/{}", names.pvc()),
+        format!("{policy_path}/{}-net", names.pod(2).unwrap()),
+    ] {
+        let (request, send) = handle.next_request().await.expect("post-anchor GET");
+        assert_eq!(request.uri().path(), path);
+        send.send_response(missing_response());
+    }
+    let (request, send) = handle.next_request().await.expect("generation-two SA GET");
+    assert_eq!(
+        request.uri().path(),
+        format!("{account_path}/{}", names.service_account(2).unwrap())
+    );
+    send.send_response(json_response(
+        StatusCode::OK,
+        json!({
+            "apiVersion": "v1",
+            "kind": "ServiceAccount",
+            "metadata": {
+                "name": names.service_account(2).unwrap(),
+                "namespace": NAMESPACE,
+                "uid": "orphan-uid",
+                "resourceVersion": "orphan-rv"
+            }
+        }),
+    ));
+
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(ReleaseError::Provisioner(
+            GenerationProvisionerError::ChildrenPresent
+        ))
+    ));
     assert_no_request(&mut handle).await;
 }

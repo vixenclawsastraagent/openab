@@ -63,6 +63,8 @@ pub enum ProvisionerOperation {
     ProveChildrenAbsent,
     EnsureGeneration,
     ReconcileComputeAbsence,
+    ReconcileStorageAbsence,
+    ProveReleasedChildrenAbsent,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

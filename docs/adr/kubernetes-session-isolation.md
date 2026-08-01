@@ -233,9 +233,23 @@ resources, and ambiguous ownership fail closed. Controller reconciliation must
 tolerate every state between API operations and must use UID preconditions for
 destructive deletion.
 
-The broker removes its mapping only after the controller durably accepts a
-fenced destructive release. A timeout, transport failure, process exit, or
-malformed acknowledgement is not permission to delete private state.
+The controller persists `Deleting` before beginning destructive work, but that
+durable intent is not a release acknowledgement. The broker removes its
+mapping only after the controller has reconciled the exact PVC and generation
+children to authoritative absence with selector LISTs and deterministic
+GETs, deleted the exact anchor, observed it absent, and repeated a read-only
+child-absence proof. If anchor deletion succeeds but the acknowledgement is
+lost, the retry performs that post-anchor proof before returning `Released`.
+A timeout, transport failure, process exit, or malformed acknowledgement is
+never permission to discard the broker mapping.
+
+Delete requests use both observed UID and `resourceVersion` preconditions, so
+a stale observation receives a conflict instead of deleting a replacement
+object. This follows the Kubernetes [Preconditions API](https://kubernetes.io/docs/reference/kubernetes-api/definitions/preconditions-v1-meta/).
+The MVP additionally assumes the trusted controller is the sole writer of
+managed worker resources in its namespace. Session locks serialize operations
+inside the single controller replica; narrowly scoped RBAC prevents another
+writer from recreating perfectly matching resources between proofs.
 
 ## 6. Lifecycle and cost
 
@@ -258,6 +272,16 @@ storage. Storage retention expiry or explicit reset performs fenced,
 controller-managed cleanup. Broker shutdown follows the non-destructive path.
 Bridge or broker failure leaves the session reconcilable; it never implies
 destructive release.
+
+`Released` proves that the Kubernetes PVC API object is absent; it does not by
+itself prove that a backing PersistentVolume or cloud disk has been physically
+destroyed. Whether and when backing storage is removed depends on the PV or
+StorageClass reclaim policy, the CSI/provisioner implementation, and any
+protection finalizers. Kubernetes documents these separate semantics under
+[Persistent Volume reclaiming](https://kubernetes.io/docs/concepts/storage/persistent-volumes/#reclaiming)
+and [StorageClass reclaim policy](https://kubernetes.io/docs/concepts/storage/storage-classes/#reclaim-policy).
+Operators that require physical deletion guarantees must select and verify a
+compatible storage policy outside this controller's API-object proof.
 
 This separation addresses the cost concern without weakening isolation:
 

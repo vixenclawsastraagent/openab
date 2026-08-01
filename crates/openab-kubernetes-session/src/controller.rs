@@ -4,14 +4,20 @@ mod generation;
 mod lifecycle;
 mod locks;
 mod registration;
+mod release;
 
 pub use activation::{
     ActivationCoordinator, ActivationError, ActivationPreparation, ActivationTiming,
     GenerationProvisioner, GenerationProvisionerError, GenerationResource, ObservedWorker,
     ProvisionerOperation,
 };
-pub use cleanup::{CleanupProgress, LifecycleProvisioner};
-pub use generation::{ComputeAbsentProof, KubernetesGenerationProvisioner};
+pub use cleanup::{
+    CleanupProgress, LifecycleProvisioner, ReleaseCleanupProgress, ReleaseProvisioner,
+};
+pub use generation::{
+    AllChildrenAbsentProof, ComputeAbsentProof, KubernetesGenerationProvisioner,
+    ReleasedChildrenAbsentProof,
+};
 pub use lifecycle::{LifecycleCoordinator, LifecycleError, LifecycleReconcileOutcome};
 pub use locks::{SessionLockGuard, SessionLocks};
 pub use registration::{
@@ -20,3 +26,4 @@ pub use registration::{
     RegistrationProvisionerError, RegistrationRecovery, VerifiedBootstrap, WorkerBootstrapAuth,
     WorkerBootstrapAuthError,
 };
+pub use release::{ReleaseCoordinator, ReleaseError, ReleaseOutcome};

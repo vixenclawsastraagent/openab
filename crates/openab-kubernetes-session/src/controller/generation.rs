@@ -2,7 +2,8 @@ use super::{
     BootstrapPresence, CleanupProgress, ConsumedBootstrap, GenerationProvisioner,
     GenerationProvisionerError, GenerationResource, LifecycleProvisioner, ObservedWorker,
     ProvisionerOperation, RegistrationOperation, RegistrationProvisioner,
-    RegistrationProvisionerError, VerifiedBootstrap, WorkerBootstrapAuth,
+    RegistrationProvisionerError, ReleaseCleanupProgress, ReleaseProvisioner, VerifiedBootstrap,
+    WorkerBootstrapAuth,
 };
 use crate::bridge::SessionBinding;
 use crate::identity::{ResourceNames, ScopeId, SessionId};
@@ -169,6 +170,101 @@ impl ComputeAbsentProof {
             && self.incarnation_id == state.incarnation_id()
             && self.fence == *state.fence()
             && self.anchor_uid == anchor.uid()
+    }
+}
+
+/// Evidence that the workspace PVC and every generation-scoped child were
+/// observed absent for one exact durable release anchor.
+///
+/// Only this module can mint production instances, after both selector LIST
+/// and deterministic GET checks. Consumers can compare but cannot forge it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AllChildrenAbsentProof {
+    session_id: SessionId,
+    incarnation_id: Uuid,
+    fence: Fence,
+    anchor_uid: String,
+    anchor_resource_version: String,
+}
+
+impl AllChildrenAbsentProof {
+    fn for_anchor(anchor: &StoredAnchor) -> Self {
+        Self {
+            session_id: anchor.state().session_id(),
+            incarnation_id: anchor.state().incarnation_id(),
+            fence: anchor.state().fence().clone(),
+            anchor_uid: anchor.uid().to_owned(),
+            anchor_resource_version: anchor.resource_version().to_owned(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(
+        session_id: SessionId,
+        incarnation_id: Uuid,
+        fence: Fence,
+        anchor_uid: impl Into<String>,
+        anchor_resource_version: impl Into<String>,
+    ) -> Self {
+        Self {
+            session_id,
+            incarnation_id,
+            fence,
+            anchor_uid: anchor_uid.into(),
+            anchor_resource_version: anchor_resource_version.into(),
+        }
+    }
+
+    pub(crate) fn matches_anchor(&self, anchor: &StoredAnchor) -> bool {
+        let state = anchor.state();
+        self.session_id == state.session_id()
+            && self.incarnation_id == state.incarnation_id()
+            && self.fence == *state.fence()
+            && self.anchor_uid == anchor.uid()
+            && self.anchor_resource_version == anchor.resource_version()
+    }
+}
+
+/// Read-only evidence that no deterministic or selector-discoverable child
+/// remains after an anchor has disappeared.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReleasedChildrenAbsentProof {
+    scope_id: ScopeId,
+    session_id: SessionId,
+    incarnation_id: Uuid,
+    fence: Fence,
+}
+
+impl ReleasedChildrenAbsentProof {
+    fn for_binding(binding: &SessionBinding) -> Self {
+        Self {
+            scope_id: binding.scope_id(),
+            session_id: binding.session_id(),
+            incarnation_id: binding.incarnation_id(),
+            fence: binding.fence().clone(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(
+        scope_id: ScopeId,
+        session_id: SessionId,
+        incarnation_id: Uuid,
+        fence: Fence,
+    ) -> Self {
+        Self {
+            scope_id,
+            session_id,
+            incarnation_id,
+            fence,
+        }
+    }
+
+    pub(crate) fn matches_binding(&self, binding: &SessionBinding) -> bool {
+        self.scope_id == binding.scope_id()
+            && self.session_id == binding.session_id()
+            && self.incarnation_id == binding.incarnation_id()
+            && self.fence == *binding.fence()
     }
 }
 
@@ -760,6 +856,328 @@ impl KubernetesGenerationProvisioner {
             .map(CleanupProgress::Absent)
     }
 
+    fn validate_release_pvc_metadata(
+        &self,
+        anchor: &StoredAnchor,
+        metadata: &ObjectMeta,
+    ) -> Result<(), GenerationProvisionerError> {
+        let rejected = || GenerationProvisionerError::ResourceRejected {
+            resource: GenerationResource::PersistentVolumeClaim,
+        };
+        let state = anchor.state();
+        let names = ResourceNames::new(state.session_id());
+        if metadata.name.as_deref() != Some(names.pvc().as_str())
+            || metadata.namespace.as_deref() != Some(self.namespace.as_str())
+            || !metadata.uid.as_deref().is_some_and(is_printable_identifier)
+            || !metadata
+                .resource_version
+                .as_deref()
+                .is_some_and(is_printable_identifier)
+        {
+            return Err(rejected());
+        }
+
+        if metadata.finalizers.as_ref().is_some_and(|finalizers| {
+            !finalizers.is_empty() && finalizers.as_slice() != ["kubernetes.io/pvc-protection"]
+        }) {
+            return Err(rejected());
+        }
+
+        let labels = metadata.labels.as_ref().ok_or_else(rejected)?;
+        if labels.len() != 3
+            || labels.get(MANAGED_BY_LABEL).map(String::as_str) != Some(MANAGED_BY_VALUE)
+            || labels.get(RESOURCE_LABEL).map(String::as_str) != Some("workspace-pvc")
+            || labels.get(SESSION_LABEL).map(String::as_str)
+                != Some(&state.session_id().as_hex()[..40])
+            || labels.contains_key(GENERATION_LABEL)
+        {
+            return Err(rejected());
+        }
+
+        let annotations = metadata.annotations.as_ref().ok_or_else(rejected)?;
+        let expected_scope = state.scope_id().as_hex();
+        let expected_session = state.session_id().as_hex();
+        let expected_incarnation = state.incarnation_id().to_string();
+        if annotations.get(SCOPE_ANNOTATION).map(String::as_str) != Some(expected_scope.as_str())
+            || annotations.get(SESSION_ANNOTATION).map(String::as_str)
+                != Some(expected_session.as_str())
+            || annotations.get(INCARNATION_ANNOTATION).map(String::as_str)
+                != Some(expected_incarnation.as_str())
+            || annotations.get(PROFILE_NAME_ANNOTATION).map(String::as_str)
+                != Some(state.profile().name())
+            || annotations
+                .get(PROFILE_VERSION_ANNOTATION)
+                .map(String::as_str)
+                != Some(state.profile().version())
+            || annotations.get(ANCHOR_NAME_ANNOTATION).map(String::as_str) != Some(anchor.name())
+            || annotations.get(ANCHOR_UID_ANNOTATION).map(String::as_str) != Some(anchor.uid())
+            || annotations.contains_key(GENERATION_ANNOTATION)
+            || annotations.contains_key(ATTEMPT_ANNOTATION)
+        {
+            return Err(rejected());
+        }
+        for (key, value) in annotations {
+            let allowed = match key.as_str() {
+                SCOPE_ANNOTATION
+                | SESSION_ANNOTATION
+                | INCARNATION_ANNOTATION
+                | PROFILE_NAME_ANNOTATION
+                | PROFILE_VERSION_ANNOTATION
+                | ANCHOR_NAME_ANNOTATION
+                | ANCHOR_UID_ANNOTATION => true,
+                "pv.kubernetes.io/bind-completed" | "pv.kubernetes.io/bound-by-controller" => {
+                    value == "yes"
+                }
+                "volume.kubernetes.io/selected-node"
+                | "volume.kubernetes.io/storage-provisioner"
+                | "volume.beta.kubernetes.io/storage-provisioner"
+                | "volume.kubernetes.io/storage-resizer" => is_dns_subdomain(value),
+                _ => false,
+            };
+            if !allowed {
+                return Err(rejected());
+            }
+        }
+
+        let owners = metadata.owner_references.as_deref().ok_or_else(rejected)?;
+        if owners.len() != 1 {
+            return Err(rejected());
+        }
+        let owner = &owners[0];
+        if owner.api_version != "v1"
+            || owner.kind != "ConfigMap"
+            || owner.name != anchor.name()
+            || owner.uid != anchor.uid()
+            || owner.controller != Some(true)
+            || owner.block_owner_deletion != Some(true)
+        {
+            return Err(rejected());
+        }
+        Ok(())
+    }
+
+    async fn cleanup_exact_pvc(
+        &self,
+        anchor: &StoredAnchor,
+    ) -> Result<ResourceCleanupProgress, GenerationProvisionerError> {
+        let name = ResourceNames::new(anchor.state().session_id()).pvc();
+        let observed = self
+            .persistent_volume_claims
+            .get_opt(&name)
+            .await
+            .map_err(release_api_error)?;
+        let Some(observed) = observed else {
+            return Ok(ResourceCleanupProgress::Absent);
+        };
+        self.validate_release_pvc_metadata(anchor, &observed.metadata)?;
+        let observed_uid = required_cleanup_metadata(
+            observed.metadata.uid.as_deref(),
+            ChildKind::PersistentVolumeClaim,
+        )?;
+        if observed.metadata.deletion_timestamp.is_some() {
+            return Ok(ResourceCleanupProgress::Pending);
+        }
+        let resource_version = required_cleanup_metadata(
+            observed.metadata.resource_version.as_deref(),
+            ChildKind::PersistentVolumeClaim,
+        )?;
+
+        // Both preconditions fence the exact object observed above. DELETE is
+        // only a request; the following most-recent GET decides whether that
+        // same UID is absent, still terminating, or was replaced.
+        // https://kubernetes.io/docs/reference/kubernetes-api/definitions/preconditions-v1-meta/
+        let delete = DeleteParams::default().preconditions(Preconditions {
+            uid: Some(observed_uid.to_owned()),
+            resource_version: Some(resource_version.to_owned()),
+        });
+        match self.persistent_volume_claims.delete(&name, &delete).await {
+            Ok(_) => {}
+            Err(kube::Error::Api(status)) if status.is_not_found() => {}
+            Err(error) => return Err(release_api_error(error)),
+        }
+
+        let replacement = self
+            .persistent_volume_claims
+            .get_opt(&name)
+            .await
+            .map_err(release_api_error)?;
+        let Some(replacement) = replacement else {
+            return Ok(ResourceCleanupProgress::Absent);
+        };
+        self.validate_release_pvc_metadata(anchor, &replacement.metadata)?;
+        let replacement_uid = required_cleanup_metadata(
+            replacement.metadata.uid.as_deref(),
+            ChildKind::PersistentVolumeClaim,
+        )?;
+        if replacement_uid != observed_uid {
+            return Err(GenerationProvisionerError::ResourceRejected {
+                resource: GenerationResource::PersistentVolumeClaim,
+            });
+        }
+        Ok(ResourceCleanupProgress::Pending)
+    }
+
+    async fn prove_release_pvc_absent(
+        &self,
+        anchor: &StoredAnchor,
+    ) -> Result<(), GenerationProvisionerError> {
+        let selector = format!(
+            "{MANAGED_BY_LABEL}={MANAGED_BY_VALUE},{SESSION_LABEL}={}",
+            &anchor.state().session_id().as_hex()[..40]
+        );
+        let claims = self
+            .persistent_volume_claims
+            .list(&ListParams::default().labels(&selector))
+            .await
+            .map_err(release_api_error)?;
+        if let Some(claim) = claims.items.first() {
+            self.validate_release_pvc_metadata(anchor, &claim.metadata)
+                .map_err(|_| GenerationProvisionerError::ChildrenAmbiguous)?;
+            return Err(GenerationProvisionerError::ChildrenPresent);
+        }
+
+        let name = ResourceNames::new(anchor.state().session_id()).pvc();
+        if let Some(claim) = self
+            .persistent_volume_claims
+            .get_opt(&name)
+            .await
+            .map_err(release_api_error)?
+        {
+            self.validate_release_pvc_metadata(anchor, &claim.metadata)
+                .map_err(|_| GenerationProvisionerError::ChildrenAmbiguous)?;
+            return Err(GenerationProvisionerError::ChildrenPresent);
+        }
+        Ok(())
+    }
+
+    async fn reconcile_release_cleanup(
+        &self,
+        anchor: &StoredAnchor,
+        compute_proof: &ComputeAbsentProof,
+    ) -> Result<ReleaseCleanupProgress, GenerationProvisionerError> {
+        self.validate_compute_cleanup_anchor(anchor)?;
+        if anchor.state().phase() != SessionPhase::Deleting || !compute_proof.matches_anchor(anchor)
+        {
+            return Err(GenerationProvisionerError::InvalidGeneration);
+        }
+        if self.cleanup_exact_pvc(anchor).await? == ResourceCleanupProgress::Pending {
+            return Ok(ReleaseCleanupProgress::Pending);
+        }
+
+        // Do not rely on owner-reference garbage collection. Re-run the full
+        // compute inventory proof after PVC deletion, then prove the PVC
+        // absent by both selector LIST and deterministic GET.
+        self.prove_compute_children_absent(anchor).await?;
+        self.prove_release_pvc_absent(anchor).await?;
+        Ok(ReleaseCleanupProgress::Absent(
+            AllChildrenAbsentProof::for_anchor(anchor),
+        ))
+    }
+
+    async fn prove_post_anchor_children_absent(
+        &self,
+        binding: &SessionBinding,
+    ) -> Result<ReleasedChildrenAbsentProof, GenerationProvisionerError> {
+        if binding.scope_id() != self.scope_id {
+            return Err(GenerationProvisionerError::InvalidGeneration);
+        }
+        let selector = format!(
+            "{MANAGED_BY_LABEL}={MANAGED_BY_VALUE},{SESSION_LABEL}={}",
+            &binding.session_id().as_hex()[..40]
+        );
+        let params = ListParams::default().labels(&selector);
+
+        if !self
+            .persistent_volume_claims
+            .list(&params)
+            .await
+            .map_err(released_proof_api_error)?
+            .items
+            .is_empty()
+            || !self
+                .network_policies
+                .list(&params)
+                .await
+                .map_err(released_proof_api_error)?
+                .items
+                .is_empty()
+            || !self
+                .service_accounts
+                .list(&params)
+                .await
+                .map_err(released_proof_api_error)?
+                .items
+                .is_empty()
+            || !self
+                .registration_secrets
+                .list(&params)
+                .await
+                .map_err(released_proof_api_error)?
+                .items
+                .is_empty()
+            || !self
+                .pods
+                .list(&params)
+                .await
+                .map_err(released_proof_api_error)?
+                .items
+                .is_empty()
+        {
+            return Err(GenerationProvisionerError::ChildrenPresent);
+        }
+
+        let names = ResourceNames::new(binding.session_id());
+        let generation = binding.fence().generation();
+        let network_policy_name = ChildKind::NetworkPolicy
+            .expected_name(names, generation)
+            .ok_or(GenerationProvisionerError::ChildrenAmbiguous)?;
+        let service_account_name = names
+            .service_account(generation)
+            .map_err(|_| GenerationProvisionerError::ChildrenAmbiguous)?;
+        let registration_secret_name = names
+            .registration_secret(generation)
+            .map_err(|_| GenerationProvisionerError::ChildrenAmbiguous)?;
+        let pod_name = names
+            .pod(generation)
+            .map_err(|_| GenerationProvisionerError::ChildrenAmbiguous)?;
+
+        if self
+            .persistent_volume_claims
+            .get_opt(&names.pvc())
+            .await
+            .map_err(released_proof_api_error)?
+            .is_some()
+            || self
+                .network_policies
+                .get_opt(&network_policy_name)
+                .await
+                .map_err(released_proof_api_error)?
+                .is_some()
+            || self
+                .service_accounts
+                .get_opt(&service_account_name)
+                .await
+                .map_err(released_proof_api_error)?
+                .is_some()
+            || self
+                .registration_secrets
+                .get_opt(&registration_secret_name)
+                .await
+                .map_err(released_proof_api_error)?
+                .is_some()
+            || self
+                .pods
+                .get_opt(&pod_name)
+                .await
+                .map_err(released_proof_api_error)?
+                .is_some()
+        {
+            return Err(GenerationProvisionerError::ChildrenPresent);
+        }
+
+        Ok(ReleasedChildrenAbsentProof::for_binding(binding))
+    }
+
     async fn ensure_generation(
         &self,
         anchor: &StoredAnchor,
@@ -1301,6 +1719,24 @@ impl LifecycleProvisioner for KubernetesGenerationProvisioner {
 }
 
 #[async_trait]
+impl ReleaseProvisioner for KubernetesGenerationProvisioner {
+    async fn reconcile_all_children_absent(
+        &self,
+        anchor: &StoredAnchor,
+        compute_proof: &ComputeAbsentProof,
+    ) -> Result<ReleaseCleanupProgress, GenerationProvisionerError> {
+        self.reconcile_release_cleanup(anchor, compute_proof).await
+    }
+
+    async fn prove_released_children_absent(
+        &self,
+        binding: &SessionBinding,
+    ) -> Result<ReleasedChildrenAbsentProof, GenerationProvisionerError> {
+        self.prove_post_anchor_children_absent(binding).await
+    }
+}
+
+#[async_trait]
 impl RegistrationProvisioner for KubernetesGenerationProvisioner {
     async fn verify_bootstrap(
         &self,
@@ -1779,6 +2215,18 @@ fn cleanup_api_error(_error: kube::Error) -> GenerationProvisionerError {
     }
 }
 
+fn release_api_error(_error: kube::Error) -> GenerationProvisionerError {
+    GenerationProvisionerError::KubernetesApi {
+        operation: ProvisionerOperation::ReconcileStorageAbsence,
+    }
+}
+
+fn released_proof_api_error(_error: kube::Error) -> GenerationProvisionerError {
+    GenerationProvisionerError::KubernetesApi {
+        operation: ProvisionerOperation::ProveReleasedChildrenAbsent,
+    }
+}
+
 fn required_cleanup_metadata(
     value: Option<&str>,
     kind: ChildKind,
@@ -1809,6 +2257,10 @@ fn is_dns_label(value: &str) -> bool {
         && bytes
             .iter()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+}
+
+fn is_dns_subdomain(value: &str) -> bool {
+    (1..=253).contains(&value.len()) && value.split('.').all(is_dns_label)
 }
 
 #[cfg(test)]

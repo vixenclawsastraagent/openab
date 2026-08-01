@@ -1,4 +1,8 @@
-use super::{generation::ComputeAbsentProof, GenerationProvisionerError};
+use super::{
+    generation::{AllChildrenAbsentProof, ComputeAbsentProof, ReleasedChildrenAbsentProof},
+    GenerationProvisionerError,
+};
+use crate::bridge::SessionBinding;
 use crate::store::StoredAnchor;
 use async_trait::async_trait;
 
@@ -6,6 +10,12 @@ use async_trait::async_trait;
 pub enum CleanupProgress {
     Pending,
     Absent(ComputeAbsentProof),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReleaseCleanupProgress {
+    Pending,
+    Absent(AllChildrenAbsentProof),
 }
 
 /// Narrow lifecycle seam shared by suspension and fail-closed worker recycle.
@@ -26,4 +36,29 @@ pub trait LifecycleProvisioner: Send + Sync {
         &self,
         anchor: &StoredAnchor,
     ) -> Result<CleanupProgress, GenerationProvisionerError>;
+}
+
+/// Destructive cleanup seam used only by the request-driven release path.
+///
+/// Implementations must not infer authority from ACP's opaque
+/// `worker_session_id`. The durable anchor and controller-issued binding are
+/// the only release authority. The caller holds the session lock throughout.
+#[async_trait]
+pub trait ReleaseProvisioner: LifecycleProvisioner {
+    /// Delete the exact session-lifetime PVC, then prove every managed child
+    /// absent. The compute proof prevents storage deletion from bypassing the
+    /// generation cleanup stage.
+    async fn reconcile_all_children_absent(
+        &self,
+        anchor: &StoredAnchor,
+        compute_proof: &ComputeAbsentProof,
+    ) -> Result<ReleaseCleanupProgress, GenerationProvisionerError>;
+
+    /// Read-only proof used after the lifecycle anchor has disappeared. This
+    /// closes the crash window where anchor deletion completed but the broker
+    /// never received the release acknowledgement.
+    async fn prove_released_children_absent(
+        &self,
+        binding: &SessionBinding,
+    ) -> Result<ReleasedChildrenAbsentProof, GenerationProvisionerError>;
 }
