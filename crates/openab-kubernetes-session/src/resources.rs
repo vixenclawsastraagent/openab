@@ -4,10 +4,11 @@ use crate::state::{Fence, ProfileRef, SessionAnchorV1};
 use crate::wire::WorkerRegistrationV1;
 use k8s_openapi::api::core::v1::{
     Capabilities, ConfigMap, ConfigMapVolumeSource, Container, ContainerResizePolicy,
-    EmptyDirVolumeSource, EnvVar, KeyToPath, PersistentVolumeClaim, PersistentVolumeClaimSpec,
-    PersistentVolumeClaimVolumeSource, Pod, PodOS, PodSecurityContext, PodSpec,
-    ResourceRequirements, SeccompProfile, Secret, SecretVolumeSource, SecurityContext,
-    ServiceAccount, Toleration, Volume, VolumeMount, VolumeResourceRequirements,
+    EmptyDirVolumeSource, EnvVar, EnvVarSource, KeyToPath, ObjectFieldSelector,
+    PersistentVolumeClaim, PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource, Pod,
+    PodOS, PodSecurityContext, PodSpec, ResourceRequirements, SeccompProfile, Secret,
+    SecretVolumeSource, SecurityContext, ServiceAccount, Toleration, Volume, VolumeMount,
+    VolumeResourceRequirements,
 };
 use k8s_openapi::api::networking::v1::{
     IPBlock, NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyPeer, NetworkPolicyPort,
@@ -905,6 +906,17 @@ impl DesiredGeneration {
                         literal_env("OPENAB_SESSION_ROOT", SESSION_ROOT),
                         literal_env("OPENAB_REGISTRATION_TOKEN_FILE", TOKEN_FILE),
                         literal_env("OPENAB_REGISTRATION_BINDING_FILE", BINDING_FILE),
+                        EnvVar {
+                            name: "OPENAB_WORKER_POD_UID".into(),
+                            value: None,
+                            value_from: Some(EnvVarSource {
+                                field_ref: Some(ObjectFieldSelector {
+                                    api_version: Some("v1".into()),
+                                    field_path: "metadata.uid".into(),
+                                }),
+                                ..EnvVarSource::default()
+                            }),
+                        },
                     ]),
                     image: Some(profile.image),
                     image_pull_policy: Some("IfNotPresent".into()),

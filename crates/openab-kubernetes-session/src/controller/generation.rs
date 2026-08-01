@@ -1,7 +1,9 @@
 use super::{
-    GenerationProvisioner, GenerationProvisionerError, GenerationResource, ObservedWorker,
-    ProvisionerOperation,
+    BootstrapPresence, ConsumedBootstrap, GenerationProvisioner, GenerationProvisionerError,
+    GenerationResource, ObservedWorker, ProvisionerOperation, RegistrationOperation,
+    RegistrationProvisioner, RegistrationProvisionerError, VerifiedBootstrap, WorkerBootstrapAuth,
 };
+use crate::bridge::SessionBinding;
 use crate::identity::{ResourceNames, ScopeId, SessionId};
 use crate::resources::{DesiredGeneration, GenerationContext, MvpWorkerProfile};
 use crate::state::SessionPhase;
@@ -11,11 +13,12 @@ use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Pod, Secret, 
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use k8s_openapi::api::node::v1::RuntimeClass;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use kube::api::{ListParams, PostParams};
+use kube::api::{DeleteParams, ListParams, PostParams, Preconditions};
 use kube::{Api, Client};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::fmt::Debug;
+use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
@@ -852,6 +855,287 @@ impl GenerationProvisioner for KubernetesGenerationProvisioner {
     ) -> Result<ObservedWorker, GenerationProvisionerError> {
         self.ensure_generation(anchor, profile).await
     }
+}
+
+#[async_trait]
+impl RegistrationProvisioner for KubernetesGenerationProvisioner {
+    async fn verify_bootstrap(
+        &self,
+        anchor: &StoredAnchor,
+        profile: &MvpWorkerProfile,
+        expected_binding: &SessionBinding,
+        auth: &WorkerBootstrapAuth,
+    ) -> Result<VerifiedBootstrap, RegistrationProvisionerError> {
+        let pod_uid = validate_registration_anchor(
+            anchor,
+            profile,
+            self.scope_id,
+            &self.namespace,
+            expected_binding,
+        )?;
+        if pod_uid != auth.pod_uid() {
+            return Err(RegistrationProvisionerError::Unauthorized);
+        }
+
+        let names = ResourceNames::new(anchor.state().session_id());
+        let context = GenerationContext::from_anchor(
+            &self.namespace,
+            anchor.name(),
+            anchor.uid(),
+            anchor.state(),
+            names,
+        )
+        .map_err(|_| RegistrationProvisionerError::InvalidGeneration)?;
+        let probe = DesiredGeneration::build(context.clone(), profile.clone(), [0_u8; 32])
+            .map_err(|_| RegistrationProvisionerError::InvalidGeneration)?;
+        let secret_name = probe
+            .registration_secret()
+            .metadata
+            .name
+            .as_deref()
+            .ok_or(RegistrationProvisionerError::InvalidGeneration)?;
+        let initial_secret = self
+            .registration_secrets
+            .get_opt(secret_name)
+            .await
+            .map_err(|_| registration_api_error(RegistrationOperation::VerifyResources))?
+            .ok_or(RegistrationProvisionerError::BootstrapCredentialConsumedOrMissing)?;
+        let token = registration_token(&initial_secret)?;
+        let desired = desired_from_observed_secret(context, profile.clone(), &initial_secret)
+            .map_err(map_generation_registration_error)?;
+        let initial_secret_uid = registration_metadata(&initial_secret, "uid")?.to_owned();
+        let initial_secret_resource_version =
+            registration_metadata(&initial_secret, "resourceVersion")?.to_owned();
+
+        let preflight = self
+            .preflight_before_pod(&desired, Some(pod_uid), None)
+            .await
+            .map_err(map_generation_registration_error)?;
+        if preflight.children.registration_secret != initial_secret_uid {
+            return Err(RegistrationProvisionerError::ResourceRejected);
+        }
+        let observed_pod_uid = preflight
+            .pod
+            .as_ref()
+            .and_then(|pod| pod.metadata.uid.as_deref())
+            .ok_or(RegistrationProvisionerError::ResourceRejected)?;
+        if observed_pod_uid != pod_uid {
+            return Err(RegistrationProvisionerError::ResourceRejected);
+        }
+
+        // Re-read the Secret after the full resource and pin proof so the
+        // deletion preconditions fence the latest exact credential object.
+        let final_secret = self
+            .registration_secrets
+            .get_opt(secret_name)
+            .await
+            .map_err(|_| registration_api_error(RegistrationOperation::VerifyResources))?
+            .ok_or(RegistrationProvisionerError::BootstrapCredentialConsumedOrMissing)?;
+        desired
+            .validate_registration_secret(&final_secret)
+            .map_err(|_| RegistrationProvisionerError::ResourceRejected)?;
+        let final_secret_uid = registration_metadata(&final_secret, "uid")?;
+        let final_resource_version = registration_metadata(&final_secret, "resourceVersion")?;
+        if final_secret_uid != initial_secret_uid
+            || final_resource_version != initial_secret_resource_version
+        {
+            return Err(RegistrationProvisionerError::ResourceRejected);
+        }
+
+        if !bool::from(token.ct_eq(auth.token())) {
+            return Err(RegistrationProvisionerError::Unauthorized);
+        }
+        VerifiedBootstrap::new(
+            expected_binding.clone(),
+            anchor.uid(),
+            pod_uid,
+            secret_name,
+            final_secret_uid,
+            final_resource_version,
+        )
+    }
+
+    async fn consume_bootstrap(
+        &self,
+        verified: VerifiedBootstrap,
+    ) -> Result<ConsumedBootstrap, RegistrationProvisionerError> {
+        let preconditions = Preconditions {
+            resource_version: Some(verified.secret_resource_version().to_owned()),
+            uid: Some(verified.secret_uid().to_owned()),
+        };
+        let delete = DeleteParams::default().preconditions(preconditions);
+        match self
+            .registration_secrets
+            .delete(verified.secret_name(), &delete)
+            .await
+        {
+            Ok(_) => {}
+            Err(kube::Error::Api(status)) if status.is_not_found() => {}
+            Err(_) => {
+                return Err(registration_api_error(
+                    RegistrationOperation::DeleteBootstrapSecret,
+                ))
+            }
+        }
+
+        match self
+            .registration_secrets
+            .get_opt(verified.secret_name())
+            .await
+            .map_err(|_| {
+                registration_api_error(RegistrationOperation::ObserveBootstrapSecretDeletion)
+            })? {
+            None => Ok(verified.into_consumed()),
+            Some(secret) if secret.metadata.uid.as_deref() == Some(verified.secret_uid()) => {
+                Err(RegistrationProvisionerError::BootstrapDeletionNotObserved)
+            }
+            Some(_) => Err(RegistrationProvisionerError::ResourceRejected),
+        }
+    }
+
+    async fn observe_bootstrap_presence(
+        &self,
+        anchor: &StoredAnchor,
+        profile: &MvpWorkerProfile,
+    ) -> Result<BootstrapPresence, RegistrationProvisionerError> {
+        let expected_binding = SessionBinding::new(
+            anchor.state().scope_id(),
+            anchor.state().session_id(),
+            anchor.state().fence().clone(),
+            anchor.state().incarnation_id(),
+        )
+        .map_err(|_| RegistrationProvisionerError::InvalidGeneration)?;
+        let pod_uid = validate_registration_anchor(
+            anchor,
+            profile,
+            self.scope_id,
+            &self.namespace,
+            &expected_binding,
+        )?;
+        let names = ResourceNames::new(anchor.state().session_id());
+        let context = GenerationContext::from_anchor(
+            &self.namespace,
+            anchor.name(),
+            anchor.uid(),
+            anchor.state(),
+            names,
+        )
+        .map_err(|_| RegistrationProvisionerError::InvalidGeneration)?;
+        let probe = DesiredGeneration::build(context.clone(), profile.clone(), [0_u8; 32])
+            .map_err(|_| RegistrationProvisionerError::InvalidGeneration)?;
+        let secret_name = probe
+            .registration_secret()
+            .metadata
+            .name
+            .as_deref()
+            .ok_or(RegistrationProvisionerError::InvalidGeneration)?;
+        let Some(secret) = self
+            .registration_secrets
+            .get_opt(secret_name)
+            .await
+            .map_err(|_| {
+                registration_api_error(RegistrationOperation::ObserveBootstrapSecretPresence)
+            })?
+        else {
+            return Ok(BootstrapPresence::Absent);
+        };
+        let desired = desired_from_observed_secret(context, profile.clone(), &secret)
+            .map_err(map_generation_registration_error)?;
+        let secret_uid = registration_metadata(&secret, "uid")?;
+        registration_metadata(&secret, "resourceVersion")?;
+        let preflight = self
+            .preflight_before_pod(&desired, Some(pod_uid), None)
+            .await
+            .map_err(map_generation_registration_error)?;
+        if preflight.children.registration_secret != secret_uid {
+            return Err(RegistrationProvisionerError::ResourceRejected);
+        }
+        Ok(BootstrapPresence::Present)
+    }
+}
+
+fn validate_registration_anchor<'a>(
+    anchor: &'a StoredAnchor,
+    profile: &MvpWorkerProfile,
+    scope_id: ScopeId,
+    namespace: &str,
+    expected_binding: &SessionBinding,
+) -> Result<&'a str, RegistrationProvisionerError> {
+    if anchor.namespace() != namespace
+        || anchor.state().scope_id() != scope_id
+        || anchor.state().phase() != SessionPhase::Provisioning
+        || anchor.state().profile() != profile.profile()
+    {
+        return Err(RegistrationProvisionerError::InvalidGeneration);
+    }
+    let actual_binding = SessionBinding::new(
+        anchor.state().scope_id(),
+        anchor.state().session_id(),
+        anchor.state().fence().clone(),
+        anchor.state().incarnation_id(),
+    )
+    .map_err(|_| RegistrationProvisionerError::InvalidGeneration)?;
+    if &actual_binding != expected_binding {
+        return Err(RegistrationProvisionerError::InvalidGeneration);
+    }
+    anchor
+        .state()
+        .pod_uid()
+        .filter(|uid| is_printable_identifier(uid))
+        .ok_or(RegistrationProvisionerError::InvalidGeneration)
+}
+
+fn registration_token(secret: &Secret) -> Result<[u8; 32], RegistrationProvisionerError> {
+    secret
+        .data
+        .as_ref()
+        .and_then(|data| data.get("token"))
+        .and_then(|token| <[u8; 32]>::try_from(token.0.as_slice()).ok())
+        .ok_or(RegistrationProvisionerError::InvalidBootstrapToken)
+}
+
+fn registration_metadata<'a>(
+    secret: &'a Secret,
+    field: &'static str,
+) -> Result<&'a str, RegistrationProvisionerError> {
+    let value = match field {
+        "uid" => secret.metadata.uid.as_deref(),
+        "resourceVersion" => secret.metadata.resource_version.as_deref(),
+        _ => None,
+    };
+    value
+        .filter(|value| is_printable_identifier(value))
+        .ok_or(RegistrationProvisionerError::ResourceRejected)
+}
+
+fn map_generation_registration_error(
+    error: GenerationProvisionerError,
+) -> RegistrationProvisionerError {
+    match error {
+        GenerationProvisionerError::InvalidGeneration
+        | GenerationProvisionerError::InvalidPodUid
+        | GenerationProvisionerError::RandomnessUnavailable => {
+            RegistrationProvisionerError::InvalidGeneration
+        }
+        GenerationProvisionerError::InvalidBootstrapToken => {
+            RegistrationProvisionerError::InvalidBootstrapToken
+        }
+        GenerationProvisionerError::BootstrapCredentialConsumedOrMissing => {
+            RegistrationProvisionerError::BootstrapCredentialConsumedOrMissing
+        }
+        GenerationProvisionerError::KubernetesApi { .. } => {
+            registration_api_error(RegistrationOperation::VerifyResources)
+        }
+        GenerationProvisionerError::ChildrenPresent
+        | GenerationProvisionerError::ChildrenAmbiguous
+        | GenerationProvisionerError::ResourceRejected { .. } => {
+            RegistrationProvisionerError::ResourceRejected
+        }
+    }
+}
+
+fn registration_api_error(operation: RegistrationOperation) -> RegistrationProvisionerError {
+    RegistrationProvisionerError::KubernetesApi { operation }
 }
 
 fn require_exact_inventory<'a, K, I, F, E>(

@@ -507,7 +507,22 @@ fn token_is_only_a_read_only_secret_file_and_no_host_path_is_present() {
     assert!(env
         .iter()
         .all(|entry| entry.value.as_deref() != Some(&"Z".repeat(32))));
-    assert!(env.iter().all(|entry| entry.value_from.is_none()));
+    let pod_uid = env
+        .iter()
+        .find(|entry| entry.name == "OPENAB_WORKER_POD_UID")
+        .expect("worker Pod UID from the Downward API");
+    assert!(pod_uid.value.is_none());
+    let field_ref = pod_uid
+        .value_from
+        .as_ref()
+        .and_then(|source| source.field_ref.as_ref())
+        .expect("metadata.uid fieldRef");
+    assert_eq!(field_ref.api_version.as_deref(), Some("v1"));
+    assert_eq!(field_ref.field_path, "metadata.uid");
+    assert!(env
+        .iter()
+        .filter(|entry| entry.name != "OPENAB_WORKER_POD_UID")
+        .all(|entry| entry.value_from.is_none()));
     assert_eq!(
         env.iter()
             .find(|entry| entry.name == "OPENAB_REGISTRATION_TOKEN_FILE")
