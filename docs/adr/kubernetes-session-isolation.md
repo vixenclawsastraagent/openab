@@ -209,6 +209,19 @@ After registration, EOF, Close, timeout, transport failure, or protocol failure
 drops both socket halves and fences the exact relay attachment before any
 controller I/O; courtesy socket writes never delay that fail-closed transition.
 
+The broker-side bridge adapter likewise accepts only an already-connected,
+transport-authenticated socket. It retains one bounded ACP `initialize` line,
+sends `Activation` as its first WebSocket application message, and constructs
+the `BridgeKernel` only after the response is exactly correlated with the
+broker-owned scope, session, attempt, profile, and mapping expectation. A
+correlated mapping-absence proof is translated into OpenAB's typed `-32041`
+initialization response using the original request ID and attempt ID; it never
+creates a worker-facing ACP lane. Startup has one fixed deadline across control
+frames, and every WebSocket or broker-stdout write has its own deadline. After
+activation, EOF, Close, timeout, transport failure, or protocol failure ends
+the bridge process. It never reconnects, replays ACP, or falls back to a local
+agent because delivery may already have become externally observable.
+
 ### 4.2 Controller and relay
 
 The controller and relay are one trusted process in the initial design. A

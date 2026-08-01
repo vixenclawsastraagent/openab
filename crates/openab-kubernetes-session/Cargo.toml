@@ -10,6 +10,11 @@ license = "MIT"
 
 [features]
 default = []
+bridge-runtime = [
+    "dep:futures-util",
+    "dep:tokio",
+    "dep:tokio-tungstenite",
+]
 controller = [
     "dep:futures-util",
     "dep:getrandom",
@@ -46,5 +51,5 @@ uuid = { version = "1", features = ["serde", "v4"] }
 
 [dev-dependencies]
 http = "1"
-tokio = { version = "1", features = ["io-util", "macros", "rt", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "rt", "test-util", "time"] }
 tower-test = "0.4"

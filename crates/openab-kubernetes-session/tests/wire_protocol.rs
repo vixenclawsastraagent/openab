@@ -480,8 +480,14 @@ fn control_plane_strings_are_bounded_and_cwd_is_canonical_by_construction() {
     .is_err());
 
     let oversized_worker_session = "s".repeat(MAX_WORKER_SESSION_ID_BYTES + 1);
-    let action = lifecycle_action(LifecycleKind::Suspend, &oversized_worker_session);
-    assert!(LifecycleRequestV1::from_bridge_action(&action).is_err());
+    let action = lifecycle_action(LifecycleKind::Suspend, "worker-1");
+    let valid = LifecycleRequestV1::from_bridge_action(&action).unwrap();
+    let mut oversized_on_wire = serde_json::to_value(valid).unwrap();
+    oversized_on_wire["workerSessionId"] = json!(oversized_worker_session);
+    assert!(
+        decode_frame::<LifecycleRequestV1>(&serde_json::to_vec(&oversized_on_wire).unwrap())
+            .is_err()
+    );
 }
 
 #[test]

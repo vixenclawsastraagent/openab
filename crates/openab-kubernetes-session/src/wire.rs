@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 mod envelope;
 
+pub use crate::bridge::MAX_WORKER_SESSION_ID_BYTES;
 pub use envelope::{
     BridgeToControllerV1, ControllerToBridgeV1, ControllerToWorkerV1, WorkerToControllerV1,
 };
@@ -29,7 +30,6 @@ pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_ACP_FRAME_BYTES: usize =
     crate::bridge::MAX_LOGICAL_MESSAGE_BYTES + MAX_CONTROL_FRAME_BYTES;
 pub const MAX_WORKER_CWD_BYTES: usize = 4 * 1024;
-pub const MAX_WORKER_SESSION_ID_BYTES: usize = 4 * 1024;
 pub const MAX_PROFILE_VERSION_BYTES: usize = 1024;
 
 mod sealed {

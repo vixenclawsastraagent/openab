@@ -4,17 +4,14 @@ use openab_kubernetes_session::bridge::{
 };
 use openab_kubernetes_session::identity::{ScopeId, SessionId};
 use openab_kubernetes_session::state::Fence;
+use openab_kubernetes_session::wire::MAX_WORKER_SESSION_ID_BYTES;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+const ATTEMPT_ID: &str = "00000000-0000-0000-0000-000000000064";
+
 fn identity() -> BridgeIdentity {
-    BridgeIdentity::from_values(
-        "team-a",
-        "discord:thread-123",
-        "00000000-0000-0000-0000-000000000064",
-        "codex-strict",
-    )
-    .unwrap()
+    BridgeIdentity::from_values("team-a", "discord:thread-123", ATTEMPT_ID, "codex-strict").unwrap()
 }
 
 fn kernel() -> BridgeKernel {
@@ -231,6 +228,43 @@ fn session_new_rewrites_only_worker_owned_filesystem_fields() {
     );
     assert_eq!(kernel.worker_session_id(), Some("worker-real-session-7"));
     assert_eq!(kernel.state(), BridgeState::Active);
+}
+
+#[test]
+fn oversized_worker_session_id_fails_before_the_bridge_becomes_active() {
+    let mut kernel = kernel();
+    initialize(&mut kernel);
+    let new_session = request(2, "session/new", json!({}));
+    forwarded_to_worker(kernel.handle_broker_message(&bytes(&new_session)).unwrap());
+    let response = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "result": {"sessionId": "s".repeat(MAX_WORKER_SESSION_ID_BYTES + 1)}
+    });
+
+    assert!(matches!(
+        kernel.handle_worker_message(&bytes(&response)),
+        Err(BridgeProtocolError::WorkerResponse(_))
+    ));
+    assert_eq!(kernel.worker_session_id(), None);
+    assert_eq!(kernel.state(), BridgeState::Failed);
+}
+
+#[test]
+fn oversized_retained_session_id_is_rejected_before_session_load() {
+    let mut kernel = kernel();
+    initialize(&mut kernel);
+    let load = request(
+        2,
+        "session/load",
+        json!({"sessionId": "s".repeat(MAX_WORKER_SESSION_ID_BYTES + 1)}),
+    );
+
+    assert!(matches!(
+        kernel.handle_broker_message(&bytes(&load)),
+        Err(BridgeProtocolError::InvalidParams(_))
+    ));
+    assert_eq!(kernel.state(), BridgeState::Initialized);
 }
 
 #[test]

@@ -8,12 +8,17 @@ use uuid::Uuid;
 pub const SESSION_KEY_ENV: &str = "OPENAB_SESSION_KEY";
 pub const SESSION_ATTEMPT_ID_ENV: &str = "OPENAB_SESSION_ATTEMPT_ID";
 
+#[cfg(feature = "bridge-runtime")]
+pub mod runtime;
+#[cfg(feature = "bridge-runtime")]
+pub mod websocket;
+
 /// Maximum size of one complete ACP JSON-RPC message.
 ///
-/// ACP content blocks can contain several encoded image attachments, so this
-/// logical-message bound is deliberately larger than the future relay's
-/// transport-frame bound. A relay may split one message into many small frames.
+/// ACP content blocks can contain several encoded image attachments. The wire
+/// layer reserves separate overhead for its typed outer relay envelope.
 pub const MAX_LOGICAL_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_WORKER_SESSION_ID_BYTES: usize = 4 * 1024;
 
 const CONTROLLER_ERROR_CODE: i64 = -32000;
 
@@ -417,13 +422,30 @@ impl BridgeKernel {
         &mut self,
         bytes: &[u8],
     ) -> Result<BridgeAction, BridgeProtocolError> {
+        self.handle_worker_envelope(parse_rpc_envelope(bytes)?)
+    }
+
+    /// Handle a worker value whose logical size was already validated by the
+    /// closed relay envelope. This avoids serializing and reparsing large ACP
+    /// payloads in the WebSocket adapter.
+    #[cfg(feature = "bridge-runtime")]
+    fn handle_validated_worker_value(
+        &mut self,
+        value: Value,
+    ) -> Result<BridgeAction, BridgeProtocolError> {
+        self.handle_worker_envelope(parse_rpc_value(value)?)
+    }
+
+    fn handle_worker_envelope(
+        &mut self,
+        mut parsed: ParsedEnvelope,
+    ) -> Result<BridgeAction, BridgeProtocolError> {
         self.ensure_not_failed()?;
         if matches!(self.state, BridgeState::Closed | BridgeState::Released) {
             return Err(BridgeProtocolError::InvalidState(
                 "terminal bridge cannot accept worker messages",
             ));
         }
-        let mut parsed = parse_rpc_envelope(bytes)?;
         if matches!(
             &parsed.kind,
             EnvelopeKind::Request { method, .. } | EnvelopeKind::Notification { method }
@@ -478,7 +500,7 @@ impl BridgeKernel {
                 let Some(session_id) = response_session_id(&parsed.value) else {
                     self.state = BridgeState::Failed;
                     return Err(BridgeProtocolError::WorkerResponse(
-                        "session/new result must contain a non-empty sessionId",
+                        "session/new result must contain a bounded non-empty sessionId",
                     ));
                 };
                 self.worker_session_id = Some(session_id.to_string());
@@ -701,9 +723,11 @@ fn required_session_id(params: &Value) -> Result<&str, BridgeProtocolError> {
         .as_object()
         .and_then(|params| params.get("sessionId"))
         .and_then(Value::as_str)
-        .filter(|session_id| !session_id.is_empty())
+        .filter(|session_id| {
+            !session_id.is_empty() && session_id.len() <= MAX_WORKER_SESSION_ID_BYTES
+        })
         .ok_or(BridgeProtocolError::InvalidParams(
-            "sessionId must be a non-empty string",
+            "sessionId must be a bounded non-empty string",
         ))
 }
 
@@ -713,7 +737,9 @@ fn response_session_id(message: &Value) -> Option<&str> {
         .and_then(Value::as_object)
         .and_then(|result| result.get("sessionId"))
         .and_then(Value::as_str)
-        .filter(|session_id| !session_id.is_empty())
+        .filter(|session_id| {
+            !session_id.is_empty() && session_id.len() <= MAX_WORKER_SESSION_ID_BYTES
+        })
 }
 
 fn augment_initialize_response(message: &mut Value) -> Result<(), BridgeProtocolError> {
@@ -795,6 +821,10 @@ enum EnvelopeKind {
 
 fn parse_rpc_envelope(bytes: &[u8]) -> Result<ParsedEnvelope, BridgeProtocolError> {
     let value = parse_logical_message(bytes)?;
+    parse_rpc_value(value)
+}
+
+fn parse_rpc_value(value: Value) -> Result<ParsedEnvelope, BridgeProtocolError> {
     let object = value
         .as_object()
         .ok_or(BridgeProtocolError::InvalidEnvelope(
