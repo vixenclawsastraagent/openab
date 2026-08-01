@@ -387,16 +387,50 @@ ID)` before calling the controller; it must not briefly remove the slot and
 allow another socket with the same binding to install. A transient persistence
 failure keeps the slot quiescing and fail closed until retry succeeds.
 
-One process-local rendezvous entry retains the exact binding and Pod UID plus
-at most one bridge connection ID and one worker connection ID. The second lane
-is paired only when that complete authority matches; a duplicate lane or
-different generation never replaces an installed connection. Routing resolves
-an exact peer only while the entry is active. A close transition returns a
+One process-local rendezvous entry retains the exact binding and Pod UID, at
+most one bridge lane and one worker lane, each lane's bounded outbound sender,
+and the pending correlated activation metadata. The Pod may register while the
+activation call is returning, so either exact lane may arrive first. The entry
+does not become active until both lanes have the same complete authority and
+profile, and queue capacity has been reserved for both the worker ACK and the
+bridge `Activated` response. A duplicate lane or different generation never
+replaces an installed connection, and no ACP message is routable while either
+handshake result is still withheld.
+
+If trusted post-mutation output identifies a different authority for the same
+logical session, the registry retains a separate detached containment ticket;
+it does not overwrite or prematurely stop the installed generation. A
+transient Kubernetes failure leaves that ticket retryable. A fresh controller
+comparison that classifies the detached authority as stale removes only that
+ticket. If the detached authority is instead the current or already-contained
+durable generation, the installed older lane is then changed to `Quiescing`
+and contained through its own ticket. While a detached ticket remains pending,
+the same authority cannot install a lane.
+
+The registry is the sole process-local source for connection identity,
+handshake state, outbound sender, and quiescing state; there is no second
+connection-ID-to-sender map. A short synchronous mutex orders lane install,
+handshake enqueue, routing admission, and the transition to `Quiescing`; no
+controller or socket I/O occurs while it is held. A close transition returns a
 retryable containment ticket containing both connection IDs, then releases the
-registry mutex before any controller or socket I/O. Failed or cancelled
-containment work remains discoverable from the quiescing registry; the entry is
-removed only after a non-error durable-containment result. A delayed completion
-ticket cannot remove a newer rendezvous.
+registry mutex before controller I/O. Failed or cancelled containment work
+remains discoverable from the quiescing registry; the entry is removed only
+after a non-error durable-containment result. A delayed completion ticket
+cannot remove a newer rendezvous.
+
+The mutex guard latches process-fatal relay health while unwinding from any
+panic that could poison this state. The controller executable must subscribe
+before advertising readiness; fatal health removes readiness, stops new relay
+admission, and terminates the process so startup orphan containment runs on the
+replacement. A poisoned registry is never recovered with its inner value.
+
+Activation and single-use worker registration run in controller-owned tasks.
+Cancelling the transport caller therefore cannot interrupt the interval
+between a successful Kubernetes mutation and lane installation. If handoff to
+the caller fails, dropping the exact attachment synchronously quiesces the
+entry and schedules containment; a retained ticket provides the retry path.
+Process failure anywhere in this interval remains covered by the startup
+orphan scan before readiness.
 
 Controller restart discards every process-local authenticated lane. Before it
 admits relay traffic or reports readiness, the controller therefore lists all

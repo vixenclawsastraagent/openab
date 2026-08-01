@@ -6,6 +6,7 @@ mod generation;
 mod lifecycle;
 mod locks;
 mod registration;
+mod relay;
 mod release;
 mod rendezvous;
 mod service;
@@ -43,11 +44,16 @@ pub use registration::{
     RegistrationProvisionerError, RegistrationRecovery, VerifiedBootstrap, WorkerBootstrapAuth,
     WorkerBootstrapAuthError,
 };
+pub use relay::{
+    BridgeOpenOutcome, RelayAttachment, RelayContainmentFailure, RelayContainmentReport,
+    RelayLossOutcome, RelayOpenError, RelayOrchestrator,
+};
 pub use release::{ReleaseCoordinator, ReleaseError, ReleaseOutcome};
 pub use rendezvous::{
-    RelayConnection, RelayConnectionId, RelayConnectionLoss, RelayContainmentCompletion,
-    RelayContainmentTicket, RelayLane, RendezvousInstallError, RendezvousRegistry,
-    RendezvousRouteError,
+    PendingActivation, RelayConnection, RelayConnectionId, RelayConnectionLoss,
+    RelayContainmentCompletion, RelayContainmentTicket, RelayInstallation, RelayLane,
+    RelayPairingOutcome, RendezvousFatalError, RendezvousHealth, RendezvousInstallError,
+    RendezvousRegistry, RendezvousRouteError,
 };
 pub use service::{
     ControllerService, ControllerServiceConfigError, ControllerServiceError,

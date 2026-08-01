@@ -149,6 +149,10 @@ fn standalone_state_values_are_validated_when_deserialized() {
     let mut inactive_turn = serde_json::to_value(test_anchor()).unwrap();
     inactive_turn["lastPromptTurnId"] = json!(Uuid::from_u128(0x400));
     assert!(serde_json::from_value::<SessionAnchorV1>(inactive_turn).is_err());
+
+    let mut invalid_pod_uid = serde_json::to_value(test_anchor()).unwrap();
+    invalid_pod_uid["podUid"] = json!("pod/uid");
+    assert!(serde_json::from_value::<SessionAnchorV1>(invalid_pod_uid).is_err());
 }
 
 #[test]

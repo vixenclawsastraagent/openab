@@ -235,6 +235,18 @@ pub struct RegisteredWorker {
 }
 
 impl RegisteredWorker {
+    pub(crate) fn from_parts(
+        binding: SessionBinding,
+        profile: ProfileRef,
+        pod_uid: String,
+    ) -> Self {
+        Self {
+            binding,
+            profile,
+            pod_uid,
+        }
+    }
+
     pub fn binding(&self) -> &SessionBinding {
         &self.binding
     }
@@ -411,11 +423,11 @@ impl RegistrationCoordinator {
             .transition(&fence, SessionPhase::Ready)
             .map_err(|_| RegistrationError::InvalidAnchor)?;
         let ready = self.persist_ready_or_recover(current, ready).await?;
-        Ok(RegisteredWorker {
-            binding: expected_binding,
-            profile: ready.state().profile().clone(),
-            pod_uid: recorded_pod_uid,
-        })
+        Ok(RegisteredWorker::from_parts(
+            expected_binding,
+            ready.state().profile().clone(),
+            recorded_pod_uid,
+        ))
     }
 
     pub async fn recover_incomplete(
@@ -572,8 +584,5 @@ fn same_registration_anchor(first: &StoredAnchor, second: &StoredAnchor) -> bool
 }
 
 fn is_printable_identifier(value: &str) -> bool {
-    (1..=256).contains(&value.len())
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_graphic() && byte != b'/' && byte != b'\\')
+    crate::state::is_valid_observation_identifier(value)
 }

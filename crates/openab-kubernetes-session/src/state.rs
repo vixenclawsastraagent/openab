@@ -515,7 +515,7 @@ impl SessionAnchorV1 {
                 to: SessionPhase::Provisioning,
             });
         }
-        if pod_uid.trim().is_empty() {
+        if !is_valid_observation_identifier(pod_uid) {
             return Err(StateError::InvalidPodUid);
         }
         match self.pod_uid.as_deref() {
@@ -738,7 +738,7 @@ impl SessionAnchorV1 {
         if self
             .pod_uid
             .as_deref()
-            .is_some_and(|uid| uid.trim().is_empty())
+            .is_some_and(|uid| !is_valid_observation_identifier(uid))
         {
             return Err(StateError::InvalidPodUid);
         }
@@ -763,6 +763,13 @@ impl SessionAnchorV1 {
         }
         Ok(())
     }
+}
+
+pub(crate) fn is_valid_observation_identifier(value: &str) -> bool {
+    (1..=256).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != b'/' && byte != b'\\')
 }
 
 fn validate_deadlines(

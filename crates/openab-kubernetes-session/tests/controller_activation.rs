@@ -1176,11 +1176,15 @@ async fn a_blocked_session_does_not_block_another_session() {
 }
 
 #[test]
-fn worker_observation_rejects_empty_or_control_character_uids() {
-    for uid in ["", "   ", "pod\nuid", "pod\0uid"] {
+fn worker_observation_uses_the_exact_relay_uid_invariant() {
+    for uid in ["", "   ", "pod\nuid", "pod\0uid", "pod/uid", "pod\\uid"] {
         assert_eq!(
             ObservedWorker::new(uid),
             Err(GenerationProvisionerError::InvalidPodUid)
         );
     }
+    assert_eq!(
+        ObservedWorker::new("p".repeat(257)),
+        Err(GenerationProvisionerError::InvalidPodUid)
+    );
 }

@@ -41,11 +41,7 @@ impl OrphanAuthority {
         pod_uid: impl Into<String>,
     ) -> Result<Self, OrphanAuthorityError> {
         let pod_uid = pod_uid.into();
-        if !(1..=256).contains(&pod_uid.len())
-            || !pod_uid
-                .bytes()
-                .all(|byte| byte.is_ascii_graphic() && byte != b'/' && byte != b'\\')
-        {
+        if !crate::state::is_valid_observation_identifier(&pod_uid) {
             return Err(OrphanAuthorityError::InvalidPodUid);
         }
         Ok(Self { binding, pod_uid })

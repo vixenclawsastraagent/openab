@@ -49,7 +49,7 @@ pub struct ObservedWorker {
 impl ObservedWorker {
     pub fn new(pod_uid: impl Into<String>) -> Result<Self, GenerationProvisionerError> {
         let pod_uid = pod_uid.into();
-        if pod_uid.trim().is_empty() || pod_uid.chars().any(char::is_control) {
+        if !crate::state::is_valid_observation_identifier(&pod_uid) {
             return Err(GenerationProvisionerError::InvalidPodUid);
         }
         Ok(Self { pod_uid })

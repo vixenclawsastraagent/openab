@@ -55,7 +55,11 @@ const TOKEN_FILE: &str = "/var/run/openab-registration/token";
 const BINDING_FILE: &str = "/var/run/openab-registration/binding.json";
 const SESSION_ROOT: &str = "/session";
 const SESSION_HOME: &str = "/session/home";
-const WORKSPACE: &str = "/session/workspace";
+/// Writable workspace root promised by the `session-layout-v1` worker image.
+///
+/// Relay activation responses and generated worker Pods must use this single
+/// value so a future layout revision cannot silently split the contract.
+pub const SESSION_WORKSPACE_V1: &str = "/session/workspace";
 const MAX_REGISTRATION_BINDING_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -982,7 +986,7 @@ impl DesiredGeneration {
                     command: Some(profile.command),
                     env: Some(vec![
                         literal_env("HOME", SESSION_HOME),
-                        literal_env("OPENAB_WORKSPACE", WORKSPACE),
+                        literal_env("OPENAB_WORKSPACE", SESSION_WORKSPACE_V1),
                         literal_env("OPENAB_SESSION_ROOT", SESSION_ROOT),
                         literal_env("OPENAB_REGISTRATION_TOKEN_FILE", TOKEN_FILE),
                         literal_env("OPENAB_REGISTRATION_BINDING_FILE", BINDING_FILE),

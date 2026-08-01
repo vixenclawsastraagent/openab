@@ -118,6 +118,10 @@ impl ControllerService {
         })
     }
 
+    pub fn scope_id(&self) -> crate::identity::ScopeId {
+        self.coordinators.scope_id()
+    }
+
     /// Prepare an activation using the current trusted profile for new state,
     /// the durable pinned revision for existing state, and policy-derived
     /// controller time.
