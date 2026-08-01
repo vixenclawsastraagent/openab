@@ -23,6 +23,18 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{debug, error, info, trace};
 
+const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const SESSION_NEW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const ISOLATED_INITIALIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+fn request_timeout(method: &str, isolated_session_runtime: bool) -> std::time::Duration {
+    match (method, isolated_session_runtime) {
+        ("session/new", _) => SESSION_NEW_TIMEOUT,
+        ("initialize", true) => ISOLATED_INITIALIZE_TIMEOUT,
+        _ => DEFAULT_REQUEST_TIMEOUT,
+    }
+}
+
 /// Pick the most permissive selectable permission option from ACP options.
 fn pick_best_option(options: &[Value]) -> Option<String> {
     let mut fallback: Option<&Value> = None;
@@ -560,8 +572,8 @@ impl AcpConnection {
 
         self.send_raw(&data).await?;
 
-        let timeout_secs = if method == "session/new" { 120 } else { 30 };
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx)
+        let timeout = request_timeout(method, self.session_spawn_context.is_some());
+        let resp = tokio::time::timeout(timeout, rx)
             .await
             .map_err(|_| anyhow!("timeout waiting for {method} response"))?
             .map_err(|_| anyhow!("channel closed waiting for {method}"))?;
@@ -933,8 +945,8 @@ impl Drop for AcpConnection {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_agent_env, build_permission_response, pick_best_option, BrokerMappingExpectation,
-        SessionSpawnContext,
+        build_agent_env, build_permission_response, pick_best_option, request_timeout,
+        BrokerMappingExpectation, SessionSpawnContext,
     };
     use crate::acp::lifecycle::{
         MappingAbsentInitialization, MAPPING_ABSENT_INITIALIZATION_ERROR_CODE,
@@ -942,6 +954,38 @@ mod tests {
     use serde_json::json;
 
     static MAPPING_EXPECTATION_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn request_timeouts_preserve_default_runtime_behavior() {
+        assert_eq!(
+            request_timeout("initialize", false),
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(
+            request_timeout("session/new", false),
+            std::time::Duration::from_secs(120)
+        );
+        assert_eq!(
+            request_timeout("session/load", false),
+            std::time::Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn isolated_initialize_has_a_bounded_provisioning_window() {
+        assert_eq!(
+            request_timeout("initialize", true),
+            std::time::Duration::from_secs(300)
+        );
+        assert_eq!(
+            request_timeout("session/new", true),
+            std::time::Duration::from_secs(120)
+        );
+        assert_eq!(
+            request_timeout("session/load", true),
+            std::time::Duration::from_secs(30)
+        );
+    }
 
     struct EnvironmentRestore {
         name: &'static str,
