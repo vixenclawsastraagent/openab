@@ -13,8 +13,16 @@ use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use thiserror::Error;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use uuid::Uuid;
+
+mod lifecycle;
+
+use lifecycle::LifecycleSessionState;
+pub use lifecycle::RendezvousLifecycleError;
+pub(crate) use lifecycle::{
+    LifecycleAcquireOutcome, LifecycleAdmission, LifecycleDeliveryOutcome, RelayLifecycleTerminal,
+};
 
 const HANDSHAKE_BYTE_RESERVE: usize = 2 * MAX_CONTROL_FRAME_BYTES;
 pub const MIN_RELAY_BYTE_BUDGET: usize = HANDSHAKE_BYTE_RESERVE;
@@ -167,7 +175,7 @@ impl RelayByteBudget {
             inner: Arc::new(RelayByteBudgetInner {
                 limit: bytes.get(),
                 used: AtomicUsize::new(0),
-                pairing_waiters: AtomicUsize::new(0),
+                control_waiters: AtomicUsize::new(0),
                 release_generation,
             }),
         })
@@ -184,11 +192,11 @@ impl RelayByteBudget {
     }
 
     fn try_acquire_acp(&self, bytes: usize) -> Option<RelayByteLease> {
-        if self.inner.pairing_waiters.load(Ordering::Acquire) != 0 {
+        if self.inner.control_waiters.load(Ordering::Acquire) != 0 {
             return None;
         }
         let lease = self.try_acquire(bytes)?;
-        if self.inner.pairing_waiters.load(Ordering::Acquire) != 0 {
+        if self.inner.control_waiters.load(Ordering::Acquire) != 0 {
             drop(lease);
             return None;
         }
@@ -223,9 +231,9 @@ impl RelayByteBudget {
         self.inner.release_generation.subscribe()
     }
 
-    fn begin_pairing_wait(&self) -> RelayPairingWaiter {
-        self.inner.pairing_waiters.fetch_add(1, Ordering::AcqRel);
-        RelayPairingWaiter {
+    fn begin_control_wait(&self) -> RelayControlWaiter {
+        self.inner.control_waiters.fetch_add(1, Ordering::AcqRel);
+        RelayControlWaiter {
             inner: Arc::clone(&self.inner),
         }
     }
@@ -235,23 +243,29 @@ impl RelayByteBudget {
         self.try_acquire(bytes)
             .expect("the test byte hold must fit the configured budget")
     }
+
+    #[cfg(test)]
+    pub(super) fn control_waiters_for_test(&self) -> usize {
+        self.inner.control_waiters.load(Ordering::Acquire)
+    }
 }
 
 #[derive(Debug)]
 struct RelayByteBudgetInner {
     limit: usize,
     used: AtomicUsize,
-    pairing_waiters: AtomicUsize,
+    control_waiters: AtomicUsize,
     release_generation: watch::Sender<u64>,
 }
 
-pub(crate) struct RelayPairingWaiter {
+#[derive(Debug)]
+pub(crate) struct RelayControlWaiter {
     inner: Arc<RelayByteBudgetInner>,
 }
 
-impl Drop for RelayPairingWaiter {
+impl Drop for RelayControlWaiter {
     fn drop(&mut self) {
-        let previous = self.inner.pairing_waiters.fetch_sub(1, Ordering::AcqRel);
+        let previous = self.inner.control_waiters.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0);
     }
 }
@@ -294,6 +308,7 @@ impl Drop for RelayByteLease {
 pub struct RelayOutboundItem<M> {
     message: M,
     _byte_budget: RelayByteLease,
+    write_reporter: Option<RelayWriteReporter>,
 }
 
 impl<M> RelayOutboundItem<M> {
@@ -301,6 +316,15 @@ impl<M> RelayOutboundItem<M> {
         Self {
             message,
             _byte_budget: permit,
+            write_reporter: None,
+        }
+    }
+
+    fn reported(message: M, permit: RelayByteLease, write_reporter: RelayWriteReporter) -> Self {
+        Self {
+            message,
+            _byte_budget: permit,
+            write_reporter: Some(write_reporter),
         }
     }
 
@@ -316,11 +340,13 @@ impl<M: WireMessage> RelayOutboundItem<M> {
         let Self {
             message,
             _byte_budget,
+            write_reporter,
         } = self;
         let bytes = crate::wire::encode_frame(&message)?;
         Ok(RelayOutboundFrame {
             bytes,
             _byte_budget,
+            write_reporter,
         })
     }
 }
@@ -342,11 +368,22 @@ impl<M> std::fmt::Debug for RelayOutboundItem<M> {
 pub struct RelayOutboundFrame {
     bytes: Vec<u8>,
     _byte_budget: RelayByteLease,
+    write_reporter: Option<RelayWriteReporter>,
 }
 
 impl RelayOutboundFrame {
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    /// Report that the exact encoded frame reached the transport successfully.
+    ///
+    /// Lifecycle completion remains fail closed unless the writer consumes the
+    /// frame through this method after its write future returns success.
+    pub fn mark_written(mut self) {
+        if let Some(reporter) = self.write_reporter.as_mut() {
+            reporter.report_written();
+        }
     }
 }
 
@@ -358,6 +395,42 @@ impl std::fmt::Debug for RelayOutboundFrame {
             .field("charged_bytes", &self._byte_budget.bytes)
             .finish_non_exhaustive()
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RelayWriteStatus {
+    Written,
+    Dropped,
+}
+
+pub(super) struct RelayWriteReporter {
+    result: Option<oneshot::Sender<()>>,
+}
+
+impl RelayWriteReporter {
+    fn report_written(&mut self) {
+        if let Some(result) = self.result.take() {
+            let _ = result.send(());
+        }
+    }
+}
+
+impl std::fmt::Debug for RelayWriteReporter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RelayWriteReporter")
+            .finish_non_exhaustive()
+    }
+}
+
+pub(super) fn relay_write_report() -> (RelayWriteReporter, oneshot::Receiver<()>) {
+    let (result, receiver) = oneshot::channel();
+    (
+        RelayWriteReporter {
+            result: Some(result),
+        },
+        receiver,
+    )
 }
 
 /// One installed lane plus the session-wide quiesce notification.
@@ -447,6 +520,8 @@ pub enum RendezvousRouteError {
     StaleConnection,
     #[error("the exact peer handshake has not completed")]
     AwaitingPeer,
+    #[error("this session has a lifecycle operation in progress")]
+    LifecyclePending,
     #[error("this session rendezvous is quiescing")]
     Quiescing,
     #[error("the ACP frame cannot fit within the configured relay byte budget")]
@@ -459,6 +534,9 @@ pub enum RelayConnectionLoss {
     /// The exact connection changed the session to `Quiescing`; persist the
     /// included authority before removing the rendezvous.
     ContainmentRequired(Box<RelayContainmentTicket>),
+    /// A lifecycle operation already fenced ACP, so this exact worker may
+    /// detach without evicting the bridge or creating orphan intent.
+    LifecycleWorkerDetached,
     /// Another exact lane already started containment for this session.
     AlreadyQuiescing,
     /// The callback belongs to an absent or replaced connection.
@@ -471,13 +549,13 @@ pub enum RelayContainmentCompletion {
     StaleTicket,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct BridgeSlot {
     connection_id: RelayConnectionId,
     outbound: mpsc::Sender<RelayOutboundItem<ControllerToBridgeV1>>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct WorkerSlot {
     connection_id: RelayConnectionId,
     outbound: mpsc::Sender<RelayOutboundItem<ControllerToWorkerV1>>,
@@ -495,6 +573,7 @@ enum RelaySessionState {
         bridge: BridgeSlot,
         worker: WorkerSlot,
     },
+    Lifecycle(LifecycleSessionState),
     Quiescing {
         bridge: Option<RelayConnectionId>,
         worker: Option<RelayConnectionId>,
@@ -513,6 +592,10 @@ impl RelaySessionState {
             }
             (Self::Active { bridge, .. }, RelayLane::Bridge) => Some(bridge.connection_id),
             (Self::Active { worker, .. }, RelayLane::Worker) => Some(worker.connection_id),
+            (Self::Lifecycle(lifecycle), RelayLane::Bridge) => Some(lifecycle.bridge.connection_id),
+            (Self::Lifecycle(lifecycle), RelayLane::Worker) => {
+                lifecycle.worker.as_ref().map(|worker| worker.connection_id)
+            }
             (Self::Quiescing { bridge, .. }, RelayLane::Bridge) => *bridge,
             (Self::Quiescing { worker, .. }, RelayLane::Worker) => *worker,
         }
@@ -607,8 +690,8 @@ impl RendezvousRegistry {
         self.byte_budget.subscribe_releases()
     }
 
-    pub(crate) fn begin_pairing_wait(&self) -> RelayPairingWaiter {
-        self.byte_budget.begin_pairing_wait()
+    pub(crate) fn begin_control_wait(&self) -> RelayControlWaiter {
+        self.byte_budget.begin_control_wait()
     }
 
     /// Subscribe to process-fatal registry health.
@@ -782,6 +865,7 @@ impl RendezvousRegistry {
                 .connection(connection.lane.peer())
                 .ok_or(RendezvousRouteError::AwaitingPeer),
             RelaySessionState::Pairing { .. } => Err(RendezvousRouteError::AwaitingPeer),
+            RelaySessionState::Lifecycle(_) => Err(RendezvousRouteError::LifecyclePending),
             RelaySessionState::Quiescing { .. } => Err(RendezvousRouteError::Quiescing),
         }
     }
@@ -806,6 +890,7 @@ impl RendezvousRegistry {
         }
         match &session.state {
             RelaySessionState::Pairing { .. } => Err(RendezvousRouteError::AwaitingPeer),
+            RelaySessionState::Lifecycle(_) => Err(RendezvousRouteError::LifecyclePending),
             RelaySessionState::Quiescing { .. } => Err(RendezvousRouteError::Quiescing),
             RelaySessionState::Active { bridge, worker } => {
                 let queued_bytes = message
@@ -905,6 +990,19 @@ impl RendezvousRegistry {
             return RelayConnectionLoss::StaleConnection;
         }
 
+        if let RelaySessionState::Lifecycle(lifecycle) = &mut session.state {
+            if connection.lane == RelayLane::Worker {
+                if lifecycle.worker_detach_is_expected_or_provisional() {
+                    lifecycle.worker = None;
+                    return RelayConnectionLoss::LifecycleWorkerDetached;
+                }
+                let ticket = quiesce(session, connection.clone());
+                return RelayConnectionLoss::ContainmentRequired(Box::new(ticket));
+            }
+            let ticket = quiesce(session, connection.clone());
+            return RelayConnectionLoss::ContainmentRequired(Box::new(ticket));
+        }
+
         match &session.state {
             RelaySessionState::Pairing { .. } | RelaySessionState::Active { .. } => {
                 let ticket = quiesce(session, connection.clone());
@@ -916,6 +1014,9 @@ impl RendezvousRegistry {
                 )))
             }
             RelaySessionState::Quiescing { .. } => RelayConnectionLoss::AlreadyQuiescing,
+            RelaySessionState::Lifecycle(_) => {
+                unreachable!("lifecycle connection loss returned before this match")
+            }
         }
     }
 
@@ -977,7 +1078,9 @@ impl RendezvousRegistry {
             .get_mut(&session_id)
             .expect("the exact session authority was observed while locked");
         match &session.state {
-            RelaySessionState::Pairing { .. } | RelaySessionState::Active { .. } => {
+            RelaySessionState::Pairing { .. }
+            | RelaySessionState::Active { .. }
+            | RelaySessionState::Lifecycle(_) => {
                 let trigger = session
                     .state
                     .connection(RelayLane::Bridge)
@@ -1009,7 +1112,9 @@ impl RendezvousRegistry {
             return RelayConnectionLoss::StaleConnection;
         };
         match &session.state {
-            RelaySessionState::Pairing { .. } | RelaySessionState::Active { .. } => {
+            RelaySessionState::Pairing { .. }
+            | RelaySessionState::Active { .. }
+            | RelaySessionState::Lifecycle(_) => {
                 let trigger = session
                     .state
                     .connection(RelayLane::Bridge)
@@ -1087,7 +1192,9 @@ impl RendezvousRegistry {
                 RelaySessionState::Quiescing { trigger, .. } => {
                     Some(containment_ticket(session, trigger))
                 }
-                RelaySessionState::Pairing { .. } | RelaySessionState::Active { .. } => None,
+                RelaySessionState::Pairing { .. }
+                | RelaySessionState::Active { .. }
+                | RelaySessionState::Lifecycle(_) => None,
             })
             .chain(state.detached_containments.values().cloned())
             .collect::<Vec<_>>();
@@ -1131,7 +1238,10 @@ fn validate_existing_session(
     if session.authority != *authority {
         return Err(RendezvousInstallError::AuthorityConflict);
     }
-    if matches!(session.state, RelaySessionState::Quiescing { .. }) {
+    if matches!(
+        session.state,
+        RelaySessionState::Lifecycle(_) | RelaySessionState::Quiescing { .. }
+    ) {
         return Err(RendezvousInstallError::Quiescing);
     }
     if session.state.connection(lane).is_some() {
@@ -1153,6 +1263,7 @@ fn pair_if_ready(
     else {
         return match session.state {
             RelaySessionState::Active { .. } => RelayPairingOutcome::Active,
+            RelaySessionState::Lifecycle(_) => RelayPairingOutcome::Unavailable,
             RelaySessionState::Quiescing { .. } => RelayPairingOutcome::Unavailable,
             RelaySessionState::Pairing { .. } => unreachable!(),
         };

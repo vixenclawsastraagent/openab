@@ -430,8 +430,8 @@ routing lock. A valid ACP frame that can never fit the configured budget is a
 terminal configuration error rather than retryable pressure.
 
 When transient pressure blocks a complete two-lane handshake, the orchestrator
-registers a pairing waiter before retrying. New ACP admission yields while any
-pairing waiter exists, and a lease release wakes the controller-owned retry.
+registers a control waiter before retrying. New ACP admission yields while any
+control waiter exists, and a lease release wakes the controller-owned retry.
 The retry revalidates the exact pair under the registry mutex before enqueueing
 either result. Cancellation while waiting transitions the exact installed
 connection to `Quiescing` and persists containment. A full queue during a fresh
@@ -449,19 +449,60 @@ delivery and close are linearized as either a complete enqueue before
 quiescing or a rejection after quiescing, never an enqueue decided from a stale
 peer lookup.
 
+An authenticated bridge lifecycle request changes the same rendezvous entry
+from `Active` to `Lifecycle`; there is no parallel lifecycle-to-connection map.
+The transition compares the complete request and durable binding under the
+routing mutex, then immediately rejects ACP in both directions. Only the exact
+bridge lane may enter this state. An identical request coalesces while one pass
+is running, while a different request ID or payload, a worker-lane request, or
+a foreign binding fails closed and starts containment.
+
+Before controller I/O, the lifecycle task reserves one item in the bridge
+outbound queue and one maximum-size control-frame byte lease. Waiting for lane
+capacity blocks only that session; waiting for process bytes registers the
+same global control priority used by pairing, so newly admitted ACP cannot
+starve suspend or release indefinitely. Each controller pass has a fresh
+process-local nonce in addition to the complete authority, connection ID, and
+request fingerprint. A late pass can therefore neither acknowledge nor alter
+a later retry or replacement generation.
+
+`ReleasePending` emits no protocol result. It drops the response reservation,
+retains the exact bridge and request in `Lifecycle`, and permits the worker
+lane to detach without treating the expected Pod exit as broker loss. The same
+request may then drive another release reconciliation pass. This accepted
+release provenance survives capacity waits, controller retries, and transient
+controller errors; a worker exit remains expected throughout those later
+passes. Before any lifecycle controller I/O, a worker loss is unexpected and
+requires containment unless a previous release pass already established that
+durable intent. During the first controller pass, detach is provisional: a
+successful lifecycle outcome confirms it, while a controller error contains
+the session because the relay cannot prove that the exit followed accepted
+intent. Controller errors never restore ACP routing.
+
+A suspend or final release ACK carries the lifecycle request ID and uses the
+already-reserved queue and byte capacity. Enqueue is not completion: the
+outbound item transfers a non-cloneable write reporter into the encoded-frame
+guard, and only an explicit successful-writer `mark_written` completes the
+operation. Dropping the item or frame changes the exact rendezvous to
+`Quiescing` and persists containment. A written completion removes only the
+matching authority, bridge connection, full request, pass nonce, and delivery
+nonce; it cannot remove a replacement generation. Final `Released` is thus
+mapping-clear eligible only after both Kubernetes absence proof and correlated
+ACK write completion.
+
 The mutex guard latches process-fatal relay health while unwinding from any
 panic that could poison this state. The controller executable must subscribe
 before advertising readiness; fatal health removes readiness, stops new relay
 admission, and terminates the process so startup orphan containment runs on the
 replacement. A poisoned registry is never recovered with its inner value.
 
-Activation and single-use worker registration run in controller-owned tasks.
-Cancelling the transport caller therefore cannot interrupt the interval
-between a successful Kubernetes mutation and lane installation. If handoff to
-the caller fails, dropping the exact attachment synchronously quiesces the
-entry and schedules containment; a retained ticket provides the retry path.
-Process failure anywhere in this interval remains covered by the startup
-orphan scan before readiness.
+Activation, single-use worker registration, and lifecycle passes run in
+controller-owned tasks. Cancelling the transport caller therefore cannot
+interrupt the interval between a successful Kubernetes mutation and lane
+installation or result delivery. If handoff to the caller fails, dropping the
+exact attachment synchronously quiesces the entry and schedules containment; a
+retained ticket provides the retry path. Process failure anywhere in this
+interval remains covered by the startup orphan scan before readiness.
 
 Controller restart discards every process-local authenticated lane. Before it
 admits relay traffic or reports readiness, the controller therefore lists all

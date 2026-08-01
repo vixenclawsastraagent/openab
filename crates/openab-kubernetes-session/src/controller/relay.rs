@@ -1,17 +1,18 @@
 use super::{
     AcpRouteOutcome, ActivationPreparation, ControllerService, ControllerServiceError,
+    LifecycleAcquireOutcome, LifecycleAdmission, LifecycleDeliveryOutcome, LifecycleServiceOutcome,
     OrphanAuthority, OrphanAuthorityError, OrphanContainmentOutcome, PendingActivation,
     RegisteredWorker, RelayBackpressure, RelayByteBudget, RelayConnection, RelayConnectionLoss,
-    RelayContainmentCompletion, RelayContainmentTicket, RelayOutboundItem, RelayPairingOutcome,
-    RendezvousHealth, RendezvousInstallError, RendezvousRegistry, RendezvousRouteError,
-    WorkerBootstrapAuth,
+    RelayContainmentCompletion, RelayContainmentTicket, RelayLifecycleTerminal, RelayOutboundItem,
+    RelayPairingOutcome, RendezvousHealth, RendezvousInstallError, RendezvousLifecycleError,
+    RendezvousRegistry, RendezvousRouteError, WorkerBootstrapAuth,
 };
 use crate::bridge::SessionBinding;
 use crate::identity::{ScopeId, SessionId};
 use crate::state::ProfileRef;
 use crate::wire::{
     AcpMessageV1, ActivationRequestV1, ControllerToBridgeV1, ControllerToWorkerV1, FatalCode,
-    WireProtocolError, WorkerRegistrationV1,
+    LifecycleRequestV1, ProtocolResultV1, WireProtocolError, WorkerRegistrationV1,
 };
 use async_trait::async_trait;
 use std::num::NonZeroUsize;
@@ -43,6 +44,11 @@ trait RelayController: Send + Sync {
         &self,
         authority: &OrphanAuthority,
     ) -> Result<OrphanContainmentOutcome, ControllerServiceError>;
+
+    async fn lifecycle(
+        &self,
+        request: &LifecycleRequestV1,
+    ) -> Result<LifecycleServiceOutcome, ControllerServiceError>;
 }
 
 #[async_trait]
@@ -71,6 +77,13 @@ impl RelayController for ControllerService {
         authority: &OrphanAuthority,
     ) -> Result<OrphanContainmentOutcome, ControllerServiceError> {
         ControllerService::connection_lost(self, authority).await
+    }
+
+    async fn lifecycle(
+        &self,
+        request: &LifecycleRequestV1,
+    ) -> Result<LifecycleServiceOutcome, ControllerServiceError> {
+        ControllerService::lifecycle(self, request).await
     }
 }
 
@@ -127,12 +140,56 @@ pub enum RelayDeliveryError {
     Controller(#[source] ControllerServiceError),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelayLifecycleOutcome {
+    /// An identical in-flight request already owns this session.
+    Coalesced,
+    /// Durable release intent exists, but absence proof is not complete yet.
+    ReleasePending,
+    /// Suspend intent is durable and its correlated ACK reached the bridge.
+    Suspended,
+    /// Full release absence is proven and its correlated ACK reached the bridge.
+    Released,
+}
+
+#[derive(Debug, Error)]
+pub enum RelayLifecycleError {
+    #[error("relay lifecycle admission failed")]
+    Rendezvous(#[source] RendezvousLifecycleError),
+    #[error("controller lifecycle operation failed")]
+    Controller(#[source] ControllerServiceError),
+    #[error("the correlated lifecycle result did not reach the bridge")]
+    ResultDeliveryLost,
+    #[error("the controller-owned lifecycle task stopped before returning a result")]
+    TaskStopped,
+}
+
+impl RelayLifecycleError {
+    pub fn fatal_code(&self) -> FatalCode {
+        match self {
+            Self::Rendezvous(RendezvousLifecycleError::WrongLane)
+            | Self::Rendezvous(RendezvousLifecycleError::AwaitingPeer) => FatalCode::InvalidMessage,
+            Self::Rendezvous(RendezvousLifecycleError::BindingMismatch)
+            | Self::Rendezvous(RendezvousLifecycleError::ConflictingRequest)
+            | Self::Rendezvous(RendezvousLifecycleError::StaleConnection)
+            | Self::Rendezvous(RendezvousLifecycleError::Quiescing)
+            | Self::Rendezvous(RendezvousLifecycleError::ReservationLost) => {
+                FatalCode::StaleBinding
+            }
+            Self::Controller(error) => error.fatal_code(),
+            Self::ResultDeliveryLost | Self::TaskStopped => FatalCode::Unavailable,
+        }
+    }
+}
+
 impl RelayDeliveryError {
     pub fn fatal_code(&self) -> FatalCode {
         match self {
             Self::Rendezvous(RendezvousRouteError::AwaitingPeer) => FatalCode::InvalidMessage,
             Self::Rendezvous(
-                RendezvousRouteError::StaleConnection | RendezvousRouteError::Quiescing,
+                RendezvousRouteError::StaleConnection
+                | RendezvousRouteError::LifecyclePending
+                | RendezvousRouteError::Quiescing,
             ) => FatalCode::StaleBinding,
             Self::Rendezvous(RendezvousRouteError::FrameExceedsByteBudget { .. }) => {
                 FatalCode::Unavailable
@@ -222,6 +279,7 @@ impl ContainmentHandle {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RelayLossOutcome {
     Contained(OrphanContainmentOutcome),
+    LifecycleWorkerDetached,
     AlreadyQuiescing,
     StaleConnection,
 }
@@ -327,6 +385,31 @@ impl RelayOrchestrator {
         }
     }
 
+    /// Fence ACP and run one exact bridge lifecycle request in a
+    /// controller-owned task.
+    ///
+    /// The rendezvous reserves one bridge queue slot and one control-frame
+    /// byte lease before Kubernetes mutation begins. Suspend and final release
+    /// return only after the transport writer marks the correlated ACK as
+    /// written; a pending release emits no result and retains the exact request
+    /// for a later reconciliation pass.
+    pub async fn request_lifecycle(
+        &self,
+        connection: &RelayConnection,
+        request: LifecycleRequestV1,
+    ) -> Result<RelayLifecycleOutcome, RelayLifecycleError> {
+        let (result_sender, result_receiver) = oneshot::channel();
+        let this = self.clone();
+        let connection = connection.clone();
+        tokio::spawn(async move {
+            let result = this.request_lifecycle_inner(&connection, request).await;
+            let _ = result_sender.send(result);
+        });
+        result_receiver
+            .await
+            .unwrap_or(Err(RelayLifecycleError::TaskStopped))
+    }
+
     /// Run activation in a controller-owned task so caller cancellation cannot
     /// interrupt Kubernetes mutation between durable preparation and registry
     /// installation.
@@ -382,6 +465,9 @@ impl RelayOrchestrator {
             }
             RelayConnectionLoss::AlreadyQuiescing => Ok(RelayLossOutcome::AlreadyQuiescing),
             RelayConnectionLoss::StaleConnection => Ok(RelayLossOutcome::StaleConnection),
+            RelayConnectionLoss::LifecycleWorkerDetached => {
+                Ok(RelayLossOutcome::LifecycleWorkerDetached)
+            }
         }
     }
 
@@ -459,6 +545,84 @@ impl RelayOrchestrator {
         }
     }
 
+    async fn request_lifecycle_inner(
+        &self,
+        connection: &RelayConnection,
+        request: LifecycleRequestV1,
+    ) -> Result<RelayLifecycleOutcome, RelayLifecycleError> {
+        let reservation = match self.registry.begin_lifecycle(connection, request) {
+            LifecycleAdmission::Reserve(reservation) => reservation,
+            LifecycleAdmission::Coalesced => return Ok(RelayLifecycleOutcome::Coalesced),
+            LifecycleAdmission::Rejected(error) => {
+                return Err(RelayLifecycleError::Rendezvous(error));
+            }
+            LifecycleAdmission::ContainmentRequired { error, ticket } => {
+                self.persist_lifecycle_ticket(&ticket).await?;
+                return Err(RelayLifecycleError::Rendezvous(error));
+            }
+        };
+
+        let execution = match (*reservation).acquire().await {
+            LifecycleAcquireOutcome::Ready(execution) => *execution,
+            LifecycleAcquireOutcome::Rejected(error) => {
+                return Err(RelayLifecycleError::Rendezvous(error));
+            }
+            LifecycleAcquireOutcome::ContainmentRequired(ticket) => {
+                self.persist_lifecycle_ticket(&ticket).await?;
+                return Err(RelayLifecycleError::ResultDeliveryLost);
+            }
+        };
+
+        let service_outcome = match self.controller.lifecycle(execution.request()).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if let Some(ticket) = execution.defer_controller_error() {
+                    self.persist_lifecycle_ticket(&ticket).await?;
+                }
+                return Err(RelayLifecycleError::Controller(error));
+            }
+        };
+        let terminal = match service_outcome {
+            LifecycleServiceOutcome::ReleasePending => {
+                execution.defer_release_pending();
+                return Ok(RelayLifecycleOutcome::ReleasePending);
+            }
+            LifecycleServiceOutcome::SuspendAccepted => RelayLifecycleTerminal::Suspended,
+            LifecycleServiceOutcome::Released => RelayLifecycleTerminal::Released,
+        };
+
+        let result = ProtocolResultV1::ack(Some(execution.request().request_id()))
+            .expect("a validated lifecycle request has a non-nil request ID");
+        let delivery = execution
+            .queue_result(ControllerToBridgeV1::ProtocolResult(result), terminal)
+            .map_err(RelayLifecycleError::Rendezvous)?;
+        match delivery.wait().await {
+            LifecycleDeliveryOutcome::Written(RelayLifecycleTerminal::Suspended) => {
+                Ok(RelayLifecycleOutcome::Suspended)
+            }
+            LifecycleDeliveryOutcome::Written(RelayLifecycleTerminal::Released) => {
+                Ok(RelayLifecycleOutcome::Released)
+            }
+            LifecycleDeliveryOutcome::ContainmentRequired(ticket) => {
+                self.persist_lifecycle_ticket(&ticket).await?;
+                Err(RelayLifecycleError::ResultDeliveryLost)
+            }
+            LifecycleDeliveryOutcome::Lost => Err(RelayLifecycleError::ResultDeliveryLost),
+        }
+    }
+
+    async fn persist_lifecycle_ticket(
+        &self,
+        ticket: &RelayContainmentTicket,
+    ) -> Result<(), RelayLifecycleError> {
+        self.controller
+            .connection_lost(ticket.authority())
+            .await
+            .map_err(RelayLifecycleError::Controller)?;
+        self.registry.complete_containment(ticket);
+        Ok(())
+    }
+
     async fn register_worker_inner(
         &self,
         registration: WorkerRegistrationV1,
@@ -529,6 +693,7 @@ impl RelayOrchestrator {
         {
             RelayConnectionLoss::ContainmentRequired(ticket) => ticket,
             RelayConnectionLoss::AlreadyQuiescing => return Ok(()),
+            RelayConnectionLoss::LifecycleWorkerDetached => return Ok(()),
             RelayConnectionLoss::StaleConnection => {
                 return self.controller.connection_lost(authority).await.map(|_| ());
             }
@@ -574,6 +739,7 @@ impl RelayOrchestrator {
                 Ok(())
             }
             RelayConnectionLoss::AlreadyQuiescing => Ok(()),
+            RelayConnectionLoss::LifecycleWorkerDetached => Ok(()),
             RelayConnectionLoss::StaleConnection => {
                 self.controller.connection_lost(authority).await.map(|_| ())
             }
@@ -596,7 +762,7 @@ impl RelayOrchestrator {
                 RelayPairingOutcome::AwaitingPeer | RelayPairingOutcome::Active => break,
                 RelayPairingOutcome::Backpressured => {
                     if pairing_waiter.is_none() {
-                        pairing_waiter = Some(self.registry.begin_pairing_wait());
+                        pairing_waiter = Some(self.registry.begin_control_wait());
                     }
                     pairing = self.registry.retry_pairing(session_id);
                     if pairing != RelayPairingOutcome::Backpressured {
@@ -707,8 +873,10 @@ mod tests {
     use crate::state::Fence;
     use crate::wire::{
         decode_frame, ActivationResponseV1, BrokerMappingExpectationV1, ControllerToWorkerV1,
-        HandshakeOutcomeV1, ValidatedActivationOutcomeV1, WireMessage, MAX_PROFILE_VERSION_BYTES,
+        HandshakeOutcomeV1, SessionBindingV1, ValidatedActivationOutcomeV1, WireMessage,
+        MAX_PROFILE_VERSION_BYTES,
     };
+    use serde_json::json;
     use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
     use std::sync::Mutex;
     use tokio::sync::Semaphore;
@@ -754,7 +922,10 @@ mod tests {
         registration_fails: AtomicBool,
         activation_gate: Mutex<Option<Gate>>,
         registration_gate: Mutex<Option<Gate>>,
+        lifecycle_gate: Mutex<Option<Gate>>,
         loss_gate: Mutex<Option<Gate>>,
+        lifecycle_outcome: AtomicU8,
+        lifecycle_calls: AtomicUsize,
         loss_failures: AtomicUsize,
         loss_outcome: AtomicU8,
         losses: AtomicUsize,
@@ -771,7 +942,10 @@ mod tests {
                 registration_fails: AtomicBool::new(false),
                 activation_gate: Mutex::new(None),
                 registration_gate: Mutex::new(None),
+                lifecycle_gate: Mutex::new(None),
                 loss_gate: Mutex::new(None),
+                lifecycle_outcome: AtomicU8::new(0),
+                lifecycle_calls: AtomicUsize::new(0),
                 loss_failures: AtomicUsize::new(0),
                 loss_outcome: AtomicU8::new(0),
                 losses: AtomicUsize::new(0),
@@ -784,6 +958,25 @@ mod tests {
 
         fn set_registration_gate(&self, gate: Gate) {
             *self.registration_gate.lock().unwrap() = Some(gate);
+        }
+
+        fn set_lifecycle_gate(&self, gate: Gate) {
+            *self.lifecycle_gate.lock().unwrap() = Some(gate);
+        }
+
+        fn set_lifecycle_outcome(&self, outcome: LifecycleServiceOutcome) {
+            self.lifecycle_outcome.store(
+                match outcome {
+                    LifecycleServiceOutcome::SuspendAccepted => 0,
+                    LifecycleServiceOutcome::ReleasePending => 1,
+                    LifecycleServiceOutcome::Released => 2,
+                },
+                Ordering::SeqCst,
+            );
+        }
+
+        fn fail_lifecycle(&self) {
+            self.lifecycle_outcome.store(3, Ordering::SeqCst);
         }
 
         fn set_loss_gate(&self, gate: Gate) {
@@ -889,6 +1082,23 @@ mod tests {
                 })
             }
         }
+
+        async fn lifecycle(
+            &self,
+            _request: &LifecycleRequestV1,
+        ) -> Result<LifecycleServiceOutcome, ControllerServiceError> {
+            let gate = self.lifecycle_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.wait().await;
+            }
+            self.lifecycle_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(match self.lifecycle_outcome.load(Ordering::SeqCst) {
+                0 => LifecycleServiceOutcome::SuspendAccepted,
+                1 => LifecycleServiceOutcome::ReleasePending,
+                2 => LifecycleServiceOutcome::Released,
+                _ => return Err(ControllerServiceError::ScopeMismatch),
+            })
+        }
     }
 
     fn scope_id() -> ScopeId {
@@ -919,6 +1129,16 @@ mod tests {
         .unwrap()
     }
 
+    fn other_binding() -> SessionBinding {
+        SessionBinding::new(
+            scope_id(),
+            SessionId::derive(RAW_SCOPE, "discord:relay-orchestrator-other"),
+            Fence::new(1, Uuid::from_u128(0x103)).unwrap(),
+            Uuid::from_u128(0x203),
+        )
+        .unwrap()
+    }
+
     fn profile() -> ProfileRef {
         ProfileRef::new(PROFILE_NAME, PROFILE_VERSION).unwrap()
     }
@@ -936,6 +1156,25 @@ mod tests {
 
     fn registration() -> WorkerRegistrationV1 {
         WorkerRegistrationV1::new(&binding())
+    }
+
+    fn lifecycle_request_for(
+        binding: &SessionBinding,
+        kind: &str,
+        request_id: u128,
+    ) -> LifecycleRequestV1 {
+        serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "requestId": Uuid::from_u128(request_id),
+            "kind": kind,
+            "binding": serde_json::to_value(SessionBindingV1::from(binding)).unwrap(),
+            "workerSessionId": "opaque-worker-session",
+        }))
+        .unwrap()
+    }
+
+    fn lifecycle_request(kind: &str, request_id: u128) -> LifecycleRequestV1 {
+        lifecycle_request_for(&binding(), kind, request_id)
     }
 
     fn auth() -> WorkerBootstrapAuth {
@@ -970,8 +1209,28 @@ mod tests {
         mpsc::Receiver<RelayOutboundItem<ControllerToBridgeV1>>,
         mpsc::Receiver<RelayOutboundItem<ControllerToWorkerV1>>,
     ) {
-        let authority = OrphanAuthority::new(binding(), POD_UID).unwrap();
-        let request = activation_request(BrokerMappingExpectationV1::Absent);
+        install_active_pair_for(registry, binding(), POD_UID)
+    }
+
+    fn install_active_pair_for(
+        registry: &RendezvousRegistry,
+        binding: SessionBinding,
+        pod_uid: &str,
+    ) -> (
+        crate::controller::RelayInstallation,
+        crate::controller::RelayInstallation,
+        mpsc::Receiver<RelayOutboundItem<ControllerToBridgeV1>>,
+        mpsc::Receiver<RelayOutboundItem<ControllerToWorkerV1>>,
+    ) {
+        let authority = OrphanAuthority::new(binding.clone(), pod_uid).unwrap();
+        let request = ActivationRequestV1::new(
+            binding.scope_id(),
+            binding.session_id(),
+            binding.fence().attempt_id(),
+            PROFILE_NAME,
+            BrokerMappingExpectationV1::Absent,
+        )
+        .unwrap();
         let pending = PendingActivation::new(&request, profile(), &authority).unwrap();
         let (bridge_sender, bridge_receiver) = mpsc::channel(1);
         let bridge = registry
@@ -993,6 +1252,30 @@ mod tests {
         })
         .await
         .expect("containment should be scheduled promptly");
+    }
+
+    async fn wait_for_lifecycle_calls(controller: &FakeController, expected: usize) {
+        timeout(Duration::from_secs(1), async {
+            while controller.lifecycle_calls.load(Ordering::SeqCst) < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the lifecycle call should be scheduled promptly");
+    }
+
+    fn drain_installed_handshake(
+        bridge: &mut mpsc::Receiver<RelayOutboundItem<ControllerToBridgeV1>>,
+        worker: &mut mpsc::Receiver<RelayOutboundItem<ControllerToWorkerV1>>,
+    ) {
+        assert!(matches!(
+            decode_outbound(bridge.try_recv().unwrap()),
+            ControllerToBridgeV1::Activation(_)
+        ));
+        assert!(matches!(
+            decode_outbound(worker.try_recv().unwrap()),
+            ControllerToWorkerV1::ProtocolResult(_)
+        ));
     }
 
     async fn wait_for_pairing_pressure(registry: &RendezvousRegistry) {
@@ -1043,6 +1326,807 @@ mod tests {
             ValidatedActivationOutcomeV1::Activated { worker_cwd, .. }
                 if worker_cwd == "/session/workspace"
         ));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_blocks_both_acp_directions_until_the_correlated_ack_is_written() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let (relay, registry) = orchestrator(Arc::clone(&controller));
+        let (bridge, worker, mut bridge_outbound, mut worker_outbound) =
+            install_original_active_pair(&registry);
+        drain_installed_handshake(&mut bridge_outbound, &mut worker_outbound);
+        let request = lifecycle_request("suspend", 0x401);
+        let call = tokio::spawn({
+            let relay = relay.clone();
+            let connection = bridge.connection().clone();
+            let request = request.clone();
+            async move { relay.request_lifecycle(&connection, request).await }
+        });
+
+        wait_for_lifecycle_calls(&controller, 1).await;
+        assert_eq!(
+            registry.route_acp(
+                bridge.connection(),
+                AcpMessageV1::new(json!({"a": 1})).unwrap()
+            ),
+            Err(RendezvousRouteError::LifecyclePending)
+        );
+        assert_eq!(
+            registry.route_acp(
+                worker.connection(),
+                AcpMessageV1::new(json!({"b": 2})).unwrap()
+            ),
+            Err(RendezvousRouteError::LifecyclePending)
+        );
+
+        let frame = bridge_outbound
+            .recv()
+            .await
+            .unwrap()
+            .into_encoded_frame()
+            .unwrap();
+        let ControllerToBridgeV1::ProtocolResult(result) = decode_frame(frame.as_bytes()).unwrap()
+        else {
+            panic!("suspend must emit a correlated protocol result")
+        };
+        assert_eq!(result.into_lifecycle_outcome(&request).unwrap(), None);
+        assert!(!call.is_finished());
+        frame.mark_written();
+        assert_eq!(
+            call.await.unwrap().unwrap(),
+            RelayLifecycleOutcome::Suspended
+        );
+        assert_eq!(
+            registry.route_target(bridge.connection()),
+            Err(RendezvousRouteError::StaleConnection)
+        );
+    }
+
+    #[tokio::test]
+    async fn release_pending_keeps_the_bridge_and_exact_request_for_a_later_pass() {
+        let controller = Arc::new(FakeController::new(binding()));
+        controller.set_lifecycle_outcome(LifecycleServiceOutcome::ReleasePending);
+        let (relay, registry) = orchestrator(Arc::clone(&controller));
+        let (bridge, worker, mut bridge_outbound, mut worker_outbound) =
+            install_original_active_pair(&registry);
+        drain_installed_handshake(&mut bridge_outbound, &mut worker_outbound);
+        let request = lifecycle_request("release", 0x402);
+
+        assert_eq!(
+            relay
+                .request_lifecycle(bridge.connection(), request.clone())
+                .await
+                .unwrap(),
+            RelayLifecycleOutcome::ReleasePending
+        );
+        assert!(matches!(
+            bridge_outbound.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            registry.begin_connection_loss(worker.connection()),
+            RelayConnectionLoss::LifecycleWorkerDetached
+        );
+        assert_eq!(controller.losses.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            registry.route_acp(
+                bridge.connection(),
+                AcpMessageV1::new(json!({"x": 1})).unwrap()
+            ),
+            Err(RendezvousRouteError::LifecyclePending)
+        );
+
+        controller.set_lifecycle_outcome(LifecycleServiceOutcome::Released);
+        let final_call = tokio::spawn({
+            let relay = relay.clone();
+            let connection = bridge.connection().clone();
+            let request = request.clone();
+            async move { relay.request_lifecycle(&connection, request).await }
+        });
+        wait_for_lifecycle_calls(&controller, 2).await;
+        let frame = bridge_outbound
+            .recv()
+            .await
+            .unwrap()
+            .into_encoded_frame()
+            .unwrap();
+        let ControllerToBridgeV1::ProtocolResult(result) = decode_frame(frame.as_bytes()).unwrap()
+        else {
+            panic!("final release must emit one correlated protocol result")
+        };
+        assert_eq!(result.into_lifecycle_outcome(&request).unwrap(), None);
+        frame.mark_written();
+        assert_eq!(
+            final_call.await.unwrap().unwrap(),
+            RelayLifecycleOutcome::Released
+        );
+        assert_eq!(controller.losses.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn accepted_release_survives_retry_pressure_worker_detach_and_controller_error() {
+        let budget = RelayByteBudget::new(NonZeroUsize::new(4 * 64 * 1024).unwrap()).unwrap();
+        let controller = Arc::new(FakeController::new(binding()));
+        controller.set_lifecycle_outcome(LifecycleServiceOutcome::ReleasePending);
+        let (relay, registry) = orchestrator_with_budget(Arc::clone(&controller), budget.clone());
+        let (bridge, worker, mut bridge_outbound, mut worker_outbound) =
+            install_original_active_pair(&registry);
+        drain_installed_handshake(&mut bridge_outbound, &mut worker_outbound);
+        let request = lifecycle_request("release", 0x411);
+        assert_eq!(
+            relay
+                .request_lifecycle(bridge.connection(), request.clone())
+                .await
+                .unwrap(),
+            RelayLifecycleOutcome::ReleasePending
+        );
+
+        let held_bytes = budget.hold_for_test(4 * 64 * 1024);
+        controller.fail_lifecycle();
+        let retry = tokio::spawn({
+            let relay = relay.clone();
+            let connection = bridge.connection().clone();
+            let request = request.clone();
+            async move { relay.request_lifecycle(&connection, request).await }
+        });
+        timeout(Duration::from_secs(1), async {
+            while budget.control_waiters_for_test() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the accepted release retry must wait for process bytes");
+        assert_eq!(
+            registry.begin_connection_loss(worker.connection()),
+            RelayConnectionLoss::LifecycleWorkerDetached
+        );
+        drop(held_bytes);
+        assert!(matches!(
+            retry.await.unwrap(),
+            Err(RelayLifecycleError::Controller(
+                ControllerServiceError::ScopeMismatch
+            ))
+        ));
+        assert_eq!(controller.losses.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            registry.route_target(bridge.connection()),
+            Err(RendezvousRouteError::LifecyclePending)
+        );
+
+        controller.set_lifecycle_outcome(LifecycleServiceOutcome::Released);
+        let final_call = tokio::spawn({
+            let relay = relay.clone();
+            let connection = bridge.connection().clone();
+            let request = request.clone();
+            async move { relay.request_lifecycle(&connection, request).await }
+        });
+        wait_for_lifecycle_calls(&controller, 3).await;
+        let frame = bridge_outbound
+            .recv()
+            .await
+            .unwrap()
+            .into_encoded_frame()
+            .unwrap();
+        frame.mark_written();
+        assert_eq!(
+            final_call.await.unwrap().unwrap(),
+            RelayLifecycleOutcome::Released
+        );
+        assert_eq!(controller.losses.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_reserves_bridge_capacity_before_controller_mutation() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let (relay, registry) = orchestrator(Arc::clone(&controller));
+        let (bridge, worker, mut bridge_outbound, mut worker_outbound) =
+            install_original_active_pair(&registry);
+        drain_installed_handshake(&mut bridge_outbound, &mut worker_outbound);
+        assert_eq!(
+            registry.route_acp(
+                worker.connection(),
+                AcpMessageV1::new(json!({"queued": true})).unwrap(),
+            ),
+            Ok(AcpRouteOutcome::Delivered)
+        );
+        let request = lifecycle_request("suspend", 0x403);
+        let call = tokio::spawn({
+            let relay = relay.clone();
+            let connection = bridge.connection().clone();
+            let request = request.clone();
+            async move { relay.request_lifecycle(&connection, request).await }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(controller.lifecycle_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            registry.route_target(bridge.connection()),
+            Err(RendezvousRouteError::LifecyclePending)
+        );
+
+        let queued_acp = bridge_outbound.recv().await.unwrap();
+        drop(queued_acp);
+        wait_for_lifecycle_calls(&controller, 1).await;
+        let frame = bridge_outbound
+            .recv()
+            .await
+            .unwrap()
+            .into_encoded_frame()
+            .unwrap();
+        frame.mark_written();
+        assert_eq!(
+            call.await.unwrap().unwrap(),
+            RelayLifecycleOutcome::Suspended
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_bridge_result_queue_contains_before_controller_mutation() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let (relay, registry) = orchestrator(Arc::clone(&controller));
+        let (bridge, _worker, mut bridge_outbound, mut worker_outbound) =
+            install_original_active_pair(&registry);
+        drain_installed_handshake(&mut bridge_outbound, &mut worker_outbound);
+        drop(bridge_outbound);
+
+        assert!(matches!(
+            relay
+                .request_lifecycle(bridge.connection(), lifecycle_request("suspend", 0x40c))
+                .await,
+            Err(RelayLifecycleError::ResultDeliveryLost)
+        ));
+        assert_eq!(controller.lifecycle_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(controller.losses.load(Ordering::SeqCst), 1);
+        assert!(registry.pending_containments().is_empty());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_control_reservation_cannot_be_starved_by_new_acp() {
+        let budget = RelayByteBudget::new(
+            NonZeroUsize::new(crate::controller::MIN_RELAY_BYTE_BUDGET).unwrap(),
+        )
+        .unwrap();
+        let controller_a = Arc::new(FakeController::new(binding()));
+        let controller_b = Arc::new(FakeController::new(other_binding()));
+        let (relay_a, registry_a) =
+            orchestrator_with_budget(Arc::clone(&controller_a), budget.clone());
+        let (_relay_b, registry_b) =
+            orchestrator_with_budget(Arc::clone(&controller_b), budget.clone());
+        let (bridge_a, _worker_a, mut bridge_outbound_a, mut worker_outbound_a) =
+            install_active_pair_for(&registry_a, binding(), POD_UID);
+        drain_installed_handshake(&mut bridge_outbound_a, &mut worker_outbound_a);
+        let (bridge_b, _worker_b, mut bridge_outbound_b, mut worker_outbound_b) =
+            install_active_pair_for(&registry_b, other_binding(), "worker-pod-uid-other");
+        drain_installed_handshake(&mut bridge_outbound_b, &mut worker_outbound_b);
+
+        let held_message = AcpMessageV1::new(json!({"held": true})).unwrap();
+        assert_eq!(
+            registry_a.route_acp(bridge_a.connection(), held_message),
+            Ok(AcpRouteOutcome::Delivered)
+        );
+        let held_item = worker_outbound_a.recv().await.unwrap();
+        let request = lifecycle_request("suspend", 0x408);
+        let call = tokio::spawn({
+            let relay = relay_a.clone();
+            let connection = bridge_a.connection().clone();
+            let request = request.clone();
+            async move { relay.request_lifecycle(&connection, request).await }
+        });
+        timeout(Duration::from_secs(1), async {
+            while budget.control_waiters_for_test() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("lifecycle must register control-byte priority");
+        assert_eq!(controller_a.lifecycle_calls.load(Ordering::SeqCst), 0);
+
+        drop(held_item);
+        let competing = AcpMessageV1::new(json!({"competing": true})).unwrap();
+        assert_eq!(
+            registry_b.route_acp(bridge_b.connection(), competing.clone()),
+            Ok(AcpRouteOutcome::Backpressured {
+                message: competing.clone(),
+                reason: RelayBackpressure::ProcessBytes,
+            })
+        );
+        wait_for_lifecycle_calls(&controller_a, 1).await;
+        assert_eq!(budget.control_waiters_for_test(), 0);
+        let frame = bridge_outbound_a
+            .recv()
+            .await
+            .unwrap()
+            .into_encoded_frame()
+            .unwrap();
+        frame.mark_written();
+        assert_eq!(
+            call.await.unwrap().unwrap(),
+            RelayLifecycleOutcome::Suspended
+        );
+        assert_eq!(
+            registry_b.route_acp(bridge_b.connection(), competing.clone()),
+            Ok(AcpRouteOutcome::Delivered)
+        );
+        assert_eq!(
+            decode_outbound(worker_outbound_b.recv().await.unwrap()),
+            ControllerToWorkerV1::Acp(competing)
+        );
+    }
+
+    #[tokio::test]
+    async fn conflicting_lifecycle_request_contains_the_exact_pair_without_ack() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let gate = Gate::new();
+        controller.set_lifecycle_gate(gate.clone());
+        let (relay, registry) = orchestrator(Arc::clone(&controller));
+        let (bridge, _worker, mut bridge_outbound, mut worker_outbound) =
+            install_original_active_pair(&registry);
+        drain_installed_handshake(&mut bridge_outbound, &mut worker_outbound);
+        let request = lifecycle_request("suspend", 0x404);
+        let first = tokio::spawn({
+            let relay = relay.clone();
+            let connection = bridge.connection().clone();
+            let request = request.clone();
+            async move { relay.request_lifecycle(&connection, request).await }
+        });
+        gate.started.acquire().await.unwrap().forget();
+
+        assert_eq!(
+            relay
+                .request_lifecycle(bridge.connection(), request.clone())
+                .await
+                .unwrap(),
+            RelayLifecycleOutcome::Coalesced
+        );
+        let mut conflicting_value = serde_json::to_value(&request).unwrap();
+        conflicting_value["workerSessionId"] = json!("different-worker-session");
+        let conflicting: LifecycleRequestV1 = serde_json::from_value(conflicting_value).unwrap();
+        assert!(matches!(
+            relay
+                .request_lifecycle(bridge.connection(), conflicting)
+                .await,
+            Err(RelayLifecycleError::Rendezvous(
+                RendezvousLifecycleError::ConflictingRequest
+            ))
+        ));
+        assert_eq!(controller.losses.load(Ordering::SeqCst), 1);
+        gate.release.add_permits(1);
+        assert!(matches!(
+            first.await.unwrap(),
+            Err(RelayLifecycleError::Rendezvous(
+                RendezvousLifecycleError::ReservationLost
+            ))
+        ));
+        assert!(matches!(
+            bridge_outbound.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[tokio::test]
+    async fn worker_lane_and_foreign_binding_are_rejected_before_controller_io() {
+        let wrong_lane_controller = Arc::new(FakeController::new(binding()));
+        let (wrong_lane_relay, wrong_lane_registry) =
+            orchestrator(Arc::clone(&wrong_lane_controller));
+        let (_bridge, worker, mut bridge_outbound, mut worker_outbound) =
+            install_original_active_pair(&wrong_lane_registry);
+        drain_installed_handshake(&mut bridge_outbound, &mut worker_outbound);
+        assert!(matches!(
+            wrong_lane_relay
+                .request_lifecycle(worker.connection(), lifecycle_request("suspend", 0x40a))
+                .await,
+            Err(RelayLifecycleError::Rendezvous(
+                RendezvousLifecycleError::WrongLane
+            ))
+        ));
+        assert_eq!(
+            wrong_lane_controller.lifecycle_calls.load(Ordering::SeqCst),
+            0
+        );
+        assert_eq!(wrong_lane_controller.losses.load(Ordering::SeqCst), 1);
+
+        let wrong_binding_controller = Arc::new(FakeController::new(binding()));
+        let (wrong_binding_relay, wrong_binding_registry) =
+            orchestrator(Arc::clone(&wrong_binding_controller));
+        let (bridge, _worker, mut bridge_outbound, mut worker_outbound) =
+            install_original_active_pair(&wrong_binding_registry);
+        drain_installed_handshake(&mut bridge_outbound, &mut worker_outbound);
+        assert!(matches!(
+            wrong_binding_relay
+                .request_lifecycle(
+                    bridge.connection(),
+                    lifecycle_request_for(&other_binding(), "suspend", 0x40b),
+                )
+                .await,
+            Err(RelayLifecycleError::Rendezvous(
+                RendezvousLifecycleError::BindingMismatch
+            ))
+        ));
+        assert_eq!(
+            wrong_binding_controller
+                .lifecycle_calls
+                .load(Ordering::SeqCst),
+            0
+        );
+        assert_eq!(wrong_binding_controller.losses.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_controller_error_keeps_the_exact_request_fail_closed_for_retry() {
+        let controller = Arc::new(FakeController::new(binding()));
+        controller.fail_lifecycle();
+        let (relay, registry) = orchestrator(Arc::clone(&controller));
+        let (bridge, worker, mut bridge_outbound, mut worker_outbound) =
+            install_original_active_pair(&registry);
+        drain_installed_handshake(&mut bridge_outbound, &mut worker_outbound);
+        let request = lifecycle_request("release", 0x405);
+
+        assert!(matches!(
+            relay
+                .request_lifecycle(bridge.connection(), request.clone())
+                .await,
+            Err(RelayLifecycleError::Controller(
+                ControllerServiceError::ScopeMismatch
+            ))
+        ));
+        assert_eq!(
+            registry.route_acp(
+                bridge.connection(),
+                AcpMessageV1::new(json!({"a": 1})).unwrap()
+            ),
+            Err(RendezvousRouteError::LifecyclePending)
+        );
+        assert_eq!(
+            registry.route_acp(
+                worker.connection(),
+                AcpMessageV1::new(json!({"b": 2})).unwrap()
+            ),
+            Err(RendezvousRouteError::LifecyclePending)
+        );
+        assert!(matches!(
+            bridge_outbound.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        controller.set_lifecycle_outcome(LifecycleServiceOutcome::Released);
+        let retry = tokio::spawn({
+            let relay = relay.clone();
+            let connection = bridge.connection().clone();
+            let request = request.clone();
+            async move { relay.request_lifecycle(&connection, request).await }
+        });
+        wait_for_lifecycle_calls(&controller, 2).await;
+        let frame = bridge_outbound
+            .recv()
+            .await
+            .unwrap()
+            .into_encoded_frame()
+            .unwrap();
+        frame.mark_written();
+        assert_eq!(
+            retry.await.unwrap().unwrap(),
+            RelayLifecycleOutcome::Released
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_loss_after_controller_error_requires_containment() {
+        let controller = Arc::new(FakeController::new(binding()));
+        controller.fail_lifecycle();
+        let (relay, registry) = orchestrator(Arc::clone(&controller));
+        let (bridge, worker, mut bridge_outbound, mut worker_outbound) =
+            install_original_active_pair(&registry);
+        drain_installed_handshake(&mut bridge_outbound, &mut worker_outbound);
+
+        assert!(matches!(
+            relay
+                .request_lifecycle(bridge.connection(), lifecycle_request("release", 0x40e))
+                .await,
+            Err(RelayLifecycleError::Controller(
+                ControllerServiceError::ScopeMismatch
+            ))
+        ));
+        let RelayConnectionLoss::ContainmentRequired(ticket) =
+            registry.begin_connection_loss(worker.connection())
+        else {
+            panic!("worker loss after a failed lifecycle pass must be contained")
+        };
+        assert_eq!(ticket.trigger(), worker.connection());
+        controller
+            .connection_lost(ticket.authority())
+            .await
+            .unwrap();
+        assert_eq!(
+            registry.complete_containment(&ticket),
+            RelayContainmentCompletion::Removed
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_loss_before_controller_io_requires_containment() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let (relay, registry) = orchestrator(Arc::clone(&controller));
+        let (bridge, worker, mut bridge_outbound, mut worker_outbound) =
+            install_original_active_pair(&registry);
+        drain_installed_handshake(&mut bridge_outbound, &mut worker_outbound);
+        assert_eq!(
+            registry.route_acp(
+                worker.connection(),
+                AcpMessageV1::new(json!({"occupiesBridgeQueue": true})).unwrap(),
+            ),
+            Ok(AcpRouteOutcome::Delivered)
+        );
+        let call = tokio::spawn({
+            let relay = relay.clone();
+            let connection = bridge.connection().clone();
+            async move {
+                relay
+                    .request_lifecycle(&connection, lifecycle_request("suspend", 0x40f))
+                    .await
+            }
+        });
+        timeout(Duration::from_secs(1), async {
+            while registry.route_target(bridge.connection())
+                != Err(RendezvousRouteError::LifecyclePending)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the lifecycle request must fence ACP before waiting for queue space");
+
+        let RelayConnectionLoss::ContainmentRequired(ticket) =
+            registry.begin_connection_loss(worker.connection())
+        else {
+            panic!("pre-controller worker loss must be contained")
+        };
+        assert_eq!(controller.lifecycle_calls.load(Ordering::SeqCst), 0);
+        controller
+            .connection_lost(ticket.authority())
+            .await
+            .unwrap();
+        assert_eq!(
+            registry.complete_containment(&ticket),
+            RelayContainmentCompletion::Removed
+        );
+        let result = timeout(Duration::from_secs(1), call)
+            .await
+            .expect("quiescing must cancel the lifecycle queue-capacity wait")
+            .unwrap();
+        assert!(matches!(
+            result,
+            Err(RelayLifecycleError::Rendezvous(
+                RendezvousLifecycleError::Quiescing
+            ))
+        ));
+        drop(bridge_outbound.recv().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn quiescing_cancels_lifecycle_byte_wait_without_waiting_for_a_release() {
+        let budget = RelayByteBudget::new(
+            NonZeroUsize::new(crate::controller::MIN_RELAY_BYTE_BUDGET).unwrap(),
+        )
+        .unwrap();
+        let controller = Arc::new(FakeController::new(binding()));
+        let (relay, registry) = orchestrator_with_budget(Arc::clone(&controller), budget.clone());
+        let (bridge, worker, mut bridge_outbound, mut worker_outbound) =
+            install_original_active_pair(&registry);
+        drain_installed_handshake(&mut bridge_outbound, &mut worker_outbound);
+        let held_bytes = budget.hold_for_test(crate::controller::MIN_RELAY_BYTE_BUDGET);
+        let call = tokio::spawn({
+            let relay = relay.clone();
+            let connection = bridge.connection().clone();
+            async move {
+                relay
+                    .request_lifecycle(&connection, lifecycle_request("suspend", 0x410))
+                    .await
+            }
+        });
+        timeout(Duration::from_secs(1), async {
+            while budget.control_waiters_for_test() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the lifecycle request must wait for process bytes");
+
+        let RelayConnectionLoss::ContainmentRequired(ticket) =
+            registry.begin_connection_loss(worker.connection())
+        else {
+            panic!("worker loss before controller I/O must quiesce the byte waiter")
+        };
+        controller
+            .connection_lost(ticket.authority())
+            .await
+            .unwrap();
+        registry.complete_containment(&ticket);
+        let result = timeout(Duration::from_secs(1), call)
+            .await
+            .expect("quiescing must wake the lifecycle byte wait")
+            .unwrap();
+        assert!(matches!(
+            result,
+            Err(RelayLifecycleError::Rendezvous(
+                RendezvousLifecycleError::Quiescing
+            ))
+        ));
+        assert_eq!(controller.lifecycle_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(budget.control_waiters_for_test(), 0);
+        drop(held_bytes);
+    }
+
+    #[tokio::test]
+    async fn controller_error_contains_a_worker_that_detached_during_the_lifecycle_pass() {
+        let controller = Arc::new(FakeController::new(binding()));
+        controller.fail_lifecycle();
+        let gate = Gate::new();
+        controller.set_lifecycle_gate(gate.clone());
+        let (relay, registry) = orchestrator(Arc::clone(&controller));
+        let (bridge, worker, mut bridge_outbound, mut worker_outbound) =
+            install_original_active_pair(&registry);
+        drain_installed_handshake(&mut bridge_outbound, &mut worker_outbound);
+        let call = tokio::spawn({
+            let relay = relay.clone();
+            let connection = bridge.connection().clone();
+            async move {
+                relay
+                    .request_lifecycle(&connection, lifecycle_request("release", 0x40d))
+                    .await
+            }
+        });
+        gate.started.acquire().await.unwrap().forget();
+        assert_eq!(
+            registry.begin_connection_loss(worker.connection()),
+            RelayConnectionLoss::LifecycleWorkerDetached
+        );
+        gate.release.add_permits(1);
+
+        assert!(matches!(
+            call.await.unwrap(),
+            Err(RelayLifecycleError::Controller(
+                ControllerServiceError::ScopeMismatch
+            ))
+        ));
+        assert_eq!(controller.losses.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            registry.route_target(bridge.connection()),
+            Err(RendezvousRouteError::StaleConnection)
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_a_lifecycle_result_frame_contains_instead_of_completing() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let (relay, registry) = orchestrator(Arc::clone(&controller));
+        let (bridge, _worker, mut bridge_outbound, mut worker_outbound) =
+            install_original_active_pair(&registry);
+        drain_installed_handshake(&mut bridge_outbound, &mut worker_outbound);
+        let request = lifecycle_request("suspend", 0x406);
+        let call = tokio::spawn({
+            let relay = relay.clone();
+            let connection = bridge.connection().clone();
+            async move { relay.request_lifecycle(&connection, request).await }
+        });
+        wait_for_lifecycle_calls(&controller, 1).await;
+
+        let frame = bridge_outbound
+            .recv()
+            .await
+            .unwrap()
+            .into_encoded_frame()
+            .unwrap();
+        drop(frame);
+        assert!(matches!(
+            call.await.unwrap(),
+            Err(RelayLifecycleError::ResultDeliveryLost)
+        ));
+        assert_eq!(controller.losses.load(Ordering::SeqCst), 1);
+        assert!(registry.pending_containments().is_empty());
+        assert_eq!(
+            registry.route_target(bridge.connection()),
+            Err(RendezvousRouteError::StaleConnection)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_lifecycle_caller_cannot_cancel_mutation_or_delivery_fencing() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let gate = Gate::new();
+        controller.set_lifecycle_gate(gate.clone());
+        let (relay, registry) = orchestrator(Arc::clone(&controller));
+        let (bridge, _worker, mut bridge_outbound, mut worker_outbound) =
+            install_original_active_pair(&registry);
+        drain_installed_handshake(&mut bridge_outbound, &mut worker_outbound);
+        let call = tokio::spawn({
+            let relay = relay.clone();
+            let connection = bridge.connection().clone();
+            async move {
+                relay
+                    .request_lifecycle(&connection, lifecycle_request("suspend", 0x407))
+                    .await
+            }
+        });
+        gate.started.acquire().await.unwrap().forget();
+        call.abort();
+        gate.release.add_permits(1);
+
+        wait_for_lifecycle_calls(&controller, 1).await;
+        let frame = bridge_outbound
+            .recv()
+            .await
+            .unwrap()
+            .into_encoded_frame()
+            .unwrap();
+        frame.mark_written();
+        timeout(Duration::from_secs(1), async {
+            while registry.route_target(bridge.connection())
+                != Err(RendezvousRouteError::StaleConnection)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the controller-owned task must finish after its caller is gone");
+        assert_eq!(controller.losses.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn stale_write_completion_cannot_remove_a_replacement_generation() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let (relay, registry) = orchestrator(Arc::clone(&controller));
+        let (bridge, _worker, mut bridge_outbound, mut worker_outbound) =
+            install_original_active_pair(&registry);
+        drain_installed_handshake(&mut bridge_outbound, &mut worker_outbound);
+        let call = tokio::spawn({
+            let relay = relay.clone();
+            let connection = bridge.connection().clone();
+            async move {
+                relay
+                    .request_lifecycle(&connection, lifecycle_request("suspend", 0x409))
+                    .await
+            }
+        });
+        wait_for_lifecycle_calls(&controller, 1).await;
+        let stale_frame = bridge_outbound
+            .recv()
+            .await
+            .unwrap()
+            .into_encoded_frame()
+            .unwrap();
+
+        let RelayConnectionLoss::ContainmentRequired(ticket) =
+            registry.begin_connection_loss(bridge.connection())
+        else {
+            panic!("closing the result-owning bridge must require containment")
+        };
+        controller
+            .connection_lost(ticket.authority())
+            .await
+            .unwrap();
+        assert_eq!(
+            registry.complete_containment(&ticket),
+            RelayContainmentCompletion::Removed
+        );
+        let (
+            replacement_bridge,
+            replacement_worker,
+            mut replacement_bridge_outbound,
+            mut replacement_worker_outbound,
+        ) = install_active_pair_for(&registry, replacement_binding(), "replacement-pod-uid");
+        drain_installed_handshake(
+            &mut replacement_bridge_outbound,
+            &mut replacement_worker_outbound,
+        );
+
+        stale_frame.mark_written();
+        assert!(matches!(
+            call.await.unwrap(),
+            Err(RelayLifecycleError::ResultDeliveryLost)
+        ));
+        assert_eq!(
+            registry.route_target(replacement_bridge.connection()),
+            Ok(replacement_worker.connection().connection_id())
+        );
     }
 
     #[tokio::test]

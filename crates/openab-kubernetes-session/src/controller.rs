@@ -46,8 +46,8 @@ pub use registration::{
 };
 pub use relay::{
     BridgeOpenOutcome, RelayAcpDeliveryOutcome, RelayAttachment, RelayContainmentFailure,
-    RelayContainmentReport, RelayDeliveryError, RelayLossOutcome, RelayOpenError,
-    RelayOrchestrator,
+    RelayContainmentReport, RelayDeliveryError, RelayLifecycleError, RelayLifecycleOutcome,
+    RelayLossOutcome, RelayOpenError, RelayOrchestrator,
 };
 pub use release::{ReleaseCoordinator, ReleaseError, ReleaseOutcome};
 pub use rendezvous::{
@@ -55,7 +55,10 @@ pub use rendezvous::{
     RelayConnection, RelayConnectionId, RelayConnectionLoss, RelayContainmentCompletion,
     RelayContainmentTicket, RelayInstallation, RelayLane, RelayOutboundFrame, RelayOutboundItem,
     RelayPairingOutcome, RendezvousFatalError, RendezvousHealth, RendezvousInstallError,
-    RendezvousRegistry, RendezvousRouteError, MIN_RELAY_BYTE_BUDGET,
+    RendezvousLifecycleError, RendezvousRegistry, RendezvousRouteError, MIN_RELAY_BYTE_BUDGET,
+};
+pub(crate) use rendezvous::{
+    LifecycleAcquireOutcome, LifecycleAdmission, LifecycleDeliveryOutcome, RelayLifecycleTerminal,
 };
 pub use service::{
     ControllerService, ControllerServiceConfigError, ControllerServiceError,
