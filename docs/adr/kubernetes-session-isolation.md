@@ -373,6 +373,17 @@ ID)` before calling the controller; it must not briefly remove the slot and
 allow another socket with the same binding to install. A transient persistence
 failure keeps the slot quiescing and fail closed until retry succeeds.
 
+One process-local rendezvous entry retains the exact binding and Pod UID plus
+at most one bridge connection ID and one worker connection ID. The second lane
+is paired only when that complete authority matches; a duplicate lane or
+different generation never replaces an installed connection. Routing resolves
+an exact peer only while the entry is active. A close transition returns a
+retryable containment ticket containing both connection IDs, then releases the
+registry mutex before any controller or socket I/O. Failed or cancelled
+containment work remains discoverable from the quiescing registry; the entry is
+removed only after a non-error durable-containment result. A delayed completion
+ticket cannot remove a newer rendezvous.
+
 Controller restart discards every process-local authenticated lane. Before it
 admits relay traffic or reports readiness, the controller therefore lists all
 anchors and schedules every observed `Provisioning`, `Ready`, and `Busy`

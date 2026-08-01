@@ -7,6 +7,7 @@ mod lifecycle;
 mod locks;
 mod registration;
 mod release;
+mod rendezvous;
 mod service;
 
 pub use activation::{
@@ -43,6 +44,11 @@ pub use registration::{
     WorkerBootstrapAuthError,
 };
 pub use release::{ReleaseCoordinator, ReleaseError, ReleaseOutcome};
+pub use rendezvous::{
+    RelayConnection, RelayConnectionId, RelayConnectionLoss, RelayContainmentCompletion,
+    RelayContainmentTicket, RelayLane, RendezvousInstallError, RendezvousRegistry,
+    RendezvousRouteError,
+};
 pub use service::{
     ControllerService, ControllerServiceConfigError, ControllerServiceError,
     LifecycleServiceOutcome,
