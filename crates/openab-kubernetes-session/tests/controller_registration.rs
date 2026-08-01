@@ -7,10 +7,11 @@ use kube::client::Body;
 use kube::Client;
 use openab_kubernetes_session::bridge::SessionBinding;
 use openab_kubernetes_session::controller::{
-    ActivationCoordinator, ActivationError, ActivationTiming, BootstrapPresence, ConsumedBootstrap,
-    GenerationProvisioner, GenerationProvisionerError, ObservedWorker, RegistrationCoordinator,
-    RegistrationError, RegistrationProvisioner, RegistrationProvisionerError, RegistrationRecovery,
-    SessionLocks, VerifiedBootstrap, WorkerBootstrapAuth,
+    ActivationCoordinator, ActivationError, ActivationTiming, BootstrapPresence, CleanupProgress,
+    ConsumedBootstrap, GenerationProvisioner, GenerationProvisionerError, LifecycleProvisioner,
+    ObservedWorker, RegistrationCoordinator, RegistrationError, RegistrationProvisioner,
+    RegistrationProvisionerError, RegistrationRecovery, SessionLocks, VerifiedBootstrap,
+    WorkerBootstrapAuth,
 };
 use openab_kubernetes_session::identity::{ResourceNames, ScopeId, SessionId};
 use openab_kubernetes_session::resources::{
@@ -160,6 +161,16 @@ impl GenerationProvisioner for UnusedGenerationProvisioner {
         _profile: &MvpWorkerProfile,
     ) -> Result<ObservedWorker, GenerationProvisionerError> {
         panic!("an already Ready session must not provision a generation")
+    }
+}
+
+#[async_trait]
+impl LifecycleProvisioner for UnusedGenerationProvisioner {
+    async fn reconcile_compute_absent(
+        &self,
+        _anchor: &StoredAnchor,
+    ) -> Result<CleanupProgress, GenerationProvisionerError> {
+        Ok(CleanupProgress::Pending)
     }
 }
 
@@ -352,11 +363,13 @@ async fn shared_session_locks_serialize_activation_and_registration_coordinators
         profile(),
         Arc::new(fake),
     ));
+    let activation_provisioner = Arc::new(UnusedGenerationProvisioner);
     let activation_coordinator = Arc::new(ActivationCoordinator::new(
         ConfigMapAnchorStore::new(client, NAMESPACE, scope_id()).unwrap(),
         locks,
         profile(),
-        Arc::new(UnusedGenerationProvisioner),
+        activation_provisioner.clone(),
+        activation_provisioner,
     ));
     let anchor = provisioning_anchor(session_id("discord:shared-controller-lock"));
     let expected_binding = binding(&anchor);

@@ -102,6 +102,13 @@ fn suspending_anchor(session_id: SessionId, recorded_pod_uid: Option<&str>) -> S
     anchor
 }
 
+fn suspended_anchor(session_id: SessionId) -> SessionAnchorV1 {
+    let mut anchor = suspending_anchor(session_id, None);
+    let fence = anchor.fence().clone();
+    anchor.transition(&fence, SessionPhase::Suspended).unwrap();
+    anchor
+}
+
 fn profile() -> MvpWorkerProfile {
     profile_with_pins(None, None)
 }
@@ -2029,6 +2036,50 @@ async fn compute_cleanup_accepts_a_blocked_partial_generation_without_a_recorded
     send.send_response(missing_response());
     for path in [policy_path, account_path] {
         let (request, send) = handle.next_request().await.expect("cleanup GET");
+        assert_eq!(request.uri().path(), path);
+        send.send_response(missing_response());
+    }
+    respond_compute_absence_proof(&mut handle, session_id, 1).await;
+
+    assert!(matches!(
+        task.await.unwrap().unwrap(),
+        CleanupProgress::Absent(_)
+    ));
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn compute_cleanup_proves_a_suspended_generation_is_still_absent() {
+    let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+    let client = Client::new(service, "default");
+    let session_id = session_id("discord:cleanup-suspended-proof");
+    let anchor = suspended_anchor(session_id);
+    let mut handle = std::pin::pin!(handle);
+    let stored = load_stored_anchor(client.clone(), &mut handle, anchor).await;
+    let provisioner = KubernetesGenerationProvisioner::new(client, NAMESPACE, scope_id()).unwrap();
+    let task = tokio::spawn(async move { provisioner.reconcile_compute_absent(&stored).await });
+    let names = ResourceNames::new(session_id);
+
+    for path in [
+        format!(
+            "/api/v1/namespaces/{NAMESPACE}/pods/{}",
+            names.pod(1).unwrap()
+        ),
+        format!(
+            "/api/v1/namespaces/{NAMESPACE}/secrets/{}",
+            names.registration_secret(1).unwrap()
+        ),
+        format!(
+            "/apis/networking.k8s.io/v1/namespaces/{NAMESPACE}/networkpolicies/{}-net",
+            names.pod(1).unwrap()
+        ),
+        format!(
+            "/api/v1/namespaces/{NAMESPACE}/serviceaccounts/{}",
+            names.service_account(1).unwrap()
+        ),
+    ] {
+        let (request, send) = handle.next_request().await.expect("cleanup absence GET");
+        assert_eq!(request.method(), Method::GET);
         assert_eq!(request.uri().path(), path);
         send.send_response(missing_response());
     }

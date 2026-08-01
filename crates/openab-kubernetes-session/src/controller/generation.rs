@@ -159,6 +159,17 @@ impl ComputeAbsentProof {
     pub fn anchor_uid(&self) -> &str {
         &self.anchor_uid
     }
+
+    /// Check that this proof authorizes exactly the observed durable anchor.
+    /// Keeping the comparison beside the private constructor prevents
+    /// security-critical consumers from drifting to different field sets.
+    pub(super) fn matches_anchor(&self, anchor: &StoredAnchor) -> bool {
+        let state = anchor.state();
+        self.session_id == state.session_id()
+            && self.incarnation_id == state.incarnation_id()
+            && self.fence == *state.fence()
+            && self.anchor_uid == anchor.uid()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -417,7 +428,10 @@ impl KubernetesGenerationProvisioner {
         }
         if !matches!(
             anchor.state().phase(),
-            SessionPhase::Suspending | SessionPhase::Deleting | SessionPhase::Blocked
+            SessionPhase::Suspending
+                | SessionPhase::Suspended
+                | SessionPhase::Deleting
+                | SessionPhase::Blocked
         ) {
             return Err(GenerationProvisionerError::InvalidCleanupPhase {
                 phase: anchor.state().phase(),

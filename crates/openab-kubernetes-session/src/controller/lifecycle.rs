@@ -186,12 +186,7 @@ fn validate_absence_proof(
     observed: &StoredAnchor,
     proof: &ComputeAbsentProof,
 ) -> Result<(), LifecycleError> {
-    let state = observed.state();
-    if proof.session_id() != state.session_id()
-        || proof.incarnation_id() != state.incarnation_id()
-        || proof.fence() != state.fence()
-        || proof.anchor_uid() != observed.uid()
-    {
+    if !proof.matches_anchor(observed) {
         return Err(LifecycleError::ProofMismatch);
     }
     Ok(())

@@ -7,8 +7,8 @@ use kube::client::Body;
 use kube::Client;
 use openab_kubernetes_session::controller::{
     ActivationCoordinator, ActivationError, ActivationPreparation, ActivationTiming,
-    GenerationProvisioner, GenerationProvisionerError, ObservedWorker, ProvisionerOperation,
-    SessionLocks,
+    CleanupProgress, GenerationProvisioner, GenerationProvisionerError, LifecycleProvisioner,
+    ObservedWorker, ProvisionerOperation, SessionLocks,
 };
 use openab_kubernetes_session::identity::{ResourceNames, ScopeId, SessionId};
 use openab_kubernetes_session::resources::{
@@ -109,6 +109,16 @@ impl GenerationProvisioner for FakeProvisioner {
     }
 }
 
+#[async_trait]
+impl LifecycleProvisioner for FakeProvisioner {
+    async fn reconcile_compute_absent(
+        &self,
+        _anchor: &StoredAnchor,
+    ) -> Result<CleanupProgress, GenerationProvisionerError> {
+        Ok(CleanupProgress::Pending)
+    }
+}
+
 struct GateProvisioner {
     blocked_session: SessionId,
     block_once: AtomicBool,
@@ -146,6 +156,16 @@ impl GenerationProvisioner for GateProvisioner {
         _profile: &MvpWorkerProfile,
     ) -> Result<ObservedWorker, GenerationProvisionerError> {
         Ok(ObservedWorker::new(POD_UID).unwrap())
+    }
+}
+
+#[async_trait]
+impl LifecycleProvisioner for GateProvisioner {
+    async fn reconcile_compute_absent(
+        &self,
+        _anchor: &StoredAnchor,
+    ) -> Result<CleanupProgress, GenerationProvisionerError> {
+        Ok(CleanupProgress::Pending)
     }
 }
 
@@ -298,12 +318,15 @@ fn coordinator(
     coordinator_with(Arc::new(fake))
 }
 
-fn coordinator_with(
-    provisioner: Arc<dyn GenerationProvisioner>,
+fn coordinator_with<P>(
+    provisioner: Arc<P>,
 ) -> (
     Arc<ActivationCoordinator>,
     mock::Handle<Request<Body>, Response<Body>>,
-) {
+)
+where
+    P: GenerationProvisioner + LifecycleProvisioner + 'static,
+{
     let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
     let client = Client::new(service, "default");
     let store = ConfigMapAnchorStore::new(client, NAMESPACE, scope_id()).unwrap();
@@ -312,6 +335,7 @@ fn coordinator_with(
             store,
             SessionLocks::new(),
             profile(),
+            provisioner.clone(),
             provisioner,
         )),
         handle,
@@ -812,7 +836,7 @@ async fn existing_phase_and_mapping_expectation_table_is_fail_closed() {
     for phase in [SessionPhase::Suspended, SessionPhase::Blocked] {
         assert!(matches!(
             classify_existing(phase, BrokerMappingExpectationV1::Present).await,
-            ActivationError::ResumeDeferred { phase: actual } if actual == phase
+            ActivationError::ResumeCleanupPending
         ));
     }
 }
