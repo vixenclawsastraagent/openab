@@ -219,8 +219,11 @@ initialization response using the original request ID and attempt ID; it never
 creates a worker-facing ACP lane. Startup has one fixed deadline across control
 frames, and every WebSocket or broker-stdout write has its own deadline. After
 activation, EOF, Close, timeout, transport failure, or protocol failure ends
-the bridge process. It never reconnects, replays ACP, or falls back to a local
-agent because delivery may already have become externally observable.
+the bridge process. A lifecycle request fences all further ACP in both
+directions; after its correlated acknowledgement is written to the broker,
+successful suspend or release also ends the bridge cleanly. The bridge never
+reconnects, replays ACP, or falls back to a local agent because delivery may
+already have become externally observable.
 
 ### 4.2 Controller and relay
 

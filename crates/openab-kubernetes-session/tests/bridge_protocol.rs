@@ -486,14 +486,10 @@ fn pending_and_terminal_lifecycle_states_do_not_accept_new_broker_work() {
     }
 
     let agent_response = json!({"jsonrpc": "2.0", "id": 90, "result": {}});
-    assert_eq!(
-        forwarded_to_worker(
-            kernel
-                .handle_broker_message(&bytes(&agent_response))
-                .unwrap()
-        ),
-        agent_response
-    );
+    assert!(matches!(
+        kernel.handle_broker_message(&bytes(&agent_response)),
+        Err(BridgeProtocolError::InvalidState(_))
+    ));
 
     forwarded_to_broker(kernel.finish_lifecycle(&action, Ok(())).unwrap());
     assert!(matches!(

@@ -42,6 +42,10 @@ pub enum BridgeWebSocketExit {
     /// The controller authoritatively proved a retained broker mapping absent
     /// and the bridge emitted the correlated initialization sentinel.
     MappingAbsent,
+    /// The correlated suspend acknowledgement reached the broker.
+    Suspended,
+    /// The correlated destructive release acknowledgement reached the broker.
+    Released,
 }
 
 #[derive(Debug, Error)]
@@ -261,13 +265,15 @@ where
                     Message::Text(text) => {
                         let message = decode_frame::<ControllerToBridgeV1>(text.as_bytes())
                             .map_err(BridgeWebSocketError::InvalidControllerFrame)?;
-                        handle_controller_message(
+                        if let Some(exit) = handle_controller_message(
                             &mut kernel,
                             &mut broker_stdout,
                             &mut pending_lifecycle,
                             message,
                             write_timeout,
-                        ).await?;
+                        ).await? {
+                            return Ok(exit);
+                        }
                     }
                     Message::Ping(_) => flush_websocket(&mut sink, write_timeout).await?,
                     Message::Pong(_) => {}
@@ -501,7 +507,7 @@ async fn handle_controller_message<W>(
     pending_lifecycle: &mut Option<PendingLifecycle>,
     message: ControllerToBridgeV1,
     write_timeout: Duration,
-) -> Result<(), BridgeWebSocketError>
+) -> Result<Option<BridgeWebSocketExit>, BridgeWebSocketError>
 where
     W: AsyncWrite + Unpin,
 {
@@ -513,7 +519,8 @@ where
                 .map_err(BridgeWebSocketError::BridgeProtocol)?
             {
                 BridgeAction::ForwardToBroker(message) => {
-                    write_broker_value(broker_stdout, &message, write_timeout).await
+                    write_broker_value(broker_stdout, &message, write_timeout).await?;
+                    Ok(None)
                 }
                 BridgeAction::ForwardToWorker(_) | BridgeAction::Controller(_) => {
                     Err(BridgeWebSocketError::InvalidBridgeDirection)
@@ -530,6 +537,10 @@ where
             let pending = pending_lifecycle
                 .take()
                 .expect("pending lifecycle was checked above");
+            let terminal_exit = match pending.action.kind() {
+                super::LifecycleKind::Suspend => BridgeWebSocketExit::Suspended,
+                super::LifecycleKind::Release => BridgeWebSocketExit::Released,
+            };
             let rejected = fatal.is_some();
             let result = fatal.map_or_else(
                 || Ok(()),
@@ -553,7 +564,7 @@ where
             if rejected {
                 Err(BridgeWebSocketError::LifecycleRejected)
             } else {
-                Ok(())
+                Ok(Some(terminal_exit))
             }
         }
     }

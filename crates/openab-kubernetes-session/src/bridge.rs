@@ -581,11 +581,10 @@ impl BridgeKernel {
                 ) || matches!(envelope, EnvelopeKind::Response { .. })
             }
             BridgeState::Active => true,
-            BridgeState::Initializing
-            | BridgeState::StartingSession
-            | BridgeState::LifecyclePending => {
+            BridgeState::Initializing | BridgeState::StartingSession => {
                 matches!(envelope, EnvelopeKind::Response { .. })
             }
+            BridgeState::LifecyclePending => false,
             BridgeState::Closed | BridgeState::Released | BridgeState::Failed => false,
         };
         if allowed {

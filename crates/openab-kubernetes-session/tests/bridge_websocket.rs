@@ -478,14 +478,47 @@ async fn lifecycle_ack_is_emitted_only_after_the_correlated_controller_result() 
         json!({"jsonrpc": "2.0", "id": 3, "result": {}})
     );
 
-    drop(bridge.broker_input);
     assert_eq!(
         timeout(Duration::from_secs(1), bridge.driver)
             .await
             .unwrap()
             .unwrap()
             .unwrap(),
-        BridgeWebSocketExit::BrokerEof
+        BridgeWebSocketExit::Suspended
+    );
+}
+
+#[tokio::test]
+async fn release_ack_is_written_before_the_bridge_exits_cleanly() {
+    let mut bridge = active_bridge(256 * 1024, Duration::from_secs(1)).await;
+
+    send_broker_line(
+        &mut bridge.broker_input,
+        &request(
+            json!(4),
+            "_openab/session/release",
+            json!({"sessionId": "worker-1"}),
+        ),
+    )
+    .await;
+    let BridgeToControllerV1::Lifecycle(lifecycle) =
+        receive_controller_message(&mut bridge.controller).await
+    else {
+        panic!("release must become a controller lifecycle request")
+    };
+
+    acknowledge_lifecycle(&mut bridge.controller, &lifecycle).await;
+    assert_eq!(
+        receive_broker_line(&mut bridge.broker_output).await,
+        json!({"jsonrpc": "2.0", "id": 4, "result": {}})
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(1), bridge.driver)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        BridgeWebSocketExit::Released
     );
 }
 
