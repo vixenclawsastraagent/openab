@@ -10,11 +10,12 @@ license = "MIT"
 
 [features]
 default = []
-controller = ["dep:k8s-openapi", "dep:kube", "dep:tokio"]
+controller = ["dep:getrandom", "dep:k8s-openapi", "dep:kube", "dep:tokio"]
 
 [dependencies]
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
+getrandom = { version = "0.4", optional = true }
 hex = "0.4"
 k8s-openapi = { version = "=0.28.0", features = ["v1_32"], optional = true }
 kube = { version = "=4.2.0", default-features = false, features = ["client", "ring", "rustls-tls"], optional = true }

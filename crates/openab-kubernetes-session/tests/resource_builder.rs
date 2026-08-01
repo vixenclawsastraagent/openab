@@ -15,7 +15,7 @@ use openab_kubernetes_session::resources::{
     ResourceValidationError, RunAsIdentity, RuntimeClassSelection, TrustedEgressRule,
     WorkerResources,
 };
-use openab_kubernetes_session::state::{ProfileRef, SessionAnchorV1};
+use openab_kubernetes_session::state::{ProfileRef, SessionAnchorV1, SessionPhase};
 use openab_kubernetes_session::wire::WorkerRegistrationV1;
 use std::collections::BTreeMap;
 use uuid::Uuid;
@@ -204,14 +204,6 @@ fn default_generation_is_hardened_and_fully_bound() {
             Some(context.session_id().as_hex().as_str())
         );
         assert_eq!(
-            annotations.get("openab.dev/generation").map(String::as_str),
-            Some("1")
-        );
-        assert_eq!(
-            annotations.get("openab.dev/attempt-id").map(String::as_str),
-            Some(context.fence().attempt_id().to_string().as_str())
-        );
-        assert_eq!(
             annotations
                 .get("openab.dev/incarnation-id")
                 .map(String::as_str),
@@ -233,6 +225,23 @@ fn default_generation_is_hardened_and_fully_bound() {
             annotations.get("openab.dev/anchor-uid").map(String::as_str),
             Some(ANCHOR_UID)
         );
+    }
+
+    for metadata in [
+        &desired.registration_secret().metadata,
+        &desired.service_account().metadata,
+        &desired.pod().metadata,
+        &desired.network_policy().metadata,
+    ] {
+        let annotations = annotations(metadata);
+        assert_eq!(
+            annotations.get("openab.dev/generation").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            annotations.get("openab.dev/attempt-id").map(String::as_str),
+            Some(context.fence().attempt_id().to_string().as_str())
+        );
         assert_eq!(
             annotations
                 .get("openab.dev/worker-image-contract")
@@ -240,6 +249,19 @@ fn default_generation_is_hardened_and_fully_bound() {
             Some("session-layout-v1")
         );
     }
+
+    let claim_metadata = &desired.persistent_volume_claim().metadata;
+    let claim_annotations = annotations(claim_metadata);
+    assert!(!claim_annotations.contains_key("openab.dev/generation"));
+    assert!(!claim_annotations.contains_key("openab.dev/attempt-id"));
+    assert!(!claim_annotations.contains_key("openab.dev/worker-image-contract"));
+    assert!(!claim_annotations.contains_key("openab.dev/skills-config-map-name"));
+    assert!(!claim_annotations.contains_key("openab.dev/runtime-class-name"));
+    assert!(!claim_metadata
+        .labels
+        .as_ref()
+        .unwrap()
+        .contains_key("openab.dev/generation"));
 
     let claim = desired.persistent_volume_claim();
     let claim_spec = claim.spec.as_ref().unwrap();
@@ -391,6 +413,82 @@ fn default_generation_is_hardened_and_fully_bound() {
         assert!(resources.requests.as_ref().unwrap().contains_key(name));
         assert!(resources.limits.as_ref().unwrap().contains_key(name));
     }
+}
+
+#[test]
+fn replacement_generation_reuses_the_exact_session_workspace_claim() {
+    let first_anchor = anchor();
+    let first_names = ResourceNames::new(first_anchor.session_id());
+    let first_context = GenerationContext::from_anchor(
+        NAMESPACE,
+        first_names.anchor(),
+        ANCHOR_UID,
+        &first_anchor,
+        first_names,
+    )
+    .unwrap();
+    let first = DesiredGeneration::build(
+        first_context,
+        profile(PvcAccessMode::default(), None, None),
+        [0x11; 32],
+    )
+    .unwrap();
+
+    let mut second_anchor = first_anchor;
+    let first_fence = second_anchor.fence().clone();
+    second_anchor
+        .observe_pod(&first_fence, "first-pod-uid")
+        .unwrap();
+    second_anchor
+        .transition(&first_fence, SessionPhase::Ready)
+        .unwrap();
+    second_anchor
+        .transition(&first_fence, SessionPhase::Suspending)
+        .unwrap();
+    second_anchor
+        .confirm_pod_deleted(&first_fence, "first-pod-uid")
+        .unwrap();
+    second_anchor
+        .transition(&first_fence, SessionPhase::Suspended)
+        .unwrap();
+    let resumed_at = second_anchor.last_activity_at() + Duration::minutes(20);
+    second_anchor
+        .advance_generation(
+            &first_fence,
+            Uuid::from_u128(0x30),
+            resumed_at,
+            resumed_at + Duration::minutes(15),
+            resumed_at + Duration::hours(72),
+        )
+        .unwrap();
+    let second_names = ResourceNames::new(second_anchor.session_id());
+    let second_context = GenerationContext::from_anchor(
+        NAMESPACE,
+        second_names.anchor(),
+        ANCHOR_UID,
+        &second_anchor,
+        second_names,
+    )
+    .unwrap();
+    let second = DesiredGeneration::build(
+        second_context,
+        profile(PvcAccessMode::default(), None, None),
+        [0x22; 32],
+    )
+    .unwrap();
+
+    assert_eq!(
+        first.persistent_volume_claim(),
+        second.persistent_volume_claim()
+    );
+    assert_ne!(
+        first.pod().metadata.name,
+        second.pod().metadata.name,
+        "worker resources remain generation-scoped"
+    );
+    let mut observed = first.persistent_volume_claim().clone();
+    mark_observed(&mut observed.metadata, "workspace-pvc-uid");
+    second.validate_persistent_volume_claim(&observed).unwrap();
 }
 
 #[test]

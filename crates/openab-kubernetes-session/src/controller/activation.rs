@@ -64,6 +64,17 @@ pub enum ProvisionerOperation {
     EnsureGeneration,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GenerationResource {
+    PersistentVolumeClaim,
+    NetworkPolicy,
+    ServiceAccount,
+    RegistrationSecret,
+    Pod,
+    SkillsConfigMap,
+    RuntimeClass,
+}
+
 /// Closed error contract between activation arbitration and the concrete
 /// Kubernetes resource driver.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -74,6 +85,16 @@ pub enum GenerationProvisionerError {
     ChildrenAmbiguous,
     #[error("Kubernetes API failed during {operation:?}")]
     KubernetesApi { operation: ProvisionerOperation },
+    #[error("the trusted worker profile or lifecycle anchor could not build a generation")]
+    InvalidGeneration,
+    #[error("the observed {resource:?} is missing or does not exactly match this generation")]
+    ResourceRejected { resource: GenerationResource },
+    #[error("the immutable bootstrap Secret does not contain one 32-byte token")]
+    InvalidBootstrapToken,
+    #[error("the bootstrap credential was consumed or is missing after worker creation")]
+    BootstrapCredentialConsumedOrMissing,
+    #[error("the controller could not obtain cryptographically secure bootstrap randomness")]
+    RandomnessUnavailable,
     #[error("the observed worker Pod UID is invalid")]
     InvalidPodUid,
 }

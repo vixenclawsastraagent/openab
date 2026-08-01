@@ -755,13 +755,10 @@ impl DesiredGeneration {
         }
 
         let persistent_volume_claim = PersistentVolumeClaim {
-            metadata: metadata(
-                &context,
-                context.resource_names.pvc(),
-                "workspace-pvc",
-                profile.skills.as_ref(),
-                profile.runtime_class.as_ref(),
-            ),
+            // The workspace survives worker replacement. Its identity is
+            // therefore bound to the session incarnation, not one worker
+            // generation or activation attempt.
+            metadata: persistent_workspace_metadata(&context),
             spec: Some(PersistentVolumeClaimSpec {
                 access_modes: Some(vec![profile
                     .workspace
@@ -1036,6 +1033,16 @@ impl DesiredGeneration {
     /// traffic.
     pub fn network_policy(&self) -> &NetworkPolicy {
         &self.network_policy
+    }
+
+    pub fn skills_config_map_name(&self) -> Option<&str> {
+        self.skills.as_ref().map(|skills| skills.name.as_str())
+    }
+
+    pub fn runtime_class_name(&self) -> Option<&str> {
+        self.runtime_class
+            .as_ref()
+            .map(|runtime_class| runtime_class.name.as_str())
     }
 
     pub fn validate_persistent_volume_claim(
@@ -1320,6 +1327,48 @@ fn metadata(
             ),
         ])),
         name: Some(name),
+        namespace: Some(context.namespace.clone()),
+        owner_references: Some(vec![OwnerReference {
+            api_version: "v1".into(),
+            block_owner_deletion: Some(true),
+            controller: Some(true),
+            kind: "ConfigMap".into(),
+            name: context.anchor_name.clone(),
+            uid: context.anchor_uid.clone(),
+        }]),
+        ..ObjectMeta::default()
+    }
+}
+
+fn persistent_workspace_metadata(context: &GenerationContext) -> ObjectMeta {
+    ObjectMeta {
+        annotations: Some(BTreeMap::from([
+            (SCOPE_ANNOTATION.into(), context.scope_id.as_hex()),
+            (SESSION_ANNOTATION.into(), context.session_id.as_hex()),
+            (
+                INCARNATION_ANNOTATION.into(),
+                context.incarnation_id.to_string(),
+            ),
+            (
+                PROFILE_NAME_ANNOTATION.into(),
+                context.profile.name().to_string(),
+            ),
+            (
+                PROFILE_VERSION_ANNOTATION.into(),
+                context.profile.version().to_string(),
+            ),
+            (ANCHOR_NAME_ANNOTATION.into(), context.anchor_name.clone()),
+            (ANCHOR_UID_ANNOTATION.into(), context.anchor_uid.clone()),
+        ])),
+        labels: Some(BTreeMap::from([
+            (MANAGED_BY_LABEL.into(), MANAGED_BY_VALUE.into()),
+            (RESOURCE_LABEL.into(), "workspace-pvc".into()),
+            (
+                SESSION_LABEL.into(),
+                context.session_id.as_hex()[..40].to_string(),
+            ),
+        ])),
+        name: Some(context.resource_names.pvc()),
         namespace: Some(context.namespace.clone()),
         owner_references: Some(vec![OwnerReference {
             api_version: "v1".into(),
