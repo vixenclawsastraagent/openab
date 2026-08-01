@@ -1,10 +1,12 @@
 use super::{
-    ActivationCoordinator, ActivationError, ActivationPreparation, GenerationProvisioner,
-    LifecycleCoordinator, LifecycleError, LifecycleProvisioner, LifecycleReconcileOutcome,
-    RegistrationCoordinator, RegistrationError, RegistrationProvisioner, RegistrationRecovery,
-    ReleaseCoordinator, ReleaseError, ReleaseOutcome, ReleaseProvisioner, SessionLocks,
+    ActivationCoordinator, ActivationError, ActivationPreparation, ActivityCoordinator,
+    GenerationProvisioner, LifecycleCoordinator, LifecycleError, LifecycleProvisioner,
+    LifecycleReconcileOutcome, RegistrationCoordinator, RegistrationError, RegistrationProvisioner,
+    RegistrationRecovery, ReleaseCoordinator, ReleaseError, ReleaseOutcome, ReleaseProvisioner,
+    SessionLocks,
 };
 use crate::identity::SessionId;
+use crate::profile_config::ControllerPolicy;
 use crate::resources::MvpWorkerProfile;
 use crate::state::{ProfileRef, SessionPhase};
 use crate::store::{AnchorStoreError, ConfigMapAnchorStore};
@@ -125,6 +127,7 @@ pub struct ControllerCoordinators {
     store: ConfigMapAnchorStore,
     locks: SessionLocks,
     profiles: BTreeMap<ProfileKey, ProfileCoordinators>,
+    activity: ActivityCoordinator,
     lifecycle: LifecycleCoordinator,
     release: ReleaseCoordinator,
 }
@@ -134,6 +137,7 @@ impl ControllerCoordinators {
     pub fn new(
         store: ConfigMapAnchorStore,
         profiles: impl IntoIterator<Item = MvpWorkerProfile>,
+        policy: ControllerPolicy,
         generation_provisioner: Arc<dyn GenerationProvisioner>,
         lifecycle_provisioner: Arc<dyn LifecycleProvisioner>,
         registration_provisioner: Arc<dyn RegistrationProvisioner>,
@@ -169,6 +173,7 @@ impl ControllerCoordinators {
             return Err(ControllerCoordinatorConfigError::EmptyProfiles);
         }
 
+        let activity = ActivityCoordinator::new(store.clone(), locks.clone(), policy);
         let lifecycle = LifecycleCoordinator::new(
             store.clone(),
             locks.clone(),
@@ -179,6 +184,7 @@ impl ControllerCoordinators {
             store,
             locks,
             profiles: profile_coordinators,
+            activity,
             lifecycle,
             release,
         })
@@ -198,6 +204,10 @@ impl ControllerCoordinators {
 
     pub fn lifecycle(&self) -> &LifecycleCoordinator {
         &self.lifecycle
+    }
+
+    pub fn activity(&self) -> &ActivityCoordinator {
+        &self.activity
     }
 
     pub fn release(&self) -> &ReleaseCoordinator {

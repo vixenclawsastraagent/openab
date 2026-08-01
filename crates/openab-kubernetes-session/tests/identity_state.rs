@@ -141,6 +141,14 @@ fn standalone_state_values_are_validated_when_deserialized() {
         r#"{"generation":1,"attemptId":"00000000-0000-0000-0000-000000000000"}"#
     )
     .is_err());
+
+    let mut nil_turn = serde_json::to_value(test_anchor()).unwrap();
+    nil_turn["lastPromptTurnId"] = json!(Uuid::nil());
+    assert!(serde_json::from_value::<SessionAnchorV1>(nil_turn).is_err());
+
+    let mut inactive_turn = serde_json::to_value(test_anchor()).unwrap();
+    inactive_turn["lastPromptTurnId"] = json!(Uuid::from_u128(0x400));
+    assert!(serde_json::from_value::<SessionAnchorV1>(inactive_turn).is_err());
 }
 
 #[test]
@@ -280,6 +288,81 @@ fn activity_refresh_is_fenced_monotonic_and_phase_aware() {
             phase: SessionPhase::Suspending
         })
     ));
+}
+
+#[test]
+fn prompt_turn_fences_ready_busy_successors_and_clears_on_lifecycle_exit() {
+    let mut ready = test_anchor();
+    let fence = ready.fence().clone();
+    ready.observe_pod(&fence, "pod-uid-a").unwrap();
+    ready.transition(&fence, SessionPhase::Ready).unwrap();
+
+    let turn_id = Uuid::from_u128(0x400);
+    let started_at = ready.last_activity_at() + Duration::minutes(2);
+    let mut busy = ready.clone();
+    busy.record_prompt_started(
+        &fence,
+        turn_id,
+        started_at,
+        started_at + Duration::minutes(15),
+        started_at + Duration::hours(72),
+    )
+    .unwrap();
+    ready.validate_successor(&busy).unwrap();
+    assert_eq!(busy.last_prompt_turn_id(), Some(turn_id));
+
+    let before_mismatch = busy.clone();
+    assert_eq!(
+        busy.record_prompt_finished(
+            &fence,
+            Uuid::from_u128(0x401),
+            started_at + Duration::minutes(1),
+            started_at + Duration::minutes(16),
+            started_at + Duration::hours(72),
+        ),
+        Err(StateError::PromptTurnMismatch)
+    );
+    assert_eq!(busy, before_mismatch);
+
+    let mut completed = busy.clone();
+    let finished_at = started_at + Duration::minutes(1);
+    completed
+        .record_prompt_finished(
+            &fence,
+            turn_id,
+            finished_at,
+            finished_at + Duration::minutes(15),
+            finished_at + Duration::hours(72),
+        )
+        .unwrap();
+    busy.validate_successor(&completed).unwrap();
+    assert_eq!(completed.last_prompt_turn_id(), Some(turn_id));
+
+    let mut suspending = busy.clone();
+    suspending
+        .transition(&fence, SessionPhase::Suspending)
+        .unwrap();
+    assert_eq!(suspending.last_prompt_turn_id(), None);
+    busy.validate_successor(&suspending).unwrap();
+
+    let mut tampered_value = serde_json::to_value(&busy).unwrap();
+    tampered_value["lastPromptTurnId"] = serde_json::json!(Uuid::from_u128(0x402));
+    let tampered: SessionAnchorV1 = serde_json::from_value(tampered_value).unwrap();
+    assert_eq!(
+        busy.validate_successor(&tampered),
+        Err(StateError::InvalidPromptTurnSuccessor)
+    );
+
+    let mut legacy_busy = ready.clone();
+    legacy_busy.transition(&fence, SessionPhase::Busy).unwrap();
+    let mut unsafe_ready = legacy_busy.clone();
+    unsafe_ready
+        .transition(&fence, SessionPhase::Ready)
+        .unwrap();
+    assert_eq!(
+        legacy_busy.validate_successor(&unsafe_ready),
+        Err(StateError::InvalidPromptTurnSuccessor)
+    );
 }
 
 #[test]

@@ -6,7 +6,7 @@ use k8s_openapi::api::node::v1::RuntimeClass;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
 use openab_kubernetes_session::identity::{ResourceNames, ScopeId, SessionId};
 use openab_kubernetes_session::profile_config::{
-    ResolvedClusterReferences, TrustedControllerConfigV1, MAX_ACTIVE_WORKERS,
+    ControllerPolicy, ResolvedClusterReferences, TrustedControllerConfigV1, MAX_ACTIVE_WORKERS,
     MAX_LIFECYCLE_TTL_SECONDS,
 };
 use openab_kubernetes_session::resources::{
@@ -300,6 +300,24 @@ fn controller_policy_values_are_nonzero_bounded_and_ordered() {
         ),
     ] {
         assert!(TrustedControllerConfigV1::from_toml(&invalid).is_err());
+    }
+}
+
+#[test]
+fn programmatic_controller_policy_uses_the_same_validation_boundary() {
+    let policy = ControllerPolicy::new(900, 259_200, 20).unwrap();
+    assert_eq!(policy.compute_idle_ttl().as_secs(), 900);
+    assert_eq!(policy.storage_retention_ttl().as_secs(), 259_200);
+    assert_eq!(policy.max_active_workers(), 20);
+
+    for invalid in [
+        ControllerPolicy::new(0, 259_200, 20),
+        ControllerPolicy::new(900, 899, 20),
+        ControllerPolicy::new(900, 259_200, 0),
+        ControllerPolicy::new(MAX_LIFECYCLE_TTL_SECONDS + 1, 259_200, 20),
+        ControllerPolicy::new(900, 259_200, MAX_ACTIVE_WORKERS + 1),
+    ] {
+        assert!(invalid.is_err());
     }
 }
 

@@ -56,7 +56,8 @@ pub struct ControllerPolicy {
 }
 
 impl ControllerPolicy {
-    fn new(
+    /// Construct a validated controller policy for programmatic embedders.
+    pub fn new(
         compute_idle_seconds: u64,
         storage_retention_seconds: u64,
         max_active_workers: usize,

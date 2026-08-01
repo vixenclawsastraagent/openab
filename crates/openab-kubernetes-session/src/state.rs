@@ -26,6 +26,14 @@ pub enum StateError {
     },
     #[error("activity cannot be refreshed while the session is {phase:?}")]
     ActivityNotAllowed { phase: SessionPhase },
+    #[error("prompt turn identifier must not be nil")]
+    InvalidPromptTurnIdentifier,
+    #[error("prompt turn does not match the durable prompt")]
+    PromptTurnMismatch,
+    #[error("prompt turn changed outside a prompt transition")]
+    InvalidPromptTurnSuccessor,
+    #[error("prompt turn is not allowed while the session is {phase:?}")]
+    PromptTurnNotAllowed { phase: SessionPhase },
     #[error("immutable anchor field {field} changed")]
     ImmutableAnchorFieldChanged { field: &'static str },
     #[error(
@@ -232,6 +240,8 @@ pub struct SessionAnchorV1 {
     fence: Fence,
     phase: SessionPhase,
     pod_uid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_prompt_turn_id: Option<Uuid>,
     last_activity_at: DateTime<Utc>,
     compute_deadline_at: DateTime<Utc>,
     storage_deadline_at: DateTime<Utc>,
@@ -248,6 +258,8 @@ struct SessionAnchorWire {
     fence: Fence,
     phase: SessionPhase,
     pod_uid: Option<String>,
+    #[serde(default)]
+    last_prompt_turn_id: Option<Uuid>,
     last_activity_at: DateTime<Utc>,
     compute_deadline_at: DateTime<Utc>,
     storage_deadline_at: DateTime<Utc>,
@@ -266,6 +278,7 @@ impl TryFrom<SessionAnchorWire> for SessionAnchorV1 {
             fence: wire.fence,
             phase: wire.phase,
             pod_uid: wire.pod_uid,
+            last_prompt_turn_id: wire.last_prompt_turn_id,
             last_activity_at: wire.last_activity_at,
             compute_deadline_at: wire.compute_deadline_at,
             storage_deadline_at: wire.storage_deadline_at,
@@ -296,6 +309,7 @@ impl SessionAnchorV1 {
             fence: Fence::new(1, attempt_id)?,
             phase: SessionPhase::Provisioning,
             pod_uid: None,
+            last_prompt_turn_id: None,
             last_activity_at,
             compute_deadline_at,
             storage_deadline_at,
@@ -330,6 +344,10 @@ impl SessionAnchorV1 {
 
     pub fn pod_uid(&self) -> Option<&str> {
         self.pod_uid.as_deref()
+    }
+
+    pub fn last_prompt_turn_id(&self) -> Option<Uuid> {
+        self.last_prompt_turn_id
     }
 
     pub fn last_activity_at(&self) -> DateTime<Utc> {
@@ -390,6 +408,9 @@ impl SessionAnchorV1 {
         if next.pod_uid.is_some() {
             return Err(StateError::InvalidPodSuccessor);
         }
+        if next.last_prompt_turn_id.is_some() {
+            return Err(StateError::InvalidPromptTurnSuccessor);
+        }
         validate_deadlines(
             self.last_activity_at,
             next.last_activity_at,
@@ -398,6 +419,8 @@ impl SessionAnchorV1 {
         )
     }
 
+    /// Refresh deadlines while a generation is still provisioning.
+    /// Ready/Busy prompt activity must use the turn-fenced methods below.
     pub fn refresh_activity(
         &mut self,
         expected: &Fence,
@@ -406,10 +429,7 @@ impl SessionAnchorV1 {
         storage_deadline_at: DateTime<Utc>,
     ) -> Result<(), StateError> {
         self.check_fence(expected)?;
-        if !matches!(
-            self.phase,
-            SessionPhase::Provisioning | SessionPhase::Ready | SessionPhase::Busy
-        ) {
+        if self.phase != SessionPhase::Provisioning {
             return Err(StateError::ActivityNotAllowed { phase: self.phase });
         }
         validate_deadlines(
@@ -421,6 +441,69 @@ impl SessionAnchorV1 {
         self.last_activity_at = last_activity_at;
         self.compute_deadline_at = compute_deadline_at;
         self.storage_deadline_at = storage_deadline_at;
+        Ok(())
+    }
+
+    pub fn record_prompt_started(
+        &mut self,
+        expected: &Fence,
+        turn_id: Uuid,
+        last_activity_at: DateTime<Utc>,
+        compute_deadline_at: DateTime<Utc>,
+        storage_deadline_at: DateTime<Utc>,
+    ) -> Result<(), StateError> {
+        self.check_fence(expected)?;
+        if turn_id.is_nil() {
+            return Err(StateError::InvalidPromptTurnIdentifier);
+        }
+        if self.phase != SessionPhase::Ready {
+            return Err(StateError::ActivityNotAllowed { phase: self.phase });
+        }
+        if self.last_prompt_turn_id == Some(turn_id) {
+            return Err(StateError::PromptTurnMismatch);
+        }
+        validate_deadlines(
+            self.last_activity_at,
+            last_activity_at,
+            compute_deadline_at,
+            storage_deadline_at,
+        )?;
+        self.last_activity_at = last_activity_at;
+        self.compute_deadline_at = compute_deadline_at;
+        self.storage_deadline_at = storage_deadline_at;
+        self.last_prompt_turn_id = Some(turn_id);
+        self.phase = SessionPhase::Busy;
+        Ok(())
+    }
+
+    pub fn record_prompt_finished(
+        &mut self,
+        expected: &Fence,
+        turn_id: Uuid,
+        last_activity_at: DateTime<Utc>,
+        compute_deadline_at: DateTime<Utc>,
+        storage_deadline_at: DateTime<Utc>,
+    ) -> Result<(), StateError> {
+        self.check_fence(expected)?;
+        if turn_id.is_nil() {
+            return Err(StateError::InvalidPromptTurnIdentifier);
+        }
+        if self.phase != SessionPhase::Busy {
+            return Err(StateError::ActivityNotAllowed { phase: self.phase });
+        }
+        if self.last_prompt_turn_id != Some(turn_id) {
+            return Err(StateError::PromptTurnMismatch);
+        }
+        validate_deadlines(
+            self.last_activity_at,
+            last_activity_at,
+            compute_deadline_at,
+            storage_deadline_at,
+        )?;
+        self.last_activity_at = last_activity_at;
+        self.compute_deadline_at = compute_deadline_at;
+        self.storage_deadline_at = storage_deadline_at;
+        self.phase = SessionPhase::Ready;
         Ok(())
     }
 
@@ -490,6 +573,12 @@ impl SessionAnchorV1 {
                 });
             }
         }
+        if matches!(
+            next,
+            SessionPhase::Suspending | SessionPhase::Deleting | SessionPhase::Blocked
+        ) {
+            self.last_prompt_turn_id = None;
+        }
         self.phase = next;
         Ok(())
     }
@@ -531,6 +620,7 @@ impl SessionAnchorV1 {
         )?;
         self.fence = next_fence;
         self.phase = SessionPhase::Provisioning;
+        self.last_prompt_turn_id = None;
         self.last_activity_at = last_activity_at;
         self.compute_deadline_at = compute_deadline_at;
         self.storage_deadline_at = storage_deadline_at;
@@ -579,16 +669,43 @@ impl SessionAnchorV1 {
     }
 
     fn validate_activity_successor(&self, next: &Self) -> Result<(), StateError> {
-        let changed = self.last_activity_at != next.last_activity_at
+        let timing_changed = self.last_activity_at != next.last_activity_at
             || self.compute_deadline_at != next.compute_deadline_at
             || self.storage_deadline_at != next.storage_deadline_at;
-        if !changed {
+        let turn_changed = self.last_prompt_turn_id != next.last_prompt_turn_id;
+
+        let prompt_transition = match (self.phase, next.phase) {
+            (SessionPhase::Ready, SessionPhase::Busy) => {
+                if !timing_changed || !turn_changed || next.last_prompt_turn_id.is_none() {
+                    return Err(StateError::InvalidPromptTurnSuccessor);
+                }
+                true
+            }
+            (SessionPhase::Busy, SessionPhase::Ready) => {
+                if !timing_changed || turn_changed || self.last_prompt_turn_id.is_none() {
+                    return Err(StateError::InvalidPromptTurnSuccessor);
+                }
+                true
+            }
+            (
+                SessionPhase::Ready | SessionPhase::Busy,
+                SessionPhase::Suspending | SessionPhase::Deleting | SessionPhase::Blocked,
+            ) => {
+                if timing_changed || next.last_prompt_turn_id.is_some() {
+                    return Err(StateError::InvalidPromptTurnSuccessor);
+                }
+                false
+            }
+            _ if turn_changed => {
+                return Err(StateError::InvalidPromptTurnSuccessor);
+            }
+            _ => false,
+        };
+
+        if !timing_changed {
             return Ok(());
         }
-        if !matches!(
-            self.phase,
-            SessionPhase::Provisioning | SessionPhase::Ready | SessionPhase::Busy
-        ) {
+        if !prompt_transition && self.phase != SessionPhase::Provisioning {
             return Err(StateError::ActivityNotAllowed { phase: self.phase });
         }
         validate_deadlines(
@@ -624,6 +741,14 @@ impl SessionAnchorV1 {
             .is_some_and(|uid| uid.trim().is_empty())
         {
             return Err(StateError::InvalidPodUid);
+        }
+        if self.last_prompt_turn_id.is_some_and(|id| id.is_nil()) {
+            return Err(StateError::InvalidPromptTurnIdentifier);
+        }
+        if self.last_prompt_turn_id.is_some()
+            && !matches!(self.phase, SessionPhase::Ready | SessionPhase::Busy)
+        {
+            return Err(StateError::PromptTurnNotAllowed { phase: self.phase });
         }
         if matches!(self.phase, SessionPhase::Ready | SessionPhase::Busy) && self.pod_uid.is_none()
         {

@@ -1,4 +1,5 @@
 mod activation;
+mod activity;
 mod cleanup;
 mod composition;
 mod generation;
@@ -11,6 +12,10 @@ pub use activation::{
     ActivationCoordinator, ActivationError, ActivationPreparation, ActivationTiming,
     GenerationProvisioner, GenerationProvisionerError, GenerationResource, ObservedWorker,
     ProvisionerOperation,
+};
+pub use activity::{
+    ActivityCoordinator, ActivityError, ActivityEvent, ActivityOutcome, ActivityTurnId,
+    ActivityTurnIdError,
 };
 pub use cleanup::{
     CleanupProgress, LifecycleProvisioner, ReleaseCleanupProgress, ReleaseProvisioner,

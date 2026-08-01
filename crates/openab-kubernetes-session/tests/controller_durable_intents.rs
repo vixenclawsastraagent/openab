@@ -7,14 +7,15 @@ use kube::client::Body;
 use kube::Client;
 use openab_kubernetes_session::bridge::SessionBinding;
 use openab_kubernetes_session::controller::{
-    BootstrapPresence, CleanupProgress, ConsumedBootstrap, ControllerCoordinatorConfigError,
-    ControllerCoordinators, DurableIntentError, DurableIntentOutcome, DurableIntentReport,
-    GenerationProvisioner, GenerationProvisionerError, LifecycleProvisioner,
-    LifecycleReconcileOutcome, ObservedWorker, RegistrationProvisioner,
-    RegistrationProvisionerError, ReleaseCleanupProgress, ReleaseOutcome, ReleaseProvisioner,
-    ReleasedChildrenAbsentProof, VerifiedBootstrap, WorkerBootstrapAuth,
+    ActivityEvent, ActivityOutcome, ActivityTurnId, BootstrapPresence, CleanupProgress,
+    ConsumedBootstrap, ControllerCoordinatorConfigError, ControllerCoordinators,
+    DurableIntentError, DurableIntentOutcome, DurableIntentReport, GenerationProvisioner,
+    GenerationProvisionerError, LifecycleProvisioner, LifecycleReconcileOutcome, ObservedWorker,
+    RegistrationProvisioner, RegistrationProvisionerError, ReleaseCleanupProgress, ReleaseOutcome,
+    ReleaseProvisioner, ReleasedChildrenAbsentProof, VerifiedBootstrap, WorkerBootstrapAuth,
 };
 use openab_kubernetes_session::identity::{ResourceNames, ScopeId, SessionId};
+use openab_kubernetes_session::profile_config::ControllerPolicy;
 use openab_kubernetes_session::resources::{
     EgressPort, EgressProtocol, MvpWorkerProfile, PersistentWorkspace, PvcAccessMode,
     RunAsIdentity, TrustedEgressRule, WorkerResources,
@@ -23,6 +24,7 @@ use openab_kubernetes_session::state::{ProfileRef, SessionAnchorV1, SessionPhase
 use openab_kubernetes_session::store::{
     AnchorStoreError, ConfigMapAnchorStore, StoreOperation, StoredAnchor,
 };
+use openab_kubernetes_session::wire::LifecycleRequestV1;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -311,11 +313,35 @@ fn coordinators(
     ControllerCoordinators::new(
         store,
         profiles,
+        ControllerPolicy::new(15 * 60, 72 * 60 * 60, 20).unwrap(),
         generation,
         lifecycle,
         registration,
         release,
     )
+}
+
+fn suspend_request(anchor: &SessionAnchorV1) -> LifecycleRequestV1 {
+    serde_json::from_value(json!({
+        "version": 1,
+        "requestId": Uuid::from_u128(0x300),
+        "kind": "suspend",
+        "binding": {
+            "version": 1,
+            "scopeId": anchor.scope_id(),
+            "sessionId": anchor.session_id(),
+            "generation": anchor.fence().generation(),
+            "attemptId": anchor.fence().attempt_id(),
+            "incarnationId": anchor.incarnation_id(),
+        },
+        "workerSessionId": "opaque-worker-session",
+    }))
+    .unwrap()
+}
+
+async fn request_body(request: Request<Body>) -> Value {
+    let bytes = request.into_body().collect_bytes().await.unwrap();
+    serde_json::from_slice(&bytes).unwrap()
 }
 
 async fn assert_no_request(
@@ -339,6 +365,7 @@ async fn composition_root_indexes_exact_profile_revisions_and_rejects_duplicates
     assert!(root.activation(&profile_ref("2026-08-03")).is_none());
     assert!(root.registration(&profile_ref("2026-08-01")).is_some());
     let _ = root.lifecycle();
+    let _ = root.activity();
     let _ = root.release();
 
     let (store, _handle) = store_and_handle();
@@ -680,6 +707,77 @@ async fn inventory_failure_aborts_before_any_session_operation() {
             ..
         })
     ));
+    assert_eq!(fake.calls(), (0, 0, 0, 0));
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn composition_root_serializes_live_activity_and_suspend_for_one_session() {
+    let anchor = anchor_in_phase(
+        session_id("discord:shared-root-lock"),
+        SessionPhase::Ready,
+        "2026-08-01",
+    );
+    let expected_binding = SessionBinding::new(
+        anchor.scope_id(),
+        anchor.session_id(),
+        anchor.fence().clone(),
+        anchor.incarnation_id(),
+    )
+    .unwrap();
+    let suspend = suspend_request(&anchor);
+    let turn_id = ActivityTurnId::from_uuid(Uuid::from_u128(0x400)).unwrap();
+    let (store, handle) = store_and_handle();
+    let fake = Arc::new(FakeProvisioner::default());
+    let root = Arc::new(coordinators(store, [profile("2026-08-01")], fake.clone()).unwrap());
+
+    let activity_root = Arc::clone(&root);
+    let activity = tokio::spawn(async move {
+        activity_root
+            .activity()
+            .record(&expected_binding, turn_id, ActivityEvent::PromptStarted)
+            .await
+    });
+    let mut handle = std::pin::pin!(handle);
+    let (get, send) = handle.next_request().await.unwrap();
+    assert_eq!(get.method(), Method::GET);
+    send.send_response(json_response(
+        StatusCode::OK,
+        config_map(&anchor, "rv-ready"),
+    ));
+    let (replace, activity_send) = handle.next_request().await.unwrap();
+    assert_eq!(replace.method(), Method::PUT);
+    let mut activity_body = request_body(replace).await;
+    let busy: SessionAnchorV1 =
+        serde_json::from_str(activity_body["data"]["anchor.json"].as_str().unwrap()).unwrap();
+    assert_eq!(busy.phase(), SessionPhase::Busy);
+
+    let lifecycle_root = Arc::clone(&root);
+    let lifecycle =
+        tokio::spawn(async move { lifecycle_root.lifecycle().accept_suspend(&suspend).await });
+    assert_no_request(&mut handle).await;
+
+    activity_body["metadata"]["resourceVersion"] = json!("rv-activity");
+    activity_send.send_response(json_response(StatusCode::OK, activity_body));
+    assert_eq!(activity.await.unwrap().unwrap(), ActivityOutcome::Recorded);
+
+    let (get, send) = handle.next_request().await.unwrap();
+    assert_eq!(get.method(), Method::GET);
+    send.send_response(json_response(
+        StatusCode::OK,
+        config_map(&busy, "rv-activity"),
+    ));
+    let (replace, send) = handle.next_request().await.unwrap();
+    assert_eq!(replace.method(), Method::PUT);
+    let mut lifecycle_body = request_body(replace).await;
+    let suspending: SessionAnchorV1 =
+        serde_json::from_str(lifecycle_body["data"]["anchor.json"].as_str().unwrap()).unwrap();
+    assert_eq!(suspending.phase(), SessionPhase::Suspending);
+    assert_eq!(suspending.last_prompt_turn_id(), None);
+    lifecycle_body["metadata"]["resourceVersion"] = json!("rv-suspending");
+    send.send_response(json_response(StatusCode::OK, lifecycle_body));
+
+    lifecycle.await.unwrap().unwrap();
     assert_eq!(fake.calls(), (0, 0, 0, 0));
     assert_no_request(&mut handle).await;
 }
