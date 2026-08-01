@@ -115,6 +115,21 @@ fn selected_runtime(name: &str, handler: &str) -> RuntimeClassSelection {
     .unwrap()
 }
 
+fn selected_skills(name: &str, uid: &str, resource_version: &str) -> PinnedSkillsConfigMap {
+    let observed = ConfigMap {
+        immutable: Some(true),
+        metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+            name: Some(name.into()),
+            namespace: Some(NAMESPACE.into()),
+            uid: Some(uid.into()),
+            resource_version: Some(resource_version.into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    PinnedSkillsConfigMap::from_observed(NAMESPACE, &observed).unwrap()
+}
+
 fn desired() -> DesiredGeneration {
     DesiredGeneration::build(
         context(),
@@ -595,7 +610,7 @@ fn token_is_only_a_read_only_secret_file_and_no_host_path_is_present() {
 #[test]
 fn runtime_and_pinned_immutable_skills_are_opt_in() {
     let runtime = selected_runtime("kata-qemu", "kata-qemu");
-    let skills = PinnedSkillsConfigMap::new("skills-2026-08-01", "skills-uid", "rv-42").unwrap();
+    let skills = selected_skills("skills-2026-08-01", "skills-uid", "rv-42");
     let desired = DesiredGeneration::build(
         context(),
         profile(PvcAccessMode::ReadWriteOnce, Some(runtime), Some(skills)),

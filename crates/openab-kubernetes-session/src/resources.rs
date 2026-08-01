@@ -379,6 +379,14 @@ impl AllowedRuntimeClass {
         }
         Ok(allowed)
     }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn handler(&self) -> &str {
+        &self.handler
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -439,6 +447,10 @@ impl RuntimeClassSelection {
             uid: uid.into(),
             resource_version: resource_version.into(),
         })
+    }
+
+    pub(crate) fn matches_intent(&self, name: &str, handler: &str) -> bool {
+        self.name == name && self.handler == handler
     }
 }
 
@@ -584,7 +596,7 @@ pub struct PinnedSkillsConfigMap {
 }
 
 impl PinnedSkillsConfigMap {
-    pub fn new(
+    fn new(
         name: impl Into<String>,
         uid: impl Into<String>,
         resource_version: impl Into<String>,
@@ -594,9 +606,7 @@ impl PinnedSkillsConfigMap {
             uid: uid.into(),
             resource_version: resource_version.into(),
         };
-        if !is_dns_subdomain(&pin.name) {
-            return Err(ResourceBuildError::InvalidSkillsConfigMap { field: "name" });
-        }
+        Self::validate_name(&pin.name)?;
         if !is_printable_identifier(&pin.uid) {
             return Err(ResourceBuildError::InvalidSkillsConfigMap { field: "uid" });
         }
@@ -606,6 +616,63 @@ impl PinnedSkillsConfigMap {
             });
         }
         Ok(pin)
+    }
+
+    /// Pins a versioned, immutable skills ConfigMap from trusted Kubernetes
+    /// observation rather than administrator-supplied UID metadata.
+    pub fn from_observed(
+        expected_namespace: &str,
+        observed: &ConfigMap,
+    ) -> Result<Self, ResourceBuildError> {
+        if !is_dns_label(expected_namespace) {
+            return Err(ResourceBuildError::InvalidSkillsConfigMap {
+                field: "expectedNamespace",
+            });
+        }
+        let name = observed.metadata.name.as_deref().ok_or(
+            ResourceBuildError::InvalidSkillsConfigMap {
+                field: "metadata.name",
+            },
+        )?;
+        Self::validate_name(name)?;
+        if observed.metadata.namespace.as_deref() != Some(expected_namespace) {
+            return Err(ResourceBuildError::InvalidSkillsConfigMap {
+                field: "metadata.namespace",
+            });
+        }
+        if observed.metadata.deletion_timestamp.is_some() {
+            return Err(ResourceBuildError::InvalidSkillsConfigMap {
+                field: "metadata.deletionTimestamp",
+            });
+        }
+        if observed.immutable != Some(true) {
+            return Err(ResourceBuildError::InvalidSkillsConfigMap { field: "immutable" });
+        }
+        let uid =
+            observed
+                .metadata
+                .uid
+                .as_deref()
+                .ok_or(ResourceBuildError::InvalidSkillsConfigMap {
+                    field: "metadata.uid",
+                })?;
+        let resource_version = observed.metadata.resource_version.as_deref().ok_or(
+            ResourceBuildError::InvalidSkillsConfigMap {
+                field: "metadata.resourceVersion",
+            },
+        )?;
+        Self::new(name, uid, resource_version)
+    }
+
+    pub(crate) fn validate_name(name: &str) -> Result<(), ResourceBuildError> {
+        if !is_dns_subdomain(name) {
+            return Err(ResourceBuildError::InvalidSkillsConfigMap { field: "name" });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn matches_intent(&self, name: &str) -> bool {
+        self.name == name
     }
 }
 
@@ -653,6 +720,9 @@ impl MvpWorkerProfile {
         A: Into<String>,
         E: IntoIterator<Item = TrustedEgressRule>,
     {
+        if !is_annotation_identifier(profile.version()) {
+            return Err(ResourceBuildError::InvalidProfileVersion);
+        }
         let image = image.into();
         if !is_pinned_image(&image) {
             return Err(ResourceBuildError::UnpinnedImage);
@@ -690,6 +760,16 @@ impl MvpWorkerProfile {
     /// configuration.
     pub fn profile(&self) -> &ProfileRef {
         &self.profile
+    }
+
+    pub(crate) fn with_cluster_references(
+        mut self,
+        runtime_class: Option<RuntimeClassSelection>,
+        skills: Option<PinnedSkillsConfigMap>,
+    ) -> Self {
+        self.runtime_class = runtime_class;
+        self.skills = skills;
+        self
     }
 }
 

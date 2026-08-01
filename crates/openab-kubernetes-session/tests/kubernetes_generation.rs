@@ -94,6 +94,21 @@ fn profile() -> MvpWorkerProfile {
     profile_with_pins(None, None)
 }
 
+fn selected_skills(name: &str, uid: &str, resource_version: &str) -> PinnedSkillsConfigMap {
+    let observed = ConfigMap {
+        immutable: Some(true),
+        metadata: ObjectMeta {
+            name: Some(name.into()),
+            namespace: Some(NAMESPACE.into()),
+            uid: Some(uid.into()),
+            resource_version: Some(resource_version.into()),
+            ..ObjectMeta::default()
+        },
+        ..ConfigMap::default()
+    };
+    PinnedSkillsConfigMap::from_observed(NAMESPACE, &observed).unwrap()
+}
+
 fn profile_with_pins(
     runtime_class: Option<RuntimeClassSelection>,
     skills: Option<PinnedSkillsConfigMap>,
@@ -1305,8 +1320,7 @@ async fn pinned_dependencies_are_revalidated_and_drift_fails_before_pod_creation
     let client = Client::new(service, "default");
     let session_id = session_id("discord:pinned-drift");
     let anchor = anchor(session_id);
-    let skills_pin =
-        PinnedSkillsConfigMap::new("team-skills-v1", "skills-uid", "skills-rv-1").unwrap();
+    let skills_pin = selected_skills("team-skills-v1", "skills-uid", "skills-rv-1");
     let pinned_profile = profile_with_pins(Some(selected_runtime_class()), Some(skills_pin));
     let mut handle = std::pin::pin!(handle);
     let stored = load_stored_anchor(client.clone(), &mut handle, anchor).await;

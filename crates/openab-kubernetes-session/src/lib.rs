@@ -7,6 +7,9 @@ pub mod wire;
 pub mod controller;
 
 #[cfg(feature = "controller")]
+pub mod profile_config;
+
+#[cfg(feature = "controller")]
 pub mod resources;
 
 #[cfg(feature = "controller")]
