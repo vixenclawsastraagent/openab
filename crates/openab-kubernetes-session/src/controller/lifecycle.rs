@@ -131,6 +131,43 @@ impl LifecycleCoordinator {
             return Err(LifecycleError::PhaseRejected);
         }
 
+        self.reconcile_observed_compute(observed, phase).await
+    }
+
+    /// Continue only an already-durable compute-removal intent.
+    ///
+    /// Unlike the request-facing strict API, startup races that leave the
+    /// anchor absent or in another phase are harmless no-ops. The inventory
+    /// snapshot is never trusted as mutation authority: this method takes the
+    /// session lock and performs a fresh read first.
+    pub(crate) async fn reconcile_durable_compute(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<LifecycleReconcileOutcome>, LifecycleError> {
+        let _guard = self.locks.lock(session_id).await;
+        let Some(observed) = self.store.get(session_id).await? else {
+            return Ok(None);
+        };
+        if observed.state().scope_id() != self.store.scope_id()
+            || observed.state().session_id() != session_id
+        {
+            return Err(LifecycleError::StaleBinding);
+        }
+        let phase = observed.state().phase();
+        if !matches!(phase, SessionPhase::Suspending | SessionPhase::Blocked) {
+            return Ok(None);
+        }
+
+        self.reconcile_observed_compute(observed, phase)
+            .await
+            .map(Some)
+    }
+
+    async fn reconcile_observed_compute(
+        &self,
+        observed: StoredAnchor,
+        phase: SessionPhase,
+    ) -> Result<LifecycleReconcileOutcome, LifecycleError> {
         let progress = self
             .provisioner
             .reconcile_compute_absent(&observed)
@@ -415,6 +452,19 @@ mod tests {
                 "status": "Failure",
                 "reason": "Conflict",
                 "code": 409
+            }),
+        )
+    }
+
+    fn missing_response() -> Response<Body> {
+        json_response(
+            StatusCode::NOT_FOUND,
+            json!({
+                "apiVersion": "v1",
+                "kind": "Status",
+                "status": "Failure",
+                "reason": "NotFound",
+                "code": 404
             }),
         )
     }
@@ -864,6 +914,64 @@ mod tests {
         let error = task.await.unwrap().unwrap_err();
         assert!(matches!(error, LifecycleError::Provisioner(_)));
         assert_eq!(error.to_string(), "worker compute reconciliation failed");
+        assert_eq!(fake.calls(), 1);
+        assert_no_request(&mut handle).await;
+    }
+
+    #[tokio::test]
+    async fn durable_compute_recovery_tolerates_absent_and_phase_drift() {
+        for anchor in [
+            None,
+            Some(anchor_in_phase(
+                session_id("discord:startup-ready"),
+                SessionPhase::Ready,
+            )),
+            Some(anchor_in_phase(
+                session_id("discord:startup-suspended"),
+                SessionPhase::Suspended,
+            )),
+        ] {
+            let fake = FakeProvisioner::returning(CleanupProgress::Pending);
+            let (coordinator, handle) = coordinator(fake.clone());
+            let target = anchor.as_ref().map_or_else(
+                || session_id("discord:startup-absent"),
+                SessionAnchorV1::session_id,
+            );
+            let task =
+                tokio::spawn(async move { coordinator.reconcile_durable_compute(target).await });
+            let mut handle = std::pin::pin!(handle);
+            let (_get, send) = handle.next_request().await.unwrap();
+            match anchor {
+                Some(anchor) => send.send_response(json_response(
+                    StatusCode::OK,
+                    config_map(&anchor, "rv-observed"),
+                )),
+                None => send.send_response(missing_response()),
+            }
+
+            assert_eq!(task.await.unwrap().unwrap(), None);
+            assert_eq!(fake.calls(), 0);
+            assert_no_request(&mut handle).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_compute_recovery_continues_suspending_intent() {
+        let anchor = anchor_in_phase(
+            session_id("discord:startup-suspending"),
+            SessionPhase::Suspending,
+        );
+        let fake = FakeProvisioner::returning(CleanupProgress::Pending);
+        let (coordinator, handle) = coordinator(fake.clone());
+        let target = anchor.session_id();
+        let task = tokio::spawn(async move { coordinator.reconcile_durable_compute(target).await });
+        let mut handle = std::pin::pin!(handle);
+        respond_get_anchor(&mut handle, &anchor, "rv-observed").await;
+
+        assert_eq!(
+            task.await.unwrap().unwrap(),
+            Some(LifecycleReconcileOutcome::Pending)
+        );
         assert_eq!(fake.calls(), 1);
         assert_no_request(&mut handle).await;
     }

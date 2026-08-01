@@ -103,6 +103,44 @@ impl ReleaseCoordinator {
             observed = self.store.replace(&observed, &next).await?;
         }
 
+        self.reconcile_observed_deleting(&binding, observed).await
+    }
+
+    /// Continue only an already-durable destructive release intent.
+    ///
+    /// An absent or non-`Deleting` fresh anchor is a no-op, so controller
+    /// startup can never manufacture release authority from a stale LIST
+    /// snapshot. A terminating anchor is observed only; child cleanup is not
+    /// restarted after Kubernetes has accepted anchor deletion.
+    pub(crate) async fn reconcile_deleting(
+        &self,
+        session_id: crate::identity::SessionId,
+    ) -> Result<Option<ReleaseOutcome>, ReleaseError> {
+        let _guard = self.locks.lock(session_id).await;
+        let Some(observed) = self.store.get_for_deletion(session_id).await? else {
+            return Ok(None);
+        };
+        if observed.state().phase() != SessionPhase::Deleting {
+            return Ok(None);
+        }
+        let binding = binding_from_anchor(&observed)?;
+        if observed.is_terminating() {
+            return self
+                .observe_anchor_absence(&binding, &observed)
+                .await
+                .map(Some);
+        }
+
+        self.reconcile_observed_deleting(&binding, observed)
+            .await
+            .map(Some)
+    }
+
+    async fn reconcile_observed_deleting(
+        &self,
+        binding: &SessionBinding,
+        mut observed: StoredAnchor,
+    ) -> Result<ReleaseOutcome, ReleaseError> {
         let compute_proof = match self
             .provisioner
             .reconcile_compute_absent(&observed)
@@ -133,7 +171,7 @@ impl ReleaseCoordinator {
         validate_all_children_proof(&observed, &all_children_proof)?;
 
         self.store.delete(&observed, &all_children_proof).await?;
-        self.observe_anchor_absence(&binding, &observed).await
+        self.observe_anchor_absence(binding, &observed).await
     }
 
     async fn observe_anchor_absence(
@@ -167,6 +205,17 @@ impl ReleaseCoordinator {
         }
         Ok(ReleaseOutcome::Released)
     }
+}
+
+fn binding_from_anchor(observed: &StoredAnchor) -> Result<SessionBinding, ReleaseError> {
+    let state = observed.state();
+    SessionBinding::new(
+        state.scope_id(),
+        state.session_id(),
+        state.fence().clone(),
+        state.incarnation_id(),
+    )
+    .map_err(|_| ReleaseError::InvalidAnchor)
 }
 
 fn validate_binding(
@@ -954,6 +1003,68 @@ mod tests {
         let error = task.await.unwrap().unwrap_err();
         assert!(matches!(error, ReleaseError::Provisioner(_)));
         assert_eq!(error.to_string(), "worker release reconciliation failed");
+        assert_no_request(&mut handle).await;
+    }
+
+    #[tokio::test]
+    async fn durable_release_recovery_never_starts_a_new_deleting_intent() {
+        for anchor in [
+            None,
+            Some(ready_anchor(session_id("discord:startup-ready"))),
+        ] {
+            let fake = FakeProvisioner::all_matching();
+            let (coordinator, handle) = coordinator(fake.clone());
+            let target = anchor.as_ref().map_or_else(
+                || session_id("discord:startup-absent"),
+                SessionAnchorV1::session_id,
+            );
+            let task = tokio::spawn(async move { coordinator.reconcile_deleting(target).await });
+            let mut handle = std::pin::pin!(handle);
+            match anchor {
+                Some(anchor) => {
+                    respond_get_anchor(&mut handle, &anchor, "rv-observed", false).await
+                }
+                None => respond_anchor_absent(&mut handle).await,
+            }
+
+            assert_eq!(task.await.unwrap().unwrap(), None);
+            assert_eq!(fake.calls(), (0, 0, 0));
+            assert_no_request(&mut handle).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_release_recovery_continues_only_an_existing_deleting_intent() {
+        let anchor = deleting_anchor(session_id("discord:startup-deleting"), false);
+        let fake = FakeProvisioner::all_matching();
+        let (coordinator, handle) = coordinator(fake.clone());
+        let target = anchor.session_id();
+        let task = tokio::spawn(async move { coordinator.reconcile_deleting(target).await });
+        let mut handle = std::pin::pin!(handle);
+
+        respond_get_anchor(&mut handle, &anchor, "rv-deleting", false).await;
+        respond_anchor_delete(&mut handle, "rv-deleting", StatusCode::OK).await;
+        respond_anchor_absent(&mut handle).await;
+
+        assert_eq!(task.await.unwrap().unwrap(), Some(ReleaseOutcome::Released));
+        assert_eq!(fake.calls(), (1, 1, 1));
+        assert_no_request(&mut handle).await;
+    }
+
+    #[tokio::test]
+    async fn durable_release_recovery_only_observes_a_terminating_anchor() {
+        let anchor = deleting_anchor(session_id("discord:startup-terminating"), false);
+        let fake = FakeProvisioner::all_matching();
+        let (coordinator, handle) = coordinator(fake.clone());
+        let target = anchor.session_id();
+        let task = tokio::spawn(async move { coordinator.reconcile_deleting(target).await });
+        let mut handle = std::pin::pin!(handle);
+
+        respond_get_anchor(&mut handle, &anchor, "rv-terminating", true).await;
+        respond_get_anchor(&mut handle, &anchor, "rv-terminating", true).await;
+
+        assert_eq!(task.await.unwrap().unwrap(), Some(ReleaseOutcome::Pending));
+        assert_eq!(fake.calls(), (0, 0, 0));
         assert_no_request(&mut handle).await;
     }
 }

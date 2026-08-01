@@ -210,6 +210,32 @@ impl ActivationCoordinator {
         }
     }
 
+    /// Continue only an already-durable `Provisioning` intent.
+    ///
+    /// Startup inventory is merely a scheduling hint. This entrypoint owns
+    /// the session lock and re-reads the anchor before it performs any worker
+    /// generation operation. It never creates an absent anchor and never
+    /// advances a stopped generation.
+    pub(crate) async fn reconcile_provisioning(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<ActivationPreparation>, ActivationError> {
+        let _guard = self.locks.lock(session_id).await;
+        let Some(anchor) = self.store.get(session_id).await? else {
+            return Ok(None);
+        };
+        if anchor.state().phase() != SessionPhase::Provisioning {
+            return Ok(None);
+        }
+        if anchor.state().profile() != self.profile.profile() {
+            return Err(ActivationError::AnchorProfileMismatch);
+        }
+        if anchor.state().pod_uid().is_some() {
+            return Ok(None);
+        }
+        self.ensure_generation(anchor).await.map(Some)
+    }
+
     fn validate_request(&self, request: &ActivationRequestV1) -> Result<(), ActivationError> {
         if request.scope_id() != self.store.scope_id() {
             return Err(ActivationError::ScopeMismatch);
@@ -609,6 +635,19 @@ mod tests {
         )
     }
 
+    fn missing_response() -> Response<Body> {
+        json_response(
+            StatusCode::NOT_FOUND,
+            json!({
+                "apiVersion": "v1",
+                "kind": "Status",
+                "status": "Failure",
+                "reason": "NotFound",
+                "code": 404
+            }),
+        )
+    }
+
     async fn request_body(request: Request<Body>) -> Value {
         let bytes = request.into_body().collect_bytes().await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
@@ -847,5 +886,107 @@ mod tests {
         assert_eq!(fake.lifecycle_calls(), 1);
         assert!(fake.ensure_calls().is_empty());
         assert_no_request(&mut handle).await;
+    }
+
+    #[tokio::test]
+    async fn durable_provisioning_recovery_only_continues_a_fresh_provisioning_anchor() {
+        let existing = anchor_in_phase(
+            session_id("discord:startup-provisioning"),
+            SessionPhase::Provisioning,
+            None,
+        );
+        let fake = FakeProvisioner::new(CleanupBehavior::Matching);
+        let shared = Arc::new(fake.clone());
+        let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+        let store =
+            ConfigMapAnchorStore::new(Client::new(service, "default"), NAMESPACE, scope_id())
+                .unwrap();
+        let coordinator = ActivationCoordinator::new(
+            store,
+            SessionLocks::new(),
+            profile(),
+            shared.clone(),
+            shared,
+        );
+        let target = existing.session_id();
+        let task = tokio::spawn(async move { coordinator.reconcile_provisioning(target).await });
+        let mut handle = std::pin::pin!(handle);
+
+        let (get, send) = handle.next_request().await.unwrap();
+        assert_eq!(get.method(), Method::GET);
+        send.send_response(json_response(StatusCode::OK, config_map(&existing, "rv-1")));
+        let (replace, send) = handle.next_request().await.unwrap();
+        assert_eq!(replace.method(), Method::PUT);
+        let mut body = request_body(replace).await;
+        let observed: SessionAnchorV1 =
+            serde_json::from_str(body["data"]["anchor.json"].as_str().unwrap()).unwrap();
+        assert_eq!(observed.phase(), SessionPhase::Provisioning);
+        assert_eq!(observed.pod_uid(), Some(POD_UID));
+        body["metadata"]["resourceVersion"] = json!("rv-2");
+        send.send_response(json_response(StatusCode::OK, body));
+
+        assert!(matches!(
+            task.await.unwrap().unwrap(),
+            Some(ActivationPreparation::AwaitingRegistration { pod_uid, .. })
+                if pod_uid == POD_UID
+        ));
+        assert_eq!(fake.lifecycle_calls(), 0);
+        assert_eq!(fake.ensure_calls().len(), 1);
+        assert_no_request(&mut handle).await;
+    }
+
+    #[tokio::test]
+    async fn durable_provisioning_recovery_never_creates_or_resumes_state() {
+        for existing in [
+            None,
+            Some(anchor_in_phase(
+                session_id("discord:startup-ready"),
+                SessionPhase::Ready,
+                Some(POD_UID),
+            )),
+            Some(anchor_in_phase(
+                session_id("discord:startup-suspended"),
+                SessionPhase::Suspended,
+                None,
+            )),
+            Some(anchor_in_phase(
+                session_id("discord:startup-pod-observed"),
+                SessionPhase::Provisioning,
+                Some(POD_UID),
+            )),
+        ] {
+            let fake = FakeProvisioner::new(CleanupBehavior::Matching);
+            let shared = Arc::new(fake.clone());
+            let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+            let store =
+                ConfigMapAnchorStore::new(Client::new(service, "default"), NAMESPACE, scope_id())
+                    .unwrap();
+            let coordinator = ActivationCoordinator::new(
+                store,
+                SessionLocks::new(),
+                profile(),
+                shared.clone(),
+                shared,
+            );
+            let target = existing.as_ref().map_or_else(
+                || session_id("discord:startup-absent"),
+                SessionAnchorV1::session_id,
+            );
+            let task =
+                tokio::spawn(async move { coordinator.reconcile_provisioning(target).await });
+            let mut handle = std::pin::pin!(handle);
+            let (_get, send) = handle.next_request().await.unwrap();
+            match existing {
+                Some(anchor) => {
+                    send.send_response(json_response(StatusCode::OK, config_map(&anchor, "rv-1")))
+                }
+                None => send.send_response(missing_response()),
+            }
+
+            assert_eq!(task.await.unwrap().unwrap(), None);
+            assert_eq!(fake.lifecycle_calls(), 0);
+            assert!(fake.ensure_calls().is_empty());
+            assert_no_request(&mut handle).await;
+        }
     }
 }

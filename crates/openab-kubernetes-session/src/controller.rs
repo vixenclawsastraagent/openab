@@ -1,5 +1,6 @@
 mod activation;
 mod cleanup;
+mod composition;
 mod generation;
 mod lifecycle;
 mod locks;
@@ -13,6 +14,10 @@ pub use activation::{
 };
 pub use cleanup::{
     CleanupProgress, LifecycleProvisioner, ReleaseCleanupProgress, ReleaseProvisioner,
+};
+pub use composition::{
+    ControllerCoordinatorConfigError, ControllerCoordinators, DurableIntentError,
+    DurableIntentOutcome, DurableIntentReport, DurableIntentResult,
 };
 pub use generation::{
     AllChildrenAbsentProof, ComputeAbsentProof, KubernetesGenerationProvisioner,
