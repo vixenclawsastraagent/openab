@@ -61,6 +61,9 @@ pub struct SessionPool {
     meta_path: PathBuf,
     mapping_load_error: Option<String>,
     default_config_options: HashMap<String, String>,
+    /// Strict-runtime capacity includes workers that are still provisioning;
+    /// default local/AgentCore behavior never consults it.
+    strict_capacity: isolated::StrictCapacity,
 }
 
 type CancelHandle = (Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>, String);
@@ -242,6 +245,7 @@ impl SessionPool {
             meta_path,
             mapping_load_error,
             default_config_options,
+            strict_capacity: isolated::StrictCapacity::new(max_sessions),
         }
     }
 
@@ -347,11 +351,27 @@ impl SessionPool {
         thread_id: &str,
         working_dir_override: Option<&str>,
     ) -> Result<bool> {
+        if self.session_context == SessionContextMode::OpenabV1 {
+            self.strict_capacity
+                .ensure_session_admission_open(thread_id)?;
+        }
         let create_gate = {
             let mut state = self.state.write().await;
+            // Linearize gate installation with strict reset admission. A
+            // creator that passed the fast check above cannot install a new
+            // provisioning gate after reset has fenced this key.
+            if self.session_context == SessionContextMode::OpenabV1 {
+                self.strict_capacity
+                    .ensure_session_admission_open(thread_id)?;
+            }
             get_or_insert_gate(&mut state.creating, thread_id)
         };
         let _create_guard = create_gate.lock().await;
+
+        if self.session_context == SessionContextMode::OpenabV1 {
+            self.strict_capacity
+                .ensure_session_admission_open(thread_id)?;
+        }
 
         let (existing, saved_session_id) = {
             let state = self.state.read().await;
@@ -382,7 +402,7 @@ impl SessionPool {
             }
         }
 
-        let (eviction_candidate, skipped_locked_candidates) =
+        let (eviction_candidate, skipped_locked_candidates, mut strict_reservation) =
             if self.session_context == SessionContextMode::None {
                 // Snapshot active handles so we can inspect them outside the state lock.
                 let snapshot: Vec<(String, Arc<Mutex<AcpConnection>>)> = {
@@ -418,10 +438,10 @@ impl SessionPool {
                         eviction_candidate = Some(candidate);
                     }
                 }
-                (eviction_candidate, skipped_locked_candidates)
+                (eviction_candidate, skipped_locked_candidates, None)
             } else {
-                isolated::suspend_for_capacity(self, thread_id, had_existing).await?;
-                (None, 0)
+                let reservation = isolated::reserve_for_provisioning(self, thread_id).await?;
+                (None, 0, Some(reservation))
             };
 
         // Resolve effective working directory: stored per-session > explicit override > global config.
@@ -451,6 +471,13 @@ impl SessionPool {
             session_spawn_context.as_ref(),
         )
         .await?;
+
+        // Once the bridge process has started, a worker may exist even if ACP
+        // initialization fails. Keep the strict slot occupied until a later
+        // controller-acknowledged release proves that capacity is free.
+        if let Some(reservation) = strict_reservation.as_mut() {
+            reservation.mark_uncertain();
+        }
 
         new_conn.initialize().await?;
 
@@ -522,12 +549,40 @@ impl SessionPool {
                     .ok_or_else(|| anyhow!("isolated session bridge has no ACP session ID"))?,
             ),
         };
+        let uncommitted_provenance = if resumed {
+            isolated::UncommittedSessionProvenance::ResumedBorrowed
+        } else {
+            isolated::UncommittedSessionProvenance::FreshOwned
+        };
         let activity_handle = new_conn.activity_handle();
         let child_pgid = new_conn.child_pgid();
         let cancel_session_id = new_conn.acp_session_id.clone().unwrap_or_default();
         let new_conn = Arc::new(Mutex::new(new_conn));
 
         let mut state = self.state.write().await;
+
+        // This check and the active-map publish are linearized by the state
+        // write lock. Shutdown closes strict admission before taking its
+        // snapshot: a publish accepted here is therefore visible to that
+        // snapshot, while a later publish is rolled back and never installed.
+        if self.session_context == SessionContextMode::OpenabV1 {
+            if let Err(error) = self
+                .strict_capacity
+                .ensure_session_admission_open(thread_id)
+            {
+                drop(state);
+                let lifecycle = lifecycle_handle
+                    .as_ref()
+                    .expect("strict sessions always have a lifecycle handle");
+                return Err(isolated::rollback_uncommitted_session(
+                    lifecycle,
+                    error,
+                    strict_reservation,
+                    uncommitted_provenance,
+                )
+                .await);
+            }
+        }
 
         // Another task may have created a healthy connection while we were
         // initializing this one.
@@ -578,7 +633,13 @@ impl SessionPool {
             let error = anyhow!("pool exhausted ({} sessions)", self.max_sessions);
             if let Some(lifecycle) = lifecycle_handle.as_ref() {
                 drop(state);
-                return Err(isolated::rollback_uncommitted_session(lifecycle, error).await);
+                return Err(isolated::rollback_uncommitted_session(
+                    lifecycle,
+                    error,
+                    strict_reservation,
+                    uncommitted_provenance,
+                )
+                .await);
             }
             return Err(error);
         }
@@ -595,7 +656,13 @@ impl SessionPool {
                 let lifecycle = lifecycle_handle
                     .as_ref()
                     .expect("strict sessions always have a lifecycle handle");
-                return Err(isolated::rollback_uncommitted_session(lifecycle, error).await);
+                return Err(isolated::rollback_uncommitted_session(
+                    lifecycle,
+                    error,
+                    strict_reservation,
+                    uncommitted_provenance,
+                )
+                .await);
             }
         }
         state.persisted = persisted;
@@ -619,6 +686,10 @@ impl SessionPool {
         }
         if self.session_context == SessionContextMode::None {
             self.save_mapping(&state.persisted);
+        }
+
+        if let Some(reservation) = strict_reservation {
+            reservation.commit();
         }
 
         // Persist workspace override only after session spawn succeeded (口渡 F2).
@@ -650,6 +721,10 @@ impl SessionPool {
             Box<dyn std::future::Future<Output = Result<R>> + Send + 'a>,
         >,
     {
+        if self.session_context == SessionContextMode::OpenabV1 {
+            self.strict_capacity
+                .ensure_session_admission_open(thread_id)?;
+        }
         let (connection, lifecycle_gate) = {
             let state = self.state.read().await;
             let connection = state
@@ -670,6 +745,8 @@ impl SessionPool {
         let mut connection_guard = connection.lock().await;
         if let Some(gate) = lifecycle_gate {
             let _gate_guard = gate.lock().await;
+            self.strict_capacity
+                .ensure_session_admission_open(thread_id)?;
             let state = self.state.read().await;
             let is_current = state
                 .active
@@ -703,6 +780,15 @@ impl SessionPool {
         config_id: &str,
         value: &str,
     ) -> Result<Vec<ConfigOption>> {
+        if self.session_context == SessionContextMode::OpenabV1 {
+            let config_id = config_id.to_string();
+            let value = value.to_string();
+            return self
+                .with_connection(thread_id, move |connection| {
+                    Box::pin(async move { connection.set_config_option(&config_id, &value).await })
+                })
+                .await;
+        }
         let conn = {
             let state = self.state.read().await;
             state
@@ -719,6 +805,11 @@ impl SessionPool {
     /// (kiro-cli extension). Fails when there is no active session for the
     /// thread or the backend does not support usage queries.
     pub async fn get_usage(&self, thread_id: &str) -> Result<crate::acp::protocol::UsageReport> {
+        if self.session_context == SessionContextMode::OpenabV1 {
+            return self
+                .with_connection(thread_id, |connection| Box::pin(connection.get_usage()))
+                .await;
+        }
         let conn = {
             let state = self.state.read().await;
             state
@@ -774,33 +865,7 @@ impl SessionPool {
     /// trigger a fresh `get_or_create` with a new ACP session.
     pub async fn reset_session(&self, thread_id: &str) -> Result<()> {
         if self.session_context == SessionContextMode::OpenabV1 {
-            let create_gate = {
-                let mut state = self.state.write().await;
-                get_or_insert_gate(&mut state.creating, thread_id)
-            };
-            let _create_guard = create_gate.lock().await;
-
-            let lifecycle = {
-                let state = self.state.read().await;
-                if !state.active.contains_key(thread_id) {
-                    return Err(anyhow!("no active isolated session for thread {thread_id}"));
-                }
-                state
-                    .lifecycle_handles
-                    .get(thread_id)
-                    .cloned()
-                    .ok_or_else(|| {
-                        anyhow!("isolated session for thread {thread_id} has no lifecycle handle")
-                    })?
-            };
-
-            isolated::release_strict_session(
-                &self.state,
-                &self.mapping_path,
-                thread_id,
-                &lifecycle,
-            )
-            .await?;
+            isolated::reset_strict_session(self, thread_id, isolated::STRICT_RESET_BUDGET).await?;
 
             info!(thread_id, "isolated session released");
             return Ok(());
@@ -969,6 +1034,11 @@ impl SessionPool {
     }
 
     pub async fn shutdown(&self) {
+        if self.session_context == SessionContextMode::OpenabV1 {
+            isolated::shutdown_strict(self).await;
+            return;
+        }
+
         // Snapshot active handles, then drop state lock before awaiting
         // per-connection mutexes (lock ordering: never hold state while
         // awaiting a connection lock).
