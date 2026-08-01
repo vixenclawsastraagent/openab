@@ -49,6 +49,11 @@ pub struct JsonRpcMessage {
     pub result: Option<Value>,
     pub error: Option<JsonRpcError>,
     pub params: Option<Value>,
+    /// Original JSON text retained for the small number of
+    /// security-sensitive extension responses that require an exact envelope.
+    /// Ordinary ACP parsing remains extension-compatible.
+    #[serde(skip)]
+    pub(crate) raw: Option<Box<str>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

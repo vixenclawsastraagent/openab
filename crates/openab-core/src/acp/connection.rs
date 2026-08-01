@@ -1,10 +1,12 @@
 #[cfg(test)]
 pub(crate) use super::lifecycle::SessionLifecycleControl;
 use super::lifecycle::{
-    new_lifecycle_handle, parse_lifecycle_capabilities, session_spawn_env, PendingRequests,
-    OPENAB_META_NAMESPACE,
+    mapping_absent_initialization, new_lifecycle_handle, parse_lifecycle_capabilities,
+    session_spawn_env, PendingRequests, OPENAB_META_NAMESPACE,
 };
-pub(crate) use super::lifecycle::{LifecycleCapabilities, LifecycleHandle, SessionSpawnContext};
+pub(crate) use super::lifecycle::{
+    BrokerMappingExpectation, LifecycleCapabilities, LifecycleHandle, SessionSpawnContext,
+};
 use crate::acp::protocol::{
     parse_config_options, parse_usage_report, ConfigOption, JsonRpcMessage, JsonRpcRequest,
     JsonRpcResponse, UsageReport,
@@ -188,7 +190,7 @@ pub struct AcpConnection {
     pub acp_session_id: Option<String>,
     pub supports_load_session: bool,
     lifecycle_capabilities: LifecycleCapabilities,
-    requires_openab_lifecycle: bool,
+    session_spawn_context: Option<SessionSpawnContext>,
     /// Agent name from `initialize` (`agentInfo.name`), e.g. "Kiro CLI Agent".
     /// Used to gate agent-specific extension methods.
     pub agent_name: String,
@@ -252,10 +254,12 @@ pub(crate) async fn run_reader_loop<R, W>(
                 break;
             }
         }
-        let msg: JsonRpcMessage = match serde_json::from_str(line.trim()) {
-            Ok(m) => m,
+        let raw = line.trim();
+        let mut msg: JsonRpcMessage = match serde_json::from_str(raw) {
+            Ok(message) => message,
             Err(_) => continue,
         };
+        msg.raw = Some(raw.into());
         debug!(line = line.trim(), "acp_recv");
 
         // Auto-reply session/request_permission
@@ -295,6 +299,7 @@ pub(crate) async fn run_reader_loop<R, W>(
                         result: msg.result.clone(),
                         error: msg.error.clone(),
                         params: None,
+                        raw: msg.raw.clone(),
                     });
                 }
                 let _ = tx.send(msg);
@@ -326,6 +331,7 @@ pub(crate) async fn run_reader_loop<R, W>(
                 data: None,
             }),
             params: None,
+            raw: None,
         });
     }
     // Close the notify channel so rx.recv() returns None
@@ -360,8 +366,6 @@ impl AcpConnection {
         session_context: Option<&SessionSpawnContext>,
     ) -> Result<Self> {
         info!(cmd = command, ?args, cwd = working_dir, "spawning agent");
-        let requires_openab_lifecycle = session_context.is_some();
-
         let mut cmd = tokio::process::Command::new(command);
         cmd.args(args)
             .stdin(std::process::Stdio::piped())
@@ -511,7 +515,7 @@ impl AcpConnection {
             acp_session_id: None,
             supports_load_session: false,
             lifecycle_capabilities: LifecycleCapabilities::default(),
-            requires_openab_lifecycle,
+            session_spawn_context: session_context.cloned(),
             agent_name: String::new(),
             config_options: Vec::new(),
             last_active: Instant::now(),
@@ -542,7 +546,11 @@ impl AcpConnection {
         Ok(())
     }
 
-    async fn send_request(&self, method: &str, params: Option<Value>) -> Result<JsonRpcMessage> {
+    async fn send_request_raw(
+        &self,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<JsonRpcMessage> {
         let id = self.next_id();
         let req = JsonRpcRequest::new(id, method, params);
         let data = serde_json::to_string(&req)?;
@@ -558,15 +566,20 @@ impl AcpConnection {
             .map_err(|_| anyhow!("timeout waiting for {method} response"))?
             .map_err(|_| anyhow!("channel closed waiting for {method}"))?;
 
-        if let Some(err) = &resp.error {
-            return Err(anyhow!("{err}"));
+        Ok(resp)
+    }
+
+    async fn send_request(&self, method: &str, params: Option<Value>) -> Result<JsonRpcMessage> {
+        let resp = self.send_request_raw(method, params).await?;
+        if let Some(error) = &resp.error {
+            return Err(anyhow!("{error}"));
         }
         Ok(resp)
     }
 
     pub async fn initialize(&mut self) -> Result<()> {
         let resp = self
-            .send_request(
+            .send_request_raw(
                 "initialize",
                 Some(json!({
                     "protocolVersion": 1,
@@ -575,6 +588,15 @@ impl AcpConnection {
                 })),
             )
             .await?;
+
+        if let Some(error) = &resp.error {
+            if let Some(mapping_absent) =
+                mapping_absent_initialization(self.session_spawn_context.as_ref(), &resp)
+            {
+                return Err(anyhow::Error::new(mapping_absent));
+            }
+            return Err(anyhow!("{error}"));
+        }
 
         let result = resp.result.as_ref();
         let agent_name = result
@@ -589,7 +611,7 @@ impl AcpConnection {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         self.lifecycle_capabilities = parse_lifecycle_capabilities(result);
-        if self.requires_openab_lifecycle {
+        if self.session_spawn_context.is_some() {
             if !self.supports_load_session {
                 return Err(anyhow!(
                     "isolated session bridge did not advertise loadSession"
@@ -606,7 +628,7 @@ impl AcpConnection {
                 ));
             }
         }
-        if self.requires_openab_lifecycle {
+        if self.session_spawn_context.is_some() {
             info!(
                 agent = agent_name,
                 load_session = self.supports_load_session,
@@ -825,9 +847,7 @@ impl AcpConnection {
     }
 
     pub(crate) fn lifecycle_handle(&self) -> Option<LifecycleHandle> {
-        if !self.requires_openab_lifecycle {
-            return None;
-        }
+        self.session_spawn_context.as_ref()?;
         let session_id = self.acp_session_id.clone()?;
         Some(new_lifecycle_handle(
             Arc::clone(&self.stdin),
@@ -913,9 +933,37 @@ impl Drop for AcpConnection {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_agent_env, build_permission_response, pick_best_option, SessionSpawnContext,
+        build_agent_env, build_permission_response, pick_best_option, BrokerMappingExpectation,
+        SessionSpawnContext,
+    };
+    use crate::acp::lifecycle::{
+        MappingAbsentInitialization, MAPPING_ABSENT_INITIALIZATION_ERROR_CODE,
     };
     use serde_json::json;
+
+    static MAPPING_EXPECTATION_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct EnvironmentRestore {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvironmentRestore {
+        fn set(name: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(name);
+            std::env::set_var(name, value);
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvironmentRestore {
+        fn drop(&mut self) {
+            match self.previous.as_ref() {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
 
     #[cfg(unix)]
     async fn spawn_default_test_agent(
@@ -945,7 +993,7 @@ while :; do sleep 1; done
         "#;
         let mut connection = spawn_default_test_agent(temp.path(), script).await;
         connection.initialize().await.unwrap();
-        assert!(!connection.requires_openab_lifecycle);
+        assert!(connection.session_spawn_context.is_none());
         assert_eq!(
             connection.lifecycle_capabilities,
             super::LifecycleCapabilities::default()
@@ -981,16 +1029,21 @@ while :; do sleep 1; done
     #[cfg(unix)]
     #[tokio::test]
     async fn broker_session_context_overrides_programmatic_agent_env() {
+        let _environment_lock = MAPPING_EXPECTATION_ENV_LOCK.lock().await;
+        let _environment_restore =
+            EnvironmentRestore::set("OPENAB_SESSION_MAPPING_EXPECTATION", "spoofed-inherited");
         let temp = tempfile::tempdir().unwrap();
         let key_output = temp.path().join("session-key");
         let attempt_output = temp.path().join("session-attempt");
+        let mapping_expectation_output = temp.path().join("mapping-expectation");
         let args = vec![
             "-c".to_string(),
-            r#"printf '%s' "$OPENAB_SESSION_KEY" > "$1"; printf '%s' "$OPENAB_SESSION_ATTEMPT_ID" > "$2""#
+            r#"printf '%s' "$OPENAB_SESSION_KEY" > "$1"; printf '%s' "$OPENAB_SESSION_ATTEMPT_ID" > "$2"; printf '%s' "$OPENAB_SESSION_MAPPING_EXPECTATION" > "$3""#
                 .to_string(),
             "openab-session-env-test".to_string(),
             key_output.to_string_lossy().to_string(),
             attempt_output.to_string_lossy().to_string(),
+            mapping_expectation_output.to_string_lossy().to_string(),
         ];
         let mut configured_env = std::collections::HashMap::new();
         configured_env.insert("OPENAB_SESSION_KEY".to_string(), "spoofed".to_string());
@@ -998,14 +1051,18 @@ while :; do sleep 1; done
             "OPENAB_SESSION_ATTEMPT_ID".to_string(),
             "spoofed-attempt".to_string(),
         );
-        let context = SessionSpawnContext::from_parts("discord:thread-123", "attempt-123");
+        let context = SessionSpawnContext::from_parts(
+            "discord:thread-123",
+            "87f08c0d-25e7-47dc-a7b6-e3f3cc89f977",
+            BrokerMappingExpectation::Present,
+        );
 
         let connection = super::AcpConnection::spawn_with_context(
             "/bin/sh",
             &args,
             temp.path().to_string_lossy().as_ref(),
             &configured_env,
-            &[],
+            &["OPENAB_SESSION_MAPPING_EXPECTATION".to_string()],
             Some(&context),
         )
         .await
@@ -1013,11 +1070,14 @@ while :; do sleep 1; done
 
         let observed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if let (Ok(key), Ok(attempt)) = (
+                if let (Ok(key), Ok(attempt), Ok(mapping_expectation)) = (
                     tokio::fs::read_to_string(&key_output).await,
                     tokio::fs::read_to_string(&attempt_output).await,
+                    tokio::fs::read_to_string(&mapping_expectation_output).await,
                 ) {
-                    break (key, attempt);
+                    if !key.is_empty() && !attempt.is_empty() && !mapping_expectation.is_empty() {
+                        break (key, attempt, mapping_expectation);
+                    }
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
@@ -1027,9 +1087,175 @@ while :; do sleep 1; done
 
         assert_eq!(
             observed,
-            ("discord:thread-123".to_string(), "attempt-123".to_string())
+            (
+                "discord:thread-123".to_string(),
+                "87f08c0d-25e7-47dc-a7b6-e3f3cc89f977".to_string(),
+                "present".to_string(),
+            )
         );
         drop(connection);
+    }
+
+    #[cfg(unix)]
+    async fn initialize_with_response(
+        temp: &std::path::Path,
+        response: serde_json::Value,
+        context: Option<&SessionSpawnContext>,
+    ) -> anyhow::Error {
+        let response = serde_json::to_string(&response).unwrap();
+        let args = vec![
+            "-c".to_string(),
+            "IFS= read -r line; printf '%s\\n' \"$INITIALIZE_RESPONSE\"".to_string(),
+        ];
+        let env = std::collections::HashMap::from([("INITIALIZE_RESPONSE".to_string(), response)]);
+        let mut connection = super::AcpConnection::spawn_with_context(
+            "/bin/sh",
+            &args,
+            temp.to_string_lossy().as_ref(),
+            &env,
+            &[],
+            context,
+        )
+        .await
+        .unwrap();
+        connection.initialize().await.unwrap_err()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn initialize_downcasts_only_exact_present_mapping_absence() {
+        let temp = tempfile::tempdir().unwrap();
+        let attempt_id = "87f08c0d-25e7-47dc-a7b6-e3f3cc89f977";
+        let present = SessionSpawnContext::from_parts(
+            "discord:thread-123",
+            attempt_id,
+            BrokerMappingExpectation::Present,
+        );
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {
+                "code": MAPPING_ABSENT_INITIALIZATION_ERROR_CODE,
+                "message": "controller detail must not escape",
+                "data": {
+                    "version": 1,
+                    "outcome": "mapping_absent",
+                    "attemptId": attempt_id,
+                },
+            },
+        });
+
+        let error = initialize_with_response(temp.path(), response.clone(), Some(&present)).await;
+        assert!(error
+            .downcast_ref::<MappingAbsentInitialization>()
+            .is_some());
+        assert!(!error.to_string().contains("controller detail"));
+
+        let absent = SessionSpawnContext::from_parts(
+            "discord:thread-123",
+            attempt_id,
+            BrokerMappingExpectation::Absent,
+        );
+        let error = initialize_with_response(temp.path(), response.clone(), Some(&absent)).await;
+        assert!(error
+            .downcast_ref::<MappingAbsentInitialization>()
+            .is_none());
+
+        let error = initialize_with_response(temp.path(), response, None).await;
+        assert!(error
+            .downcast_ref::<MappingAbsentInitialization>()
+            .is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn initialize_keeps_uncorrelated_or_malformed_mapping_absence_generic() {
+        let temp = tempfile::tempdir().unwrap();
+        let attempt_id = "87f08c0d-25e7-47dc-a7b6-e3f3cc89f977";
+        let context = SessionSpawnContext::from_parts(
+            "discord:thread-123",
+            attempt_id,
+            BrokerMappingExpectation::Present,
+        );
+        let valid_data = json!({
+            "version": 1,
+            "outcome": "mapping_absent",
+            "attemptId": attempt_id,
+        });
+        let cases = [
+            (
+                MAPPING_ABSENT_INITIALIZATION_ERROR_CODE + 1,
+                valid_data.clone(),
+            ),
+            (
+                MAPPING_ABSENT_INITIALIZATION_ERROR_CODE,
+                json!({
+                    "version": 1,
+                    "outcome": "mapping_absent",
+                    "attemptId": "b43160d0-1ee1-4562-99c7-6697899b7208",
+                }),
+            ),
+            (
+                MAPPING_ABSENT_INITIALIZATION_ERROR_CODE,
+                json!({
+                    "version": 1,
+                    "outcome": "mapping_absent",
+                    "attemptId": attempt_id,
+                    "unexpected": true,
+                }),
+            ),
+            (
+                MAPPING_ABSENT_INITIALIZATION_ERROR_CODE,
+                json!({
+                    "version": 2,
+                    "outcome": "mapping_absent",
+                    "attemptId": attempt_id,
+                }),
+            ),
+            (
+                MAPPING_ABSENT_INITIALIZATION_ERROR_CODE,
+                json!({
+                    "version": 1,
+                    "outcome": "mapping_absent",
+                    "attemptId": "not-a-uuid",
+                }),
+            ),
+        ];
+
+        for (code, data) in cases {
+            let response = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {
+                    "code": code,
+                    "message": "generic controller failure",
+                    "data": data,
+                },
+            });
+            let error = initialize_with_response(temp.path(), response, Some(&context)).await;
+            assert!(
+                error
+                    .downcast_ref::<MappingAbsentInitialization>()
+                    .is_none(),
+                "unexpected typed error for {error:?}"
+            );
+            assert!(error.to_string().contains("generic controller failure"));
+        }
+
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {},
+            "error": {
+                "code": MAPPING_ABSENT_INITIALIZATION_ERROR_CODE,
+                "message": "malformed response envelope",
+                "data": valid_data,
+            },
+        });
+        let error = initialize_with_response(temp.path(), response, Some(&context)).await;
+        assert!(error
+            .downcast_ref::<MappingAbsentInitialization>()
+            .is_none());
     }
 
     #[test]

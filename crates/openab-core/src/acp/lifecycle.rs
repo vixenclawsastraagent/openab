@@ -1,7 +1,9 @@
 use crate::acp::protocol::{JsonRpcMessage, JsonRpcRequest};
 use anyhow::{anyhow, Result};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -13,6 +15,7 @@ use tracing::debug;
 pub(super) const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const LIFECYCLE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 pub(super) const OPENAB_META_NAMESPACE: &str = "openab.dev";
+pub(crate) const MAPPING_ABSENT_INITIALIZATION_ERROR_CODE: i64 = -32041;
 
 pub(crate) type PendingRequests = Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>;
 
@@ -263,24 +266,49 @@ pub(super) fn new_lifecycle_handle(
 /// Broker-owned context injected when spawning an ACP process for a logical
 /// session. This is deliberately separate from operator-controlled `[agent]`
 /// environment configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BrokerMappingExpectation {
+    Absent,
+    Present,
+}
+
+impl BrokerMappingExpectation {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Present => "present",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SessionSpawnContext {
     logical_session_key: String,
     attempt_id: String,
+    broker_mapping_expectation: BrokerMappingExpectation,
 }
 
 impl SessionSpawnContext {
-    pub(crate) fn new(logical_session_key: impl Into<String>) -> Self {
-        Self::from_parts(logical_session_key, uuid::Uuid::new_v4().to_string())
+    pub(crate) fn new(
+        logical_session_key: impl Into<String>,
+        broker_mapping_expectation: BrokerMappingExpectation,
+    ) -> Self {
+        Self::from_parts(
+            logical_session_key,
+            uuid::Uuid::new_v4().to_string(),
+            broker_mapping_expectation,
+        )
     }
 
     pub(super) fn from_parts(
         logical_session_key: impl Into<String>,
         attempt_id: impl Into<String>,
+        broker_mapping_expectation: BrokerMappingExpectation,
     ) -> Self {
         Self {
             logical_session_key: logical_session_key.into(),
             attempt_id: attempt_id.into(),
+            broker_mapping_expectation,
         }
     }
 
@@ -291,6 +319,89 @@ impl SessionSpawnContext {
     pub(crate) fn attempt_id(&self) -> &str {
         &self.attempt_id
     }
+
+    pub(crate) fn broker_mapping_expectation(&self) -> BrokerMappingExpectation {
+        self.broker_mapping_expectation
+    }
+}
+
+/// Sanitized signal that the controller authoritatively found no worker state
+/// for the durable mapping supplied by this broker.
+///
+/// The untrusted JSON-RPC message and data are deliberately not retained.
+/// Callers can downcast `anyhow::Error` to this type without parsing text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MappingAbsentInitialization;
+
+impl fmt::Display for MappingAbsentInitialization {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("isolated session durable mapping is absent")
+    }
+}
+
+impl std::error::Error for MappingAbsentInitialization {}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MappingAbsentInitializationData {
+    version: u8,
+    outcome: MappingAbsentInitializationOutcome,
+    attempt_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MappingAbsentInitializationEnvelope {
+    jsonrpc: String,
+    #[serde(rename = "id")]
+    _request_id: u64,
+    error: MappingAbsentInitializationError,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MappingAbsentInitializationError {
+    code: i64,
+    #[serde(rename = "message")]
+    _message: String,
+    data: MappingAbsentInitializationData,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MappingAbsentInitializationOutcome {
+    MappingAbsent,
+}
+
+pub(super) fn mapping_absent_initialization(
+    context: Option<&SessionSpawnContext>,
+    message: &JsonRpcMessage,
+) -> Option<MappingAbsentInitialization> {
+    let context = context?;
+    if context.broker_mapping_expectation() != BrokerMappingExpectation::Present {
+        return None;
+    }
+    let envelope: MappingAbsentInitializationEnvelope =
+        serde_json::from_str(message.raw.as_deref()?).ok()?;
+    if envelope.jsonrpc != "2.0" || envelope.error.code != MAPPING_ABSENT_INITIALIZATION_ERROR_CODE
+    {
+        return None;
+    }
+    let data = envelope.error.data;
+    if data.version != 1
+        || !matches!(
+            data.outcome,
+            MappingAbsentInitializationOutcome::MappingAbsent
+        )
+        || data.attempt_id != context.attempt_id()
+        || uuid::Uuid::parse_str(&data.attempt_id)
+            .ok()
+            .map(|attempt_id| attempt_id.is_nil())
+            .unwrap_or(true)
+    {
+        return None;
+    }
+    Some(MappingAbsentInitialization)
 }
 
 pub(super) fn session_spawn_env(
@@ -301,6 +412,10 @@ pub(super) fn session_spawn_env(
             vec![
                 (super::SESSION_KEY_ENV, context.logical_session_key()),
                 (super::SESSION_ATTEMPT_ID_ENV, context.attempt_id()),
+                (
+                    super::SESSION_MAPPING_EXPECTATION_ENV,
+                    context.broker_mapping_expectation().as_str(),
+                ),
             ]
         })
         .unwrap_or_default()
@@ -309,8 +424,9 @@ pub(super) fn session_spawn_env(
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_lifecycle_capabilities, send_bounded_request, session_spawn_env, AcpLifecycleHandle,
-        LifecycleCapabilities, PendingRequests, SessionSpawnContext,
+        mapping_absent_initialization, parse_lifecycle_capabilities, send_bounded_request,
+        session_spawn_env, AcpLifecycleHandle, BrokerMappingExpectation, LifecycleCapabilities,
+        PendingRequests, SessionSpawnContext, MAPPING_ABSENT_INITIALIZATION_ERROR_CODE,
     };
     use crate::acp::connection::run_reader_loop;
     use crate::acp::protocol::JsonRpcMessage;
@@ -333,6 +449,7 @@ mod tests {
             result: Some(result),
             error: None,
             params: None,
+            raw: None,
         }
     }
 
@@ -387,15 +504,184 @@ mod tests {
 
     #[test]
     fn openab_v1_session_spawn_context_maps_broker_owned_values() {
-        let context = SessionSpawnContext::from_parts("discord:thread-123", "attempt-123");
+        let context = SessionSpawnContext::from_parts(
+            "discord:thread-123",
+            "87f08c0d-25e7-47dc-a7b6-e3f3cc89f977",
+            BrokerMappingExpectation::Present,
+        );
 
         assert_eq!(
             session_spawn_env(Some(&context)),
             vec![
                 ("OPENAB_SESSION_KEY", "discord:thread-123"),
-                ("OPENAB_SESSION_ATTEMPT_ID", "attempt-123"),
+                (
+                    "OPENAB_SESSION_ATTEMPT_ID",
+                    "87f08c0d-25e7-47dc-a7b6-e3f3cc89f977"
+                ),
+                ("OPENAB_SESSION_MAPPING_EXPECTATION", "present"),
             ]
         );
+    }
+
+    #[test]
+    fn mapping_expectation_environment_value_is_closed() {
+        assert_eq!(BrokerMappingExpectation::Absent.as_str(), "absent");
+        assert_eq!(BrokerMappingExpectation::Present.as_str(), "present");
+    }
+
+    fn mapping_absent_response(attempt_id: &str) -> serde_json::Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {
+                "code": MAPPING_ABSENT_INITIALIZATION_ERROR_CODE,
+                "message": "controller mapping is absent",
+                "data": {
+                    "version": 1,
+                    "outcome": "mapping_absent",
+                    "attemptId": attempt_id,
+                },
+            },
+        })
+    }
+
+    fn message_with_retained_raw(raw: serde_json::Value) -> JsonRpcMessage {
+        let raw = serde_json::to_string(&raw).unwrap();
+        let mut message: JsonRpcMessage = serde_json::from_str(&raw).unwrap();
+        message.raw = Some(raw.into());
+        message
+    }
+
+    fn message_with_retained_raw_text(raw: &str) -> JsonRpcMessage {
+        // Construct the permissive generic view from a normalized Value while
+        // retaining the exact original text for strict duplicate detection.
+        let normalized: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let mut message: JsonRpcMessage = serde_json::from_value(normalized).unwrap();
+        message.raw = Some(raw.into());
+        message
+    }
+
+    #[test]
+    fn mapping_absence_requires_an_exact_retained_json_rpc_envelope() {
+        let attempt_id = "87f08c0d-25e7-47dc-a7b6-e3f3cc89f977";
+        let context = SessionSpawnContext::from_parts(
+            "discord:thread-123",
+            attempt_id,
+            BrokerMappingExpectation::Present,
+        );
+        let valid = mapping_absent_response(attempt_id);
+        assert!(mapping_absent_initialization(
+            Some(&context),
+            &message_with_retained_raw(valid.clone())
+        )
+        .is_some());
+
+        let missing_raw: JsonRpcMessage = serde_json::from_value(valid.clone()).unwrap();
+        assert!(missing_raw.raw.is_none());
+        assert!(mapping_absent_initialization(Some(&context), &missing_raw).is_none());
+
+        let mut invalid_envelopes = Vec::new();
+
+        let mut response = valid.clone();
+        response.as_object_mut().unwrap().remove("jsonrpc");
+        invalid_envelopes.push(response);
+
+        let mut response = valid.clone();
+        response["jsonrpc"] = json!("1.0");
+        invalid_envelopes.push(response);
+
+        for (field, value) in [
+            ("result", serde_json::Value::Null),
+            ("method", json!("initialize")),
+            ("params", json!({})),
+            ("unexpected", json!(true)),
+        ] {
+            let mut response = valid.clone();
+            response
+                .as_object_mut()
+                .unwrap()
+                .insert(field.to_string(), value);
+            invalid_envelopes.push(response);
+        }
+
+        let mut response = valid;
+        response["error"]
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".to_string(), json!(true));
+        invalid_envelopes.push(response);
+
+        for response in invalid_envelopes {
+            // Legacy ACP parsing remains permissive; only the typed
+            // security-sensitive classification rejects the extension.
+            let message = message_with_retained_raw(response);
+            assert!(message.error.is_some());
+            assert!(mapping_absent_initialization(Some(&context), &message).is_none());
+        }
+    }
+
+    #[test]
+    fn mapping_absence_rejects_duplicate_keys_at_every_envelope_layer() {
+        let attempt_id = "87f08c0d-25e7-47dc-a7b6-e3f3cc89f977";
+        let context = SessionSpawnContext::from_parts(
+            "discord:thread-123",
+            attempt_id,
+            BrokerMappingExpectation::Present,
+        );
+        let value = mapping_absent_response(attempt_id);
+        let canonical = serde_json::to_string(&value).unwrap();
+        let error_json = serde_json::to_string(&value["error"]).unwrap();
+        let data_json = serde_json::to_string(&value["error"]["data"]).unwrap();
+        let error_field = format!(r#""error":{error_json}"#);
+        let data_field = format!(r#""data":{data_json}"#);
+        let attempt_field = format!(r#""attemptId":"{attempt_id}""#);
+
+        let duplicates = [
+            (
+                "root jsonrpc",
+                canonical.replacen(
+                    r#""jsonrpc":"2.0""#,
+                    r#""jsonrpc":"2.0","jsonrpc":"2.0""#,
+                    1,
+                ),
+            ),
+            (
+                "root id",
+                canonical.replacen(r#""id":1"#, r#""id":1,"id":1"#, 1),
+            ),
+            (
+                "root error",
+                canonical.replacen(&error_field, &format!("{error_field},{error_field}"), 1),
+            ),
+            (
+                "error code",
+                canonical.replacen(r#""code":-32041"#, r#""code":-32041,"code":-32041"#, 1),
+            ),
+            (
+                "error data",
+                canonical.replacen(&data_field, &format!("{data_field},{data_field}"), 1),
+            ),
+            (
+                "data attemptId",
+                canonical.replacen(
+                    &attempt_field,
+                    &format!("{attempt_field},{attempt_field}"),
+                    1,
+                ),
+            ),
+        ];
+
+        for (case, duplicate) in duplicates {
+            assert_ne!(
+                duplicate, canonical,
+                "test fixture did not duplicate {case}"
+            );
+            let message = message_with_retained_raw_text(&duplicate);
+            assert!(
+                mapping_absent_initialization(Some(&context), &message).is_none(),
+                "duplicate {case} must not produce a typed absence"
+            );
+        }
     }
 
     #[test]

@@ -3,7 +3,7 @@ use super::{
     PoolState, SessionGate, SessionPool,
 };
 use crate::acp::connection::{
-    AcpConnection, LifecycleHandle, SessionActivity, SessionSpawnContext,
+    AcpConnection, BrokerMappingExpectation, LifecycleHandle, SessionActivity, SessionSpawnContext,
 };
 use crate::acp::SessionContextMode;
 use anyhow::{anyhow, Context, Result};
@@ -312,10 +312,14 @@ pub(super) fn write_mapping_file(path: &Path, mapping: &HashMap<String, String>)
 pub(super) fn session_spawn_context(
     mode: SessionContextMode,
     logical_session_key: &str,
+    broker_mapping_expectation: BrokerMappingExpectation,
 ) -> Option<SessionSpawnContext> {
     match mode {
         SessionContextMode::None => None,
-        SessionContextMode::OpenabV1 => Some(SessionSpawnContext::new(logical_session_key)),
+        SessionContextMode::OpenabV1 => Some(SessionSpawnContext::new(
+            logical_session_key,
+            broker_mapping_expectation,
+        )),
     }
 }
 
@@ -1267,7 +1271,10 @@ mod tests {
         session_spawn_context, shutdown_strict_with_limits, write_mapping_file, StrictCapacity,
         StrictSuspendOutcome, UncommittedSessionProvenance,
     };
-    use crate::acp::connection::{LifecycleCapabilities, LifecycleHandle, SessionLifecycleControl};
+    use crate::acp::connection::{
+        BrokerMappingExpectation, LifecycleCapabilities, LifecycleHandle, SessionLifecycleControl,
+    };
+    use crate::acp::lifecycle::MappingAbsentInitialization;
     use crate::acp::SessionContextMode;
     use crate::config::AgentConfig;
     use anyhow::{anyhow, Result};
@@ -1378,26 +1385,46 @@ done
     #[test]
     fn session_context_none_has_no_spawn_context() {
         assert_eq!(
-            session_spawn_context(SessionContextMode::None, "discord:thread-123"),
+            session_spawn_context(
+                SessionContextMode::None,
+                "discord:thread-123",
+                BrokerMappingExpectation::Absent,
+            ),
             None
         );
     }
 
     #[test]
     fn session_context_openab_v1_preserves_exact_logical_key() {
-        let context = session_spawn_context(SessionContextMode::OpenabV1, "discord:thread-123")
-            .expect("OpenAB v1 should create broker-owned context");
+        let context = session_spawn_context(
+            SessionContextMode::OpenabV1,
+            "discord:thread-123",
+            BrokerMappingExpectation::Present,
+        )
+        .expect("OpenAB v1 should create broker-owned context");
 
         assert_eq!(context.logical_session_key(), "discord:thread-123");
         assert!(uuid::Uuid::parse_str(context.attempt_id()).is_ok());
+        assert_eq!(
+            context.broker_mapping_expectation(),
+            BrokerMappingExpectation::Present
+        );
     }
 
     #[test]
     fn session_context_openab_v1_mints_a_fresh_attempt_per_spawn() {
-        let first = session_spawn_context(SessionContextMode::OpenabV1, "discord:thread-123")
-            .expect("first context");
-        let second = session_spawn_context(SessionContextMode::OpenabV1, "discord:thread-123")
-            .expect("second context");
+        let first = session_spawn_context(
+            SessionContextMode::OpenabV1,
+            "discord:thread-123",
+            BrokerMappingExpectation::Absent,
+        )
+        .expect("first context");
+        let second = session_spawn_context(
+            SessionContextMode::OpenabV1,
+            "discord:thread-123",
+            BrokerMappingExpectation::Absent,
+        )
+        .expect("second context");
 
         assert_ne!(first.attempt_id(), second.attempt_id());
     }
@@ -1709,6 +1736,47 @@ done
             .unwrap_err();
         assert!(other_error.to_string().contains("pool exhausted"));
         assert!(!pool.strict_capacity.contains("discord:thread-b"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn strict_mapping_absence_is_typed_without_mutating_durable_mapping() {
+        let temp = tempfile::tempdir().unwrap();
+        let mapping_path = temp.path().join("thread_map.json");
+        let expected_mapping =
+            HashMap::from([("discord:thread".to_string(), "outer-session".to_string())]);
+        write_mapping_file(&mapping_path, &expected_mapping).unwrap();
+        let script = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      if [ "$OPENAB_SESSION_MAPPING_EXPECTATION" = "present" ]; then
+        printf '{"jsonrpc":"2.0","id":1,"error":{"code":-32041,"message":"untrusted controller detail","data":{"version":1,"outcome":"mapping_absent","attemptId":"%s"}}}\n' "$OPENAB_SESSION_ATTEMPT_ID"
+      else
+        printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"wrong mapping expectation"}}'
+      fi
+      ;;
+  esac
+done
+"#;
+        let pool = strict_pool_from_script(temp.path(), 1, script, HashMap::new());
+
+        let error = pool
+            .get_or_create("discord:thread", None)
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .downcast_ref::<MappingAbsentInitialization>()
+            .is_some());
+        assert!(!error.to_string().contains("untrusted controller detail"));
+        let state = pool.state.read().await;
+        assert_eq!(state.persisted, expected_mapping);
+        drop(state);
+        let on_disk: HashMap<String, String> =
+            serde_json::from_str(&std::fs::read_to_string(mapping_path).unwrap()).unwrap();
+        assert_eq!(on_disk, expected_mapping);
+        assert!(pool.strict_capacity.contains("discord:thread"));
     }
 
     #[cfg(unix)]

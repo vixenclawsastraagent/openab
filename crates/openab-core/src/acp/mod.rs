@@ -20,5 +20,10 @@ pub(crate) enum SessionContextMode {
 
 pub(crate) const SESSION_KEY_ENV: &str = "OPENAB_SESSION_KEY";
 pub(crate) const SESSION_ATTEMPT_ID_ENV: &str = "OPENAB_SESSION_ATTEMPT_ID";
+pub(crate) const SESSION_MAPPING_EXPECTATION_ENV: &str = "OPENAB_SESSION_MAPPING_EXPECTATION";
 
-pub(crate) const RESERVED_SESSION_ENV: [&str; 2] = [SESSION_KEY_ENV, SESSION_ATTEMPT_ID_ENV];
+pub(crate) const RESERVED_SESSION_ENV: [&str; 3] = [
+    SESSION_KEY_ENV,
+    SESSION_ATTEMPT_ID_ENV,
+    SESSION_MAPPING_EXPECTATION_ENV,
+];

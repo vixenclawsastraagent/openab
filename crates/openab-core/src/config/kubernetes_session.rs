@@ -307,6 +307,40 @@ inherit_env = ["OPENAB_SESSION_ATTEMPT_ID"]
     }
 
     #[test]
+    fn kubernetes_session_rejects_configured_mapping_expectation_case_insensitively() {
+        let err = parse_config_str(
+            &valid_config(
+                r#"
+[agent.env]
+openab_session_mapping_expectation = "spoofed"
+"#,
+            ),
+            "test",
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("OPENAB_SESSION_MAPPING_EXPECTATION"));
+    }
+
+    #[test]
+    fn kubernetes_session_rejects_inherited_mapping_expectation_case_insensitively() {
+        let err = parse_config_str(
+            &valid_config(
+                r#"
+[agent]
+inherit_env = ["openab_session_mapping_expectation"]
+"#,
+            ),
+            "test",
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("OPENAB_SESSION_MAPPING_EXPECTATION"));
+    }
+
+    #[test]
     fn kubernetes_session_rejects_agentcore() {
         let err = parse_config_str(
             &valid_config(
@@ -457,6 +491,7 @@ bot_token = "x"
 [agent.env]
 OPENAB_SESSION_KEY = "legacy-value"
 OPENAB_SESSION_ATTEMPT_ID = "legacy-attempt"
+OPENAB_SESSION_MAPPING_EXPECTATION = "legacy-expectation"
 "#,
             "test",
         )
@@ -465,5 +500,9 @@ OPENAB_SESSION_ATTEMPT_ID = "legacy-attempt"
         assert!(cfg.kubernetes_session.is_none());
         assert_eq!(cfg.agent.env["OPENAB_SESSION_KEY"], "legacy-value");
         assert_eq!(cfg.agent.env["OPENAB_SESSION_ATTEMPT_ID"], "legacy-attempt");
+        assert_eq!(
+            cfg.agent.env["OPENAB_SESSION_MAPPING_EXPECTATION"],
+            "legacy-expectation"
+        );
     }
 }

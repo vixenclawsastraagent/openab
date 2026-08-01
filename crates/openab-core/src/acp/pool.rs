@@ -1,6 +1,8 @@
 mod isolated;
 
-use crate::acp::connection::{AcpConnection, LifecycleHandle, SessionActivity};
+use crate::acp::connection::{
+    AcpConnection, BrokerMappingExpectation, LifecycleHandle, SessionActivity,
+};
 use crate::acp::protocol::ConfigOption;
 use crate::acp::SessionContextMode;
 use crate::config::AgentConfig;
@@ -224,6 +226,17 @@ fn get_or_insert_gate(map: &mut HashMap<String, Arc<Mutex<()>>>, key: &str) -> A
     map.entry(key.to_string())
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone()
+}
+
+fn durable_mapping_expectation(
+    persisted: &HashMap<String, String>,
+    thread_id: &str,
+) -> BrokerMappingExpectation {
+    if persisted.contains_key(thread_id) {
+        BrokerMappingExpectation::Present
+    } else {
+        BrokerMappingExpectation::Absent
+    }
 }
 
 fn resolve_effective_workdir(
@@ -586,14 +599,18 @@ impl SessionPool {
                 .ensure_session_admission_open(thread_id)?;
         }
 
-        let (existing, saved_session_id) = {
+        let (existing, saved_session_id, broker_mapping_expectation) = {
             let state = self.state.read().await;
             let saved_session_id = state.suspended.get(thread_id).cloned().or_else(|| {
                 (self.session_context == SessionContextMode::OpenabV1)
                     .then(|| state.persisted.get(thread_id).cloned())
                     .flatten()
             });
-            (state.active.get(thread_id).cloned(), saved_session_id)
+            (
+                state.active.get(thread_id).cloned(),
+                saved_session_id,
+                durable_mapping_expectation(&state.persisted, thread_id),
+            )
         };
 
         let had_existing = existing.is_some();
@@ -673,8 +690,11 @@ impl SessionPool {
 
         // Build the replacement connection outside the state lock so one stuck
         // initialization does not block all unrelated sessions.
-        let session_spawn_context =
-            isolated::session_spawn_context(self.session_context, thread_id);
+        let session_spawn_context = isolated::session_spawn_context(
+            self.session_context,
+            thread_id,
+            broker_mapping_expectation,
+        );
         let mut new_conn = AcpConnection::spawn_with_context(
             &self.config.command,
             &self.config.args,
@@ -1324,10 +1344,11 @@ impl SessionPool {
 #[cfg(test)]
 mod tests {
     use super::{
-        better_candidate, classify_hung, classify_idle, get_or_insert_gate, purge_session_entries,
-        remove_if_same_handle, resolve_effective_workdir, PoolState, SessionPool,
+        better_candidate, classify_hung, classify_idle, durable_mapping_expectation,
+        get_or_insert_gate, purge_session_entries, remove_if_same_handle,
+        resolve_effective_workdir, PoolState, SessionPool,
     };
-    use crate::acp::connection::SessionActivity;
+    use crate::acp::connection::{BrokerMappingExpectation, SessionActivity};
     use crate::acp::SessionContextMode;
     use crate::config::AgentConfig;
     use std::collections::HashMap;
@@ -1385,6 +1406,28 @@ done
         assert_eq!(
             super::kubernetes_scope_partition("team-a"),
             "c7d126d05da76b40b912226a894e8acdc3c4f80d9b0f14f8f24a782ab0e61d67"
+        );
+    }
+
+    #[test]
+    fn mapping_expectation_uses_only_the_durable_broker_mapping() {
+        let mut persisted = HashMap::new();
+        assert_eq!(
+            durable_mapping_expectation(&persisted, "discord:thread"),
+            BrokerMappingExpectation::Absent
+        );
+
+        persisted.insert(
+            "discord:thread".to_string(),
+            "durable-outer-session".to_string(),
+        );
+        assert_eq!(
+            durable_mapping_expectation(&persisted, "discord:thread"),
+            BrokerMappingExpectation::Present
+        );
+        assert_eq!(
+            durable_mapping_expectation(&persisted, "discord:other-thread"),
+            BrokerMappingExpectation::Absent
         );
     }
 
