@@ -127,6 +127,23 @@ impl ComputeAbsentProof {
         }
     }
 
+    /// Unit-test seam for lifecycle proof-consumption tests. Production code
+    /// can mint this type only after the Kubernetes absence checks above.
+    #[cfg(test)]
+    pub(super) fn for_test(
+        session_id: SessionId,
+        incarnation_id: Uuid,
+        fence: Fence,
+        anchor_uid: impl Into<String>,
+    ) -> Self {
+        Self {
+            session_id,
+            incarnation_id,
+            fence,
+            anchor_uid: anchor_uid.into(),
+        }
+    }
+
     pub fn session_id(&self) -> SessionId {
         self.session_id
     }

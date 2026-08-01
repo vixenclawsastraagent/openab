@@ -1,6 +1,7 @@
 mod activation;
 mod cleanup;
 mod generation;
+mod lifecycle;
 mod locks;
 mod registration;
 
@@ -11,6 +12,7 @@ pub use activation::{
 };
 pub use cleanup::{CleanupProgress, LifecycleProvisioner};
 pub use generation::{ComputeAbsentProof, KubernetesGenerationProvisioner};
+pub use lifecycle::{LifecycleCoordinator, LifecycleError, LifecycleReconcileOutcome};
 pub use locks::{SessionLockGuard, SessionLocks};
 pub use registration::{
     BootstrapPresence, ConsumedBootstrap, RegisteredWorker, RegistrationCoordinator,
