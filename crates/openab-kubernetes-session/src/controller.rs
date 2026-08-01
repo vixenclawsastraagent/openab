@@ -45,15 +45,17 @@ pub use registration::{
     WorkerBootstrapAuthError,
 };
 pub use relay::{
-    BridgeOpenOutcome, RelayAttachment, RelayContainmentFailure, RelayContainmentReport,
-    RelayLossOutcome, RelayOpenError, RelayOrchestrator,
+    BridgeOpenOutcome, RelayAcpDeliveryOutcome, RelayAttachment, RelayContainmentFailure,
+    RelayContainmentReport, RelayDeliveryError, RelayLossOutcome, RelayOpenError,
+    RelayOrchestrator,
 };
 pub use release::{ReleaseCoordinator, ReleaseError, ReleaseOutcome};
 pub use rendezvous::{
-    PendingActivation, RelayConnection, RelayConnectionId, RelayConnectionLoss,
-    RelayContainmentCompletion, RelayContainmentTicket, RelayInstallation, RelayLane,
+    AcpRouteOutcome, PendingActivation, RelayBackpressure, RelayByteBudget, RelayByteBudgetError,
+    RelayConnection, RelayConnectionId, RelayConnectionLoss, RelayContainmentCompletion,
+    RelayContainmentTicket, RelayInstallation, RelayLane, RelayOutboundFrame, RelayOutboundItem,
     RelayPairingOutcome, RendezvousFatalError, RendezvousHealth, RendezvousInstallError,
-    RendezvousRegistry, RendezvousRouteError,
+    RendezvousRegistry, RendezvousRouteError, MIN_RELAY_BYTE_BUDGET,
 };
 pub use service::{
     ControllerService, ControllerServiceConfigError, ControllerServiceError,

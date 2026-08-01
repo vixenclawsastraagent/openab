@@ -292,12 +292,15 @@ impl<'de> Deserialize<'de> for SelectedProfile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct AcpPayload(Value);
+struct AcpPayload {
+    value: Value,
+    encoded_len: usize,
+}
 
 impl AcpPayload {
     fn new(value: Value) -> Result<Self, WireProtocolError> {
-        validate_acp_payload(&value)?;
-        Ok(Self(value))
+        let encoded_len = validate_acp_payload(&value)?;
+        Ok(Self { value, encoded_len })
     }
 }
 
@@ -306,7 +309,7 @@ impl Serialize for AcpPayload {
     where
         S: Serializer,
     {
-        self.0.serialize(serializer)
+        self.value.serialize(serializer)
     }
 }
 
@@ -647,11 +650,17 @@ impl AcpMessageV1 {
     }
 
     pub fn payload(&self) -> &Value {
-        &self.payload.0
+        &self.payload.value
     }
 
     pub fn into_payload(self) -> Value {
-        self.payload.0
+        self.payload.value
+    }
+
+    /// Exact encoded JSON size of the opaque ACP payload, excluding this
+    /// protocol's outer envelope.
+    pub fn encoded_payload_bytes(&self) -> usize {
+        self.payload.encoded_len
     }
 }
 
@@ -907,11 +916,12 @@ pub fn decode_frame<T: WireMessage>(bytes: &[u8]) -> Result<T, WireProtocolError
     Ok(message)
 }
 
-fn validate_acp_payload(payload: &Value) -> Result<(), WireProtocolError> {
+fn validate_acp_payload(payload: &Value) -> Result<usize, WireProtocolError> {
     let bytes = serde_json::to_vec(payload)
         .map_err(WireProtocolError::InvalidJson)?
         .len();
-    validate_acp_payload_len(bytes)
+    validate_acp_payload_len(bytes)?;
+    Ok(bytes)
 }
 
 fn validate_acp_payload_len(bytes: usize) -> Result<(), WireProtocolError> {
@@ -975,5 +985,14 @@ mod tests {
             validate_frame_len::<ProtocolResultV1>(MAX_CONTROL_FRAME_BYTES + 1),
             Err(WireProtocolError::FrameTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn acp_message_exposes_its_validated_payload_size() {
+        let payload = serde_json::json!({"jsonrpc": "2.0", "id": 7});
+        let expected = serde_json::to_vec(&payload).unwrap().len();
+        let message = AcpMessageV1::new(payload).unwrap();
+
+        assert_eq!(message.encoded_payload_bytes(), expected);
     }
 }

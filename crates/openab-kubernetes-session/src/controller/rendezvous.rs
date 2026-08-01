@@ -3,15 +3,21 @@ use crate::identity::{ScopeId, SessionId};
 use crate::resources::SESSION_WORKSPACE_V1;
 use crate::state::ProfileRef;
 use crate::wire::{
-    ActivatedSessionV1, ActivationRequestV1, ControllerToBridgeV1, ControllerToWorkerV1,
-    ProtocolResultV1, WireProtocolError,
+    AcpMessageV1, ActivatedSessionV1, ActivationRequestV1, ControllerToBridgeV1,
+    ControllerToWorkerV1, ProtocolResultV1, WireMessage, WireProtocolError,
+    MAX_CONTROL_FRAME_BYTES,
 };
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use thiserror::Error;
 use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
+
+const HANDSHAKE_BYTE_RESERVE: usize = 2 * MAX_CONTROL_FRAME_BYTES;
+pub const MIN_RELAY_BYTE_BUDGET: usize = HANDSHAKE_BYTE_RESERVE;
 
 /// One authenticated side of a session relay.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,12 +113,251 @@ pub enum RelayPairingOutcome {
     AwaitingPeer,
     /// Both handshake frames were enqueued and ACP routing is now enabled.
     Active,
-    /// Both lanes remain installed, but at least one bounded queue is full.
+    /// Both lanes remain installed while the process byte budget is occupied.
     Backpressured,
     /// A handshake receiver was closed; the session is now fail-closed.
     ContainmentRequired(Box<RelayContainmentTicket>),
     /// The session disappeared or is already quiescing.
     Unavailable,
+}
+
+/// Result of one atomic active-lane ACP enqueue.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AcpRouteOutcome {
+    Delivered,
+    Backpressured {
+        message: AcpMessageV1,
+        reason: RelayBackpressure,
+    },
+    ContainmentRequired(Box<RelayContainmentTicket>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelayBackpressure {
+    LaneItems,
+    ProcessBytes,
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum RelayByteBudgetError {
+    #[error(
+        "relay byte budget is {configured} bytes; at least {minimum} bytes are required for one atomic handshake"
+    )]
+    BelowAtomicHandshake { configured: usize, minimum: usize },
+}
+
+/// Process-wide queue byte budget shared by every relay orchestrator in one
+/// executable. Clone this value when several controller scopes share a
+/// process; constructing one budget per scope would weaken the global bound.
+#[derive(Clone, Debug)]
+pub struct RelayByteBudget {
+    inner: Arc<RelayByteBudgetInner>,
+}
+
+impl RelayByteBudget {
+    pub fn new(bytes: NonZeroUsize) -> Result<Self, RelayByteBudgetError> {
+        if bytes.get() < MIN_RELAY_BYTE_BUDGET {
+            return Err(RelayByteBudgetError::BelowAtomicHandshake {
+                configured: bytes.get(),
+                minimum: MIN_RELAY_BYTE_BUDGET,
+            });
+        }
+        let (release_generation, _) = watch::channel(0_u64);
+        Ok(Self {
+            inner: Arc::new(RelayByteBudgetInner {
+                limit: bytes.get(),
+                used: AtomicUsize::new(0),
+                pairing_waiters: AtomicUsize::new(0),
+                release_generation,
+            }),
+        })
+    }
+
+    pub fn available_bytes(&self) -> usize {
+        self.inner
+            .limit
+            .saturating_sub(self.inner.used.load(Ordering::Acquire))
+    }
+
+    fn try_acquire(&self, bytes: usize) -> Option<RelayByteLease> {
+        self.try_acquire_up_to(bytes, self.inner.limit)
+    }
+
+    fn try_acquire_acp(&self, bytes: usize) -> Option<RelayByteLease> {
+        if self.inner.pairing_waiters.load(Ordering::Acquire) != 0 {
+            return None;
+        }
+        let lease = self.try_acquire(bytes)?;
+        if self.inner.pairing_waiters.load(Ordering::Acquire) != 0 {
+            drop(lease);
+            return None;
+        }
+        Some(lease)
+    }
+
+    fn try_acquire_up_to(&self, bytes: usize, admission_limit: usize) -> Option<RelayByteLease> {
+        let mut used = self.inner.used.load(Ordering::Acquire);
+        loop {
+            let next = used.checked_add(bytes)?;
+            if next > admission_limit {
+                return None;
+            }
+            match self.inner.used.compare_exchange_weak(
+                used,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(RelayByteLease {
+                        inner: Arc::clone(&self.inner),
+                        bytes,
+                    });
+                }
+                Err(actual) => used = actual,
+            }
+        }
+    }
+
+    fn subscribe_releases(&self) -> watch::Receiver<u64> {
+        self.inner.release_generation.subscribe()
+    }
+
+    fn begin_pairing_wait(&self) -> RelayPairingWaiter {
+        self.inner.pairing_waiters.fetch_add(1, Ordering::AcqRel);
+        RelayPairingWaiter {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn hold_for_test(&self, bytes: usize) -> RelayByteLease {
+        self.try_acquire(bytes)
+            .expect("the test byte hold must fit the configured budget")
+    }
+}
+
+#[derive(Debug)]
+struct RelayByteBudgetInner {
+    limit: usize,
+    used: AtomicUsize,
+    pairing_waiters: AtomicUsize,
+    release_generation: watch::Sender<u64>,
+}
+
+pub(crate) struct RelayPairingWaiter {
+    inner: Arc<RelayByteBudgetInner>,
+}
+
+impl Drop for RelayPairingWaiter {
+    fn drop(&mut self) {
+        let previous = self.inner.pairing_waiters.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct RelayByteLease {
+    inner: Arc<RelayByteBudgetInner>,
+    bytes: usize,
+}
+
+impl RelayByteLease {
+    fn split_off(&mut self, bytes: usize) -> Self {
+        assert!(bytes <= self.bytes, "a byte lease cannot be oversplit");
+        self.bytes -= bytes;
+        Self {
+            inner: Arc::clone(&self.inner),
+            bytes,
+        }
+    }
+}
+
+impl Drop for RelayByteLease {
+    fn drop(&mut self) {
+        if self.bytes == 0 {
+            return;
+        }
+        let previous = self.inner.used.fetch_sub(self.bytes, Ordering::AcqRel);
+        debug_assert!(previous >= self.bytes);
+        self.inner
+            .release_generation
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+}
+
+/// One bounded outbound item.
+///
+/// Every item retains its process-wide byte-budget permit until the network
+/// writer drops this value after the write completes.
+#[must_use = "the relay byte lease is released when this queued item is dropped"]
+pub struct RelayOutboundItem<M> {
+    message: M,
+    _byte_budget: RelayByteLease,
+}
+
+impl<M> RelayOutboundItem<M> {
+    fn budgeted(message: M, permit: RelayByteLease) -> Self {
+        Self {
+            message,
+            _byte_budget: permit,
+        }
+    }
+
+    fn into_message(self) -> M {
+        self.message
+    }
+}
+
+impl<M: WireMessage> RelayOutboundItem<M> {
+    /// Consume a queued message and transfer its byte lease to the exact bytes
+    /// that a transport writer must retain through write completion.
+    pub fn into_encoded_frame(self) -> Result<RelayOutboundFrame, WireProtocolError> {
+        let Self {
+            message,
+            _byte_budget,
+        } = self;
+        let bytes = crate::wire::encode_frame(&message)?;
+        Ok(RelayOutboundFrame {
+            bytes,
+            _byte_budget,
+        })
+    }
+}
+
+impl<M> std::fmt::Debug for RelayOutboundItem<M> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RelayOutboundItem")
+            .field("charged_bytes", &self._byte_budget.bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Encoded outbound bytes that retain their process-wide queue lease.
+///
+/// A transport writer borrows [`Self::as_bytes`] for the actual write and
+/// drops this value only after the write completes or is cancelled.
+#[must_use = "hold the encoded frame until the transport write completes"]
+pub struct RelayOutboundFrame {
+    bytes: Vec<u8>,
+    _byte_budget: RelayByteLease,
+}
+
+impl RelayOutboundFrame {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl std::fmt::Debug for RelayOutboundFrame {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RelayOutboundFrame")
+            .field("bytes", &self.bytes.len())
+            .field("charged_bytes", &self._byte_budget.bytes)
+            .finish_non_exhaustive()
+    }
 }
 
 /// One installed lane plus the session-wide quiesce notification.
@@ -204,6 +449,8 @@ pub enum RendezvousRouteError {
     AwaitingPeer,
     #[error("this session rendezvous is quiescing")]
     Quiescing,
+    #[error("the ACP frame cannot fit within the configured relay byte budget")]
+    FrameExceedsByteBudget { bytes: usize, capacity: usize },
 }
 
 /// Result of atomically handling one socket-close callback.
@@ -227,13 +474,13 @@ pub enum RelayContainmentCompletion {
 #[derive(Debug)]
 struct BridgeSlot {
     connection_id: RelayConnectionId,
-    outbound: mpsc::Sender<ControllerToBridgeV1>,
+    outbound: mpsc::Sender<RelayOutboundItem<ControllerToBridgeV1>>,
 }
 
 #[derive(Debug)]
 struct WorkerSlot {
     connection_id: RelayConnectionId,
-    outbound: mpsc::Sender<ControllerToWorkerV1>,
+    outbound: mpsc::Sender<RelayOutboundItem<ControllerToWorkerV1>>,
     profile: ProfileRef,
 }
 
@@ -342,16 +589,26 @@ pub struct RendezvousRegistry {
     scope_id: ScopeId,
     state: Arc<Mutex<RendezvousState>>,
     health: watch::Sender<RendezvousHealth>,
+    byte_budget: RelayByteBudget,
 }
 
 impl RendezvousRegistry {
-    pub fn new(scope_id: ScopeId) -> Self {
+    pub fn with_byte_budget(scope_id: ScopeId, byte_budget: RelayByteBudget) -> Self {
         let (health, _) = watch::channel(RendezvousHealth::Healthy);
         Self {
             scope_id,
             state: Arc::new(Mutex::new(RendezvousState::default())),
             health,
+            byte_budget,
         }
+    }
+
+    pub(crate) fn byte_budget_releases(&self) -> watch::Receiver<u64> {
+        self.byte_budget.subscribe_releases()
+    }
+
+    pub(crate) fn begin_pairing_wait(&self) -> RelayPairingWaiter {
+        self.byte_budget.begin_pairing_wait()
     }
 
     /// Subscribe to process-fatal registry health.
@@ -370,7 +627,7 @@ impl RendezvousRegistry {
         &self,
         authority: OrphanAuthority,
         activation: PendingActivation,
-        outbound: mpsc::Sender<ControllerToBridgeV1>,
+        outbound: mpsc::Sender<RelayOutboundItem<ControllerToBridgeV1>>,
     ) -> Result<RelayInstallation, RendezvousInstallError> {
         self.validate_scope(&authority)?;
         let session_id = authority.binding().session_id();
@@ -418,7 +675,7 @@ impl RendezvousRegistry {
                 lane: RelayLane::Bridge,
                 connection_id,
             };
-            let pairing = pair_if_ready(session, session_id);
+            let pairing = pair_if_ready(session, session_id, &self.byte_budget);
             return Ok(RelayInstallation {
                 connection,
                 quiesced: session.quiesced.subscribe(),
@@ -435,7 +692,7 @@ impl RendezvousRegistry {
         &self,
         authority: OrphanAuthority,
         profile: ProfileRef,
-        outbound: mpsc::Sender<ControllerToWorkerV1>,
+        outbound: mpsc::Sender<RelayOutboundItem<ControllerToWorkerV1>>,
     ) -> Result<RelayInstallation, RendezvousInstallError> {
         self.validate_scope(&authority)?;
         let session_id = authority.binding().session_id();
@@ -483,7 +740,7 @@ impl RendezvousRegistry {
                 lane: RelayLane::Worker,
                 connection_id,
             };
-            let pairing = pair_if_ready(session, session_id);
+            let pairing = pair_if_ready(session, session_id, &self.byte_budget);
             return Ok(RelayInstallation {
                 connection,
                 quiesced: session.quiesced.subscribe(),
@@ -500,15 +757,14 @@ impl RendezvousRegistry {
             .sessions
             .get_mut(&session_id)
             .map_or(RelayPairingOutcome::Unavailable, |session| {
-                pair_if_ready(session, session_id)
+                pair_if_ready(session, session_id, &self.byte_budget)
             })
     }
 
     /// Resolve the exact peer only after both handshake frames were enqueued.
     ///
     /// This is an inspection primitive. A transport must not use the returned
-    /// ID across an await; bounded ACP enqueue is added as a registry operation
-    /// in the following relay-delivery slice.
+    /// ID across an await; delivery must use [`Self::route_acp`] instead.
     pub fn route_target(
         &self,
         connection: &RelayConnection,
@@ -527,6 +783,111 @@ impl RendezvousRegistry {
                 .ok_or(RendezvousRouteError::AwaitingPeer),
             RelaySessionState::Pairing { .. } => Err(RendezvousRouteError::AwaitingPeer),
             RelaySessionState::Quiescing { .. } => Err(RendezvousRouteError::Quiescing),
+        }
+    }
+
+    /// Atomically validate one exact source lane and enqueue ACP to its peer.
+    ///
+    /// Source validation, active-state admission, byte-budget reservation,
+    /// bounded `try_send`, and a closed-peer transition to `Quiescing` all
+    /// occur while the same registry mutex is held. `Full` or exhausted global
+    /// byte budget returns the original message without adding another buffer.
+    pub fn route_acp(
+        &self,
+        connection: &RelayConnection,
+        message: AcpMessageV1,
+    ) -> Result<AcpRouteOutcome, RendezvousRouteError> {
+        let mut state = self.lock_state();
+        let Some(session) = state.sessions.get_mut(&connection.session_id) else {
+            return Err(RendezvousRouteError::StaleConnection);
+        };
+        if !session.state.contains(connection) {
+            return Err(RendezvousRouteError::StaleConnection);
+        }
+        match &session.state {
+            RelaySessionState::Pairing { .. } => Err(RendezvousRouteError::AwaitingPeer),
+            RelaySessionState::Quiescing { .. } => Err(RendezvousRouteError::Quiescing),
+            RelaySessionState::Active { bridge, worker } => {
+                let queued_bytes = message
+                    .encoded_payload_bytes()
+                    .checked_add(MAX_CONTROL_FRAME_BYTES)
+                    .expect("a validated ACP payload plus frame overhead fits usize");
+                if queued_bytes > self.byte_budget.inner.limit {
+                    return Err(RendezvousRouteError::FrameExceedsByteBudget {
+                        bytes: queued_bytes,
+                        capacity: self.byte_budget.inner.limit,
+                    });
+                }
+                let permit = match self.byte_budget.try_acquire_acp(queued_bytes) {
+                    Some(permit) => permit,
+                    None => {
+                        return Ok(AcpRouteOutcome::Backpressured {
+                            message,
+                            reason: RelayBackpressure::ProcessBytes,
+                        });
+                    }
+                };
+                match connection.lane {
+                    RelayLane::Bridge => {
+                        let peer_id = worker.connection_id;
+                        let queued =
+                            RelayOutboundItem::budgeted(ControllerToWorkerV1::Acp(message), permit);
+                        match worker.outbound.try_send(queued) {
+                            Ok(()) => Ok(AcpRouteOutcome::Delivered),
+                            Err(mpsc::error::TrySendError::Full(queued)) => {
+                                let ControllerToWorkerV1::Acp(message) = queued.into_message()
+                                else {
+                                    unreachable!("the ACP route created an ACP worker item")
+                                };
+                                Ok(AcpRouteOutcome::Backpressured {
+                                    message,
+                                    reason: RelayBackpressure::LaneItems,
+                                })
+                            }
+                            Err(mpsc::error::TrySendError::Closed(queued)) => {
+                                drop(queued);
+                                let trigger = RelayConnection {
+                                    session_id: connection.session_id,
+                                    lane: RelayLane::Worker,
+                                    connection_id: peer_id,
+                                };
+                                Ok(AcpRouteOutcome::ContainmentRequired(Box::new(quiesce(
+                                    session, trigger,
+                                ))))
+                            }
+                        }
+                    }
+                    RelayLane::Worker => {
+                        let peer_id = bridge.connection_id;
+                        let queued =
+                            RelayOutboundItem::budgeted(ControllerToBridgeV1::Acp(message), permit);
+                        match bridge.outbound.try_send(queued) {
+                            Ok(()) => Ok(AcpRouteOutcome::Delivered),
+                            Err(mpsc::error::TrySendError::Full(queued)) => {
+                                let ControllerToBridgeV1::Acp(message) = queued.into_message()
+                                else {
+                                    unreachable!("the ACP route created an ACP bridge item")
+                                };
+                                Ok(AcpRouteOutcome::Backpressured {
+                                    message,
+                                    reason: RelayBackpressure::LaneItems,
+                                })
+                            }
+                            Err(mpsc::error::TrySendError::Closed(queued)) => {
+                                drop(queued);
+                                let trigger = RelayConnection {
+                                    session_id: connection.session_id,
+                                    lane: RelayLane::Bridge,
+                                    connection_id: peer_id,
+                                };
+                                Ok(AcpRouteOutcome::ContainmentRequired(Box::new(quiesce(
+                                    session, trigger,
+                                ))))
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -779,7 +1140,11 @@ fn validate_existing_session(
     Ok(())
 }
 
-fn pair_if_ready(session: &mut RelaySession, session_id: SessionId) -> RelayPairingOutcome {
+fn pair_if_ready(
+    session: &mut RelaySession,
+    session_id: SessionId,
+    byte_budget: &RelayByteBudget,
+) -> RelayPairingOutcome {
     let RelaySessionState::Pairing {
         bridge,
         worker,
@@ -804,9 +1169,20 @@ fn pair_if_ready(session: &mut RelaySession, session_id: SessionId) -> RelayPair
     let worker_ack = ProtocolResultV1::ack(None)
         .expect("a handshake ACK without requestId is structurally valid");
 
+    let Some(mut handshake_budget) = byte_budget.try_acquire(HANDSHAKE_BYTE_RESERVE) else {
+        return RelayPairingOutcome::Backpressured;
+    };
+
     let worker_permit = match worker_sender.try_reserve_owned() {
         Ok(permit) => permit,
-        Err(mpsc::error::TrySendError::Full(_)) => return RelayPairingOutcome::Backpressured,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            let trigger = RelayConnection {
+                session_id,
+                lane: RelayLane::Worker,
+                connection_id: worker_id,
+            };
+            return RelayPairingOutcome::ContainmentRequired(Box::new(quiesce(session, trigger)));
+        }
         Err(mpsc::error::TrySendError::Closed(_)) => {
             let trigger = RelayConnection {
                 session_id,
@@ -818,7 +1194,14 @@ fn pair_if_ready(session: &mut RelaySession, session_id: SessionId) -> RelayPair
     };
     let bridge_permit = match bridge_sender.try_reserve_owned() {
         Ok(permit) => permit,
-        Err(mpsc::error::TrySendError::Full(_)) => return RelayPairingOutcome::Backpressured,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            let trigger = RelayConnection {
+                session_id,
+                lane: RelayLane::Bridge,
+                connection_id: bridge_id,
+            };
+            return RelayPairingOutcome::ContainmentRequired(Box::new(quiesce(session, trigger)));
+        }
         Err(mpsc::error::TrySendError::Closed(_)) => {
             let trigger = RelayConnection {
                 session_id,
@@ -829,8 +1212,17 @@ fn pair_if_ready(session: &mut RelaySession, session_id: SessionId) -> RelayPair
         }
     };
 
-    worker_permit.send(ControllerToWorkerV1::ProtocolResult(worker_ack));
-    bridge_permit.send(activation_response);
+    let worker_budget = handshake_budget.split_off(MAX_CONTROL_FRAME_BYTES);
+    let bridge_budget = handshake_budget;
+
+    worker_permit.send(RelayOutboundItem::budgeted(
+        ControllerToWorkerV1::ProtocolResult(worker_ack),
+        worker_budget,
+    ));
+    bridge_permit.send(RelayOutboundItem::budgeted(
+        activation_response,
+        bridge_budget,
+    ));
 
     let RelaySessionState::Pairing {
         bridge,
@@ -917,7 +1309,10 @@ mod tests {
 
     #[test]
     fn mutex_poison_latches_process_fatal_health_during_unwind() {
-        let registry = RendezvousRegistry::new(ScopeId::derive("relay-health-test"));
+        let budget =
+            RelayByteBudget::new(NonZeroUsize::new(MIN_RELAY_BYTE_BUDGET).unwrap()).unwrap();
+        let registry =
+            RendezvousRegistry::with_byte_budget(ScopeId::derive("relay-health-test"), budget);
         let health = registry.health();
         assert_eq!(*health.borrow(), RendezvousHealth::Healthy);
 

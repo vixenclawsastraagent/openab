@@ -1,16 +1,17 @@
 use super::{
-    ActivationPreparation, ControllerService, ControllerServiceError, OrphanAuthority,
-    OrphanAuthorityError, OrphanContainmentOutcome, PendingActivation, RegisteredWorker,
-    RelayConnection, RelayConnectionLoss, RelayContainmentCompletion, RelayContainmentTicket,
-    RelayPairingOutcome, RendezvousHealth, RendezvousInstallError, RendezvousRegistry,
+    AcpRouteOutcome, ActivationPreparation, ControllerService, ControllerServiceError,
+    OrphanAuthority, OrphanAuthorityError, OrphanContainmentOutcome, PendingActivation,
+    RegisteredWorker, RelayBackpressure, RelayByteBudget, RelayConnection, RelayConnectionLoss,
+    RelayContainmentCompletion, RelayContainmentTicket, RelayOutboundItem, RelayPairingOutcome,
+    RendezvousHealth, RendezvousInstallError, RendezvousRegistry, RendezvousRouteError,
     WorkerBootstrapAuth,
 };
 use crate::bridge::SessionBinding;
 use crate::identity::{ScopeId, SessionId};
 use crate::state::ProfileRef;
 use crate::wire::{
-    ActivationRequestV1, ControllerToBridgeV1, ControllerToWorkerV1, FatalCode, WireProtocolError,
-    WorkerRegistrationV1,
+    AcpMessageV1, ActivationRequestV1, ControllerToBridgeV1, ControllerToWorkerV1, FatalCode,
+    WireProtocolError, WorkerRegistrationV1,
 };
 use async_trait::async_trait;
 use std::num::NonZeroUsize;
@@ -108,6 +109,39 @@ impl RelayOpenError {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum RelayAcpDeliveryOutcome {
+    Delivered,
+    Backpressured {
+        message: AcpMessageV1,
+        reason: RelayBackpressure,
+    },
+    PeerContained(OrphanContainmentOutcome),
+}
+
+#[derive(Debug, Error)]
+pub enum RelayDeliveryError {
+    #[error("relay routing rejected the connection")]
+    Rendezvous(#[source] RendezvousRouteError),
+    #[error("controller containment failed")]
+    Controller(#[source] ControllerServiceError),
+}
+
+impl RelayDeliveryError {
+    pub fn fatal_code(&self) -> FatalCode {
+        match self {
+            Self::Rendezvous(RendezvousRouteError::AwaitingPeer) => FatalCode::InvalidMessage,
+            Self::Rendezvous(
+                RendezvousRouteError::StaleConnection | RendezvousRouteError::Quiescing,
+            ) => FatalCode::StaleBinding,
+            Self::Rendezvous(RendezvousRouteError::FrameExceedsByteBudget { .. }) => {
+                FatalCode::Unavailable
+            }
+            Self::Controller(error) => error.fatal_code(),
+        }
+    }
+}
+
 /// Successful bridge handshake result before any socket-specific work.
 pub enum BridgeOpenOutcome {
     /// A durable generation exists. The outbound queue withholds `Activated`
@@ -126,7 +160,7 @@ pub enum BridgeOpenOutcome {
 /// cancellation after that local transition.
 pub struct RelayAttachment<M> {
     connection: Option<RelayConnection>,
-    outbound: mpsc::Receiver<M>,
+    outbound: mpsc::Receiver<RelayOutboundItem<M>>,
     quiesced: watch::Receiver<bool>,
     containment: ContainmentHandle,
 }
@@ -138,7 +172,7 @@ impl<M> RelayAttachment<M> {
             .expect("an armed relay attachment always has a connection")
     }
 
-    pub fn outbound(&mut self) -> &mut mpsc::Receiver<M> {
+    pub fn outbound(&mut self) -> &mut mpsc::Receiver<RelayOutboundItem<M>> {
         &mut self.outbound
     }
 
@@ -235,12 +269,20 @@ pub struct RelayOrchestrator {
 }
 
 impl RelayOrchestrator {
-    pub fn new(controller: Arc<ControllerService>, queue_capacity: NonZeroUsize) -> Self {
-        Self::with_controller(controller, queue_capacity)
+    pub fn new(
+        controller: Arc<ControllerService>,
+        queue_capacity: NonZeroUsize,
+        byte_budget: RelayByteBudget,
+    ) -> Self {
+        Self::with_controller(controller, queue_capacity, byte_budget)
     }
 
-    fn with_controller(controller: Arc<dyn RelayController>, queue_capacity: NonZeroUsize) -> Self {
-        let registry = RendezvousRegistry::new(controller.scope_id());
+    fn with_controller(
+        controller: Arc<dyn RelayController>,
+        queue_capacity: NonZeroUsize,
+        byte_budget: RelayByteBudget,
+    ) -> Self {
+        let registry = RendezvousRegistry::with_byte_budget(controller.scope_id(), byte_budget);
         Self {
             controller,
             registry,
@@ -254,6 +296,37 @@ impl RelayOrchestrator {
         self.registry.health()
     }
 
+    /// Deliver one ACP message through the exact active peer lane.
+    ///
+    /// Backpressure returns ownership to the caller. A closed peer is changed
+    /// to `Quiescing` by the registry before this method performs durable
+    /// containment; transient controller errors leave the ticket retryable.
+    pub async fn route_acp(
+        &self,
+        connection: &RelayConnection,
+        message: AcpMessageV1,
+    ) -> Result<RelayAcpDeliveryOutcome, RelayDeliveryError> {
+        match self
+            .registry
+            .route_acp(connection, message)
+            .map_err(RelayDeliveryError::Rendezvous)?
+        {
+            AcpRouteOutcome::Delivered => Ok(RelayAcpDeliveryOutcome::Delivered),
+            AcpRouteOutcome::Backpressured { message, reason } => {
+                Ok(RelayAcpDeliveryOutcome::Backpressured { message, reason })
+            }
+            AcpRouteOutcome::ContainmentRequired(ticket) => {
+                let outcome = self
+                    .controller
+                    .connection_lost(ticket.authority())
+                    .await
+                    .map_err(RelayDeliveryError::Controller)?;
+                self.registry.complete_containment(&ticket);
+                Ok(RelayAcpDeliveryOutcome::PeerContained(outcome))
+            }
+        }
+    }
+
     /// Run activation in a controller-owned task so caller cancellation cannot
     /// interrupt Kubernetes mutation between durable preparation and registry
     /// installation.
@@ -262,9 +335,10 @@ impl RelayOrchestrator {
         request: ActivationRequestV1,
     ) -> Result<BridgeOpenOutcome, RelayOpenError> {
         let (result_sender, result_receiver) = oneshot::channel();
+        let (_caller_lifetime, caller_gone) = oneshot::channel();
         let this = self.clone();
         tokio::spawn(async move {
-            let result = this.activate_bridge_inner(request).await;
+            let result = this.activate_bridge_inner(request, caller_gone).await;
             let _ = result_sender.send(result);
         });
         result_receiver
@@ -280,9 +354,12 @@ impl RelayOrchestrator {
         auth: WorkerBootstrapAuth,
     ) -> Result<RelayAttachment<ControllerToWorkerV1>, RelayOpenError> {
         let (result_sender, result_receiver) = oneshot::channel();
+        let (_caller_lifetime, caller_gone) = oneshot::channel();
         let this = self.clone();
         tokio::spawn(async move {
-            let result = this.register_worker_inner(registration, auth).await;
+            let result = this
+                .register_worker_inner(registration, auth, caller_gone)
+                .await;
             let _ = result_sender.send(result);
         });
         result_receiver
@@ -334,6 +411,7 @@ impl RelayOrchestrator {
     async fn activate_bridge_inner(
         &self,
         request: ActivationRequestV1,
+        caller_gone: oneshot::Receiver<()>,
     ) -> Result<BridgeOpenOutcome, RelayOpenError> {
         match self
             .controller
@@ -374,7 +452,7 @@ impl RelayOrchestrator {
                             return Err(RelayOpenError::Rendezvous(error));
                         }
                     };
-                self.attachment_or_contain(installation, receiver)
+                self.attachment_or_contain(installation, receiver, caller_gone)
                     .await
                     .map(BridgeOpenOutcome::Attached)
             }
@@ -385,6 +463,7 @@ impl RelayOrchestrator {
         &self,
         registration: WorkerRegistrationV1,
         auth: WorkerBootstrapAuth,
+        caller_gone: oneshot::Receiver<()>,
     ) -> Result<RelayAttachment<ControllerToWorkerV1>, RelayOpenError> {
         let RegisteredWorkerParts {
             binding,
@@ -411,7 +490,8 @@ impl RelayOrchestrator {
                 return Err(RelayOpenError::Rendezvous(error));
             }
         };
-        self.attachment_or_contain(installation, receiver).await
+        self.attachment_or_contain(installation, receiver, caller_gone)
+            .await
     }
 
     async fn contain_after_install_failure(
@@ -503,16 +583,66 @@ impl RelayOrchestrator {
     async fn attachment_or_contain<M>(
         &self,
         installation: super::RelayInstallation,
-        receiver: mpsc::Receiver<M>,
+        receiver: mpsc::Receiver<RelayOutboundItem<M>>,
+        mut caller_gone: oneshot::Receiver<()>,
     ) -> Result<RelayAttachment<M>, RelayOpenError> {
-        if let RelayPairingOutcome::ContainmentRequired(ticket) = installation.pairing() {
-            persist_containment(self.controller.as_ref(), &self.registry, ticket).await;
-            return Err(RelayOpenError::PeerClosed);
+        let session_id = installation.connection().session_id();
+        let mut pairing = installation.pairing().clone();
+        let mut budget_releases = self.registry.byte_budget_releases();
+        let mut quiesced = installation.quiesced();
+        let mut pairing_waiter = None;
+        loop {
+            match pairing {
+                RelayPairingOutcome::AwaitingPeer | RelayPairingOutcome::Active => break,
+                RelayPairingOutcome::Backpressured => {
+                    if pairing_waiter.is_none() {
+                        pairing_waiter = Some(self.registry.begin_pairing_wait());
+                    }
+                    pairing = self.registry.retry_pairing(session_id);
+                    if pairing != RelayPairingOutcome::Backpressured {
+                        continue;
+                    }
+                    tokio::select! {
+                        released = budget_releases.changed() => {
+                            if released.is_err() {
+                                return Err(RelayOpenError::PeerClosed);
+                            }
+                        }
+                        changed = quiesced.changed() => {
+                            if changed.is_err() || *quiesced.borrow() {
+                                return Err(RelayOpenError::PeerClosed);
+                            }
+                        }
+                        _ = &mut caller_gone => {
+                            drop(pairing_waiter.take());
+                            let connection = installation.connection().clone();
+                            if let RelayConnectionLoss::ContainmentRequired(ticket) =
+                                self.registry.begin_connection_loss(&connection)
+                            {
+                                persist_containment(
+                                    self.controller.as_ref(),
+                                    &self.registry,
+                                    &ticket,
+                                )
+                                .await;
+                            }
+                            return Err(RelayOpenError::PeerClosed);
+                        }
+                    }
+                    pairing = self.registry.retry_pairing(session_id);
+                }
+                RelayPairingOutcome::ContainmentRequired(ticket) => {
+                    drop(pairing_waiter.take());
+                    persist_containment(self.controller.as_ref(), &self.registry, &ticket).await;
+                    return Err(RelayOpenError::PeerClosed);
+                }
+                RelayPairingOutcome::Unavailable => return Err(RelayOpenError::PeerClosed),
+            }
         }
         Ok(RelayAttachment {
             connection: Some(installation.connection().clone()),
             outbound: receiver,
-            quiesced: installation.quiesced(),
+            quiesced,
             containment: ContainmentHandle {
                 controller: Arc::clone(&self.controller),
                 registry: self.registry.clone(),
@@ -576,8 +706,8 @@ mod tests {
     use crate::identity::ScopeId;
     use crate::state::Fence;
     use crate::wire::{
-        ActivationResponseV1, BrokerMappingExpectationV1, ControllerToWorkerV1, HandshakeOutcomeV1,
-        ValidatedActivationOutcomeV1, MAX_PROFILE_VERSION_BYTES,
+        decode_frame, ActivationResponseV1, BrokerMappingExpectationV1, ControllerToWorkerV1,
+        HandshakeOutcomeV1, ValidatedActivationOutcomeV1, WireMessage, MAX_PROFILE_VERSION_BYTES,
     };
     use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -624,6 +754,7 @@ mod tests {
         registration_fails: AtomicBool,
         activation_gate: Mutex<Option<Gate>>,
         registration_gate: Mutex<Option<Gate>>,
+        loss_gate: Mutex<Option<Gate>>,
         loss_failures: AtomicUsize,
         loss_outcome: AtomicU8,
         losses: AtomicUsize,
@@ -640,6 +771,7 @@ mod tests {
                 registration_fails: AtomicBool::new(false),
                 activation_gate: Mutex::new(None),
                 registration_gate: Mutex::new(None),
+                loss_gate: Mutex::new(None),
                 loss_failures: AtomicUsize::new(0),
                 loss_outcome: AtomicU8::new(0),
                 losses: AtomicUsize::new(0),
@@ -652,6 +784,10 @@ mod tests {
 
         fn set_registration_gate(&self, gate: Gate) {
             *self.registration_gate.lock().unwrap() = Some(gate);
+        }
+
+        fn set_loss_gate(&self, gate: Gate) {
+            *self.loss_gate.lock().unwrap() = Some(gate);
         }
 
         fn fail_next_loss(&self) {
@@ -738,6 +874,10 @@ mod tests {
             &self,
             _authority: &OrphanAuthority,
         ) -> Result<OrphanContainmentOutcome, ControllerServiceError> {
+            let gate = self.loss_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.wait().await;
+            }
             self.losses.fetch_add(1, Ordering::SeqCst);
             if self.should_fail_loss() {
                 Err(ControllerServiceError::ScopeMismatch)
@@ -802,8 +942,22 @@ mod tests {
         WorkerBootstrapAuth::new(POD_UID, &TOKEN).unwrap()
     }
 
+    fn decode_outbound<M: WireMessage>(queued: RelayOutboundItem<M>) -> M {
+        let frame = queued.into_encoded_frame().unwrap();
+        decode_frame(frame.as_bytes()).unwrap()
+    }
+
     fn orchestrator(controller: Arc<FakeController>) -> (RelayOrchestrator, RendezvousRegistry) {
-        let relay = RelayOrchestrator::with_controller(controller, NonZeroUsize::new(1).unwrap());
+        let budget = RelayByteBudget::new(NonZeroUsize::new(4 * 64 * 1024).unwrap()).unwrap();
+        orchestrator_with_budget(controller, budget)
+    }
+
+    fn orchestrator_with_budget(
+        controller: Arc<FakeController>,
+        budget: RelayByteBudget,
+    ) -> (RelayOrchestrator, RendezvousRegistry) {
+        let relay =
+            RelayOrchestrator::with_controller(controller, NonZeroUsize::new(1).unwrap(), budget);
         let registry = relay.registry.clone();
         (relay, registry)
     }
@@ -813,8 +967,8 @@ mod tests {
     ) -> (
         crate::controller::RelayInstallation,
         crate::controller::RelayInstallation,
-        mpsc::Receiver<ControllerToBridgeV1>,
-        mpsc::Receiver<ControllerToWorkerV1>,
+        mpsc::Receiver<RelayOutboundItem<ControllerToBridgeV1>>,
+        mpsc::Receiver<RelayOutboundItem<ControllerToWorkerV1>>,
     ) {
         let authority = OrphanAuthority::new(binding(), POD_UID).unwrap();
         let request = activation_request(BrokerMappingExpectationV1::Absent);
@@ -841,6 +995,20 @@ mod tests {
         .expect("containment should be scheduled promptly");
     }
 
+    async fn wait_for_pairing_pressure(registry: &RendezvousRegistry) {
+        timeout(Duration::from_secs(1), async {
+            loop {
+                match registry.retry_pairing(session_id()) {
+                    RelayPairingOutcome::AwaitingPeer => tokio::task::yield_now().await,
+                    RelayPairingOutcome::Backpressured => break,
+                    outcome => panic!("expected pairing pressure, got {outcome:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the worker lane should reach bounded pairing");
+    }
+
     #[tokio::test]
     async fn exact_pair_gets_ack_and_activation_only_after_both_domain_calls_succeed() {
         let controller = Arc::new(FakeController::new(binding()));
@@ -857,8 +1025,8 @@ mod tests {
         ));
 
         let mut worker = relay.register_worker(registration(), auth()).await.unwrap();
-        let ControllerToWorkerV1::ProtocolResult(worker_result) =
-            worker.outbound().recv().await.unwrap()
+        let worker_item = worker.outbound().recv().await.unwrap();
+        let ControllerToWorkerV1::ProtocolResult(worker_result) = decode_outbound(worker_item)
         else {
             panic!("worker must receive handshake ACK")
         };
@@ -866,8 +1034,8 @@ mod tests {
             worker_result.into_handshake_outcome().unwrap(),
             HandshakeOutcomeV1::Ack
         );
-        let ControllerToBridgeV1::Activation(activation) = bridge.outbound().recv().await.unwrap()
-        else {
+        let bridge_item = bridge.outbound().recv().await.unwrap();
+        let ControllerToBridgeV1::Activation(activation) = decode_outbound(bridge_item) else {
             panic!("bridge must receive Activated")
         };
         assert!(matches!(
@@ -949,6 +1117,102 @@ mod tests {
         wait_for_losses(&controller, 1).await;
         quiesced.changed().await.unwrap();
         assert!(*quiesced.borrow_and_update());
+        assert!(registry.pending_containments().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pairing_retries_after_transient_process_byte_pressure() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let limit = 4 * 64 * 1024;
+        let budget = RelayByteBudget::new(NonZeroUsize::new(limit).unwrap()).unwrap();
+        let held = budget.hold_for_test(limit);
+        let (relay, registry) = orchestrator_with_budget(controller, budget);
+        let request = activation_request(BrokerMappingExpectationV1::Absent);
+        let BridgeOpenOutcome::Attached(mut bridge) =
+            relay.activate_bridge(request.clone()).await.unwrap()
+        else {
+            panic!("durable generation must attach")
+        };
+        let mut worker_call = tokio::spawn({
+            let relay = relay.clone();
+            async move { relay.register_worker(registration(), auth()).await }
+        });
+
+        wait_for_pairing_pressure(&registry).await;
+        assert!(!worker_call.is_finished());
+        drop(held);
+
+        let mut worker = timeout(Duration::from_secs(1), &mut worker_call)
+            .await
+            .expect("budget release must wake pairing")
+            .unwrap()
+            .unwrap();
+        let worker_item = worker.outbound().try_recv().unwrap();
+        let ControllerToWorkerV1::ProtocolResult(result) = decode_outbound(worker_item) else {
+            panic!("worker must receive exactly one handshake result")
+        };
+        assert_eq!(
+            result.into_handshake_outcome().unwrap(),
+            HandshakeOutcomeV1::Ack
+        );
+        let bridge_item = bridge.outbound().try_recv().unwrap();
+        let ControllerToBridgeV1::Activation(activation) = decode_outbound(bridge_item) else {
+            panic!("bridge must receive exactly one activation result")
+        };
+        assert!(matches!(
+            activation.into_validated_outcome(&request).unwrap(),
+            ValidatedActivationOutcomeV1::Activated { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_pairing_wait_releases_global_admission_before_containment_io() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let limit = 4 * 64 * 1024;
+        let budget = RelayByteBudget::new(NonZeroUsize::new(limit).unwrap()).unwrap();
+        let active_registry = RendezvousRegistry::with_byte_budget(scope_id(), budget.clone());
+        let (active_bridge, _active_worker, mut active_bridge_outbound, mut active_worker_outbound) =
+            install_original_active_pair(&active_registry);
+        drop(active_bridge_outbound.try_recv().unwrap());
+        drop(active_worker_outbound.try_recv().unwrap());
+        let held = budget.hold_for_test(limit);
+        let (relay, registry) = orchestrator_with_budget(Arc::clone(&controller), budget);
+        let BridgeOpenOutcome::Attached(bridge) = relay
+            .activate_bridge(activation_request(BrokerMappingExpectationV1::Absent))
+            .await
+            .unwrap()
+        else {
+            panic!("durable generation must attach")
+        };
+        let loss_gate = Gate::new();
+        controller.set_loss_gate(loss_gate.clone());
+        let call = tokio::spawn({
+            let relay = relay.clone();
+            async move { relay.register_worker(registration(), auth()).await }
+        });
+
+        wait_for_pairing_pressure(&registry).await;
+        call.abort();
+        let _ = call.await;
+        loss_gate.started.acquire().await.unwrap().forget();
+
+        drop(held);
+        let message = AcpMessageV1::new(serde_json::json!({"jsonrpc": "2.0"})).unwrap();
+        assert_eq!(
+            active_registry.route_acp(active_bridge.connection(), message.clone()),
+            Ok(AcpRouteOutcome::Delivered)
+        );
+        assert_eq!(
+            decode_outbound(active_worker_outbound.try_recv().unwrap()),
+            ControllerToWorkerV1::Acp(message)
+        );
+
+        loss_gate.release.add_permits(1);
+        wait_for_losses(&controller, 1).await;
+        assert_eq!(
+            registry.route_target(bridge.connection()),
+            Err(RendezvousRouteError::StaleConnection)
+        );
         assert!(registry.pending_containments().is_empty());
     }
 
@@ -1171,5 +1435,65 @@ mod tests {
         ));
         assert_eq!(registry.pending_containments().len(), 2);
         assert_eq!(controller.losses.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn orchestrator_routes_acp_to_the_exact_active_attachment() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let (relay, _registry) = orchestrator(controller);
+        let BridgeOpenOutcome::Attached(mut bridge) = relay
+            .activate_bridge(activation_request(BrokerMappingExpectationV1::Absent))
+            .await
+            .unwrap()
+        else {
+            panic!("durable generation must attach")
+        };
+        let mut worker = relay.register_worker(registration(), auth()).await.unwrap();
+        drop(bridge.outbound().recv().await.unwrap());
+        drop(worker.outbound().recv().await.unwrap());
+        let message = AcpMessageV1::new(serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/prompt"
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            relay.route_acp(bridge.connection(), message.clone()).await,
+            Ok(RelayAcpDeliveryOutcome::Delivered)
+        ));
+        let queued = worker.outbound().recv().await.unwrap();
+        assert_eq!(decode_outbound(queued), ControllerToWorkerV1::Acp(message));
+    }
+
+    #[tokio::test]
+    async fn closed_peer_delivery_failure_remains_retryable_after_controller_error() {
+        let controller = Arc::new(FakeController::new(binding()));
+        controller.fail_next_loss();
+        let (relay, registry) = orchestrator(Arc::clone(&controller));
+        let BridgeOpenOutcome::Attached(mut bridge) = relay
+            .activate_bridge(activation_request(BrokerMappingExpectationV1::Absent))
+            .await
+            .unwrap()
+        else {
+            panic!("durable generation must attach")
+        };
+        let mut worker = relay.register_worker(registration(), auth()).await.unwrap();
+        drop(bridge.outbound().recv().await.unwrap());
+        drop(worker.outbound().recv().await.unwrap());
+        worker.outbound().close();
+
+        let error = relay
+            .route_acp(
+                bridge.connection(),
+                AcpMessageV1::new(serde_json::json!({"jsonrpc": "2.0"})).unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, RelayDeliveryError::Controller(_)));
+        assert_eq!(registry.pending_containments().len(), 1);
+        let report = relay.retry_pending_containments().await;
+        assert_eq!(report.completed(), 1);
+        assert!(report.failures().is_empty());
+        assert!(registry.pending_containments().is_empty());
     }
 }

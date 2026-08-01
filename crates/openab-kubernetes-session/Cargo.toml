@@ -24,7 +24,7 @@ serde_json = "1"
 sha2 = "0.10"
 subtle = { version = "2", optional = true }
 thiserror = "2"
-tokio = { version = "1", features = ["rt", "sync"], optional = true }
+tokio = { version = "1", features = ["macros", "rt", "sync"], optional = true }
 toml = { version = "0.8", optional = true }
 uuid = { version = "1", features = ["serde", "v4"] }
 

@@ -410,13 +410,44 @@ the same authority cannot install a lane.
 The registry is the sole process-local source for connection identity,
 handshake state, outbound sender, and quiescing state; there is no second
 connection-ID-to-sender map. A short synchronous mutex orders lane install,
-handshake enqueue, routing admission, and the transition to `Quiescing`; no
-controller or socket I/O occurs while it is held. A close transition returns a
-retryable containment ticket containing both connection IDs, then releases the
-registry mutex before controller I/O. Failed or cancelled containment work
-remains discoverable from the quiescing registry; the entry is removed only
-after a non-error durable-containment result. A delayed completion ticket
-cannot remove a newer rendezvous.
+handshake enqueue, exact-source routing admission, peer `try_send`, and the
+transition to `Quiescing`; no controller or socket I/O occurs while it is held.
+The old peer-ID lookup remains inspection-only and must never be carried
+across an await for delivery. A close transition returns a retryable
+containment ticket containing both connection IDs, then releases the registry
+mutex before controller I/O. Failed or cancelled containment work remains
+discoverable from the quiescing registry; the entry is removed only after a
+non-error durable-containment result. A delayed completion ticket cannot
+remove a newer rendezvous.
+
+Each lane has a bounded item count, and every queued handshake, control, or ACP
+delivery owns a lease from an explicitly injected process-wide byte budget.
+There is no public constructor that silently creates one budget per registry,
+and the configured budget must fit both handshake frames atomically. ACP is
+charged its validated encoded payload length plus the maximum control-frame
+overhead, without serializing the potentially 64 MiB value again inside the
+routing lock. A valid ACP frame that can never fit the configured budget is a
+terminal configuration error rather than retryable pressure.
+
+When transient pressure blocks a complete two-lane handshake, the orchestrator
+registers a pairing waiter before retrying. New ACP admission yields while any
+pairing waiter exists, and a lease release wakes the controller-owned retry.
+The retry revalidates the exact pair under the registry mutex before enqueueing
+either result. Cancellation while waiting transitions the exact installed
+connection to `Quiescing` and persists containment. A full queue during a fresh
+handshake is an invariant failure and also fails closed; it cannot leave a
+permanent silent `Pairing` entry.
+
+The queued item can only be consumed into a non-cloneable encoded-frame guard.
+That guard retains the byte lease while the network writer borrows its bytes
+and releases it only after the write completes, is cancelled, or the frame is
+discarded. Ordinary queue-full or transient byte-budget pressure returns
+ownership of the original ACP message to the single reader for retry; it must
+stop reading newer frames. A closed peer queue releases the unsent lease and
+changes the exact session to `Quiescing` under the same mutex. Consequently,
+delivery and close are linearized as either a complete enqueue before
+quiescing or a rejection after quiescing, never an enqueue decided from a stale
+peer lookup.
 
 The mutex guard latches process-fatal relay health while unwinding from any
 panic that could poison this state. The controller executable must subscribe
