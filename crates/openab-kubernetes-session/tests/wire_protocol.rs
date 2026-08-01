@@ -2,12 +2,14 @@ use openab_kubernetes_session::bridge::{
     BridgeAction, BridgeIdentity, BridgeKernel, ControllerLifecycleAction, LifecycleKind,
     SessionBinding,
 };
+use openab_kubernetes_session::identity::{ScopeId, SessionId};
 use openab_kubernetes_session::state::{Fence, ProfileRef};
 use openab_kubernetes_session::wire::{
     decode_frame, encode_frame, max_frame_len, validate_frame_len, AcpMessageV1,
-    ActivatedSessionV1, ActivationRequestV1, FatalCode, LifecycleRequestV1, ProtocolResultV1,
-    SessionBindingV1, WireMessage, WireProtocolError, WorkerRegistrationV1, MAX_ACP_FRAME_BYTES,
-    MAX_CONTROL_FRAME_BYTES, MAX_PROFILE_VERSION_BYTES, MAX_WORKER_CWD_BYTES,
+    ActivatedSessionV1, ActivationRequestV1, ActivationResponseV1, BrokerMappingExpectationV1,
+    FatalCode, LifecycleRequestV1, ProtocolResultV1, SessionBindingV1,
+    ValidatedActivationOutcomeV1, WireMessage, WireProtocolError, WorkerRegistrationV1,
+    MAX_ACP_FRAME_BYTES, MAX_CONTROL_FRAME_BYTES, MAX_PROFILE_VERSION_BYTES, MAX_WORKER_CWD_BYTES,
     MAX_WORKER_SESSION_ID_BYTES,
 };
 use serde_json::{json, Value};
@@ -27,7 +29,7 @@ fn identity() -> BridgeIdentity {
 }
 
 fn activation() -> ActivationRequestV1 {
-    ActivationRequestV1::from_identity(&identity())
+    ActivationRequestV1::from_identity(&identity(), BrokerMappingExpectationV1::Present)
 }
 
 fn binding() -> SessionBinding {
@@ -129,6 +131,7 @@ fn activation_contains_only_derived_identity_and_requested_profile_name() {
     assert_eq!(json["scopeId"], identity().scope_id().as_hex());
     assert_eq!(json["sessionId"], identity().session_id().as_hex());
     assert_eq!(json["attemptId"], ATTEMPT_ID.to_string());
+    assert_eq!(json["brokerMappingExpectation"], "present");
     assert_eq!(json["requestedProfileName"], "codex-strict");
     assert!(!json.as_object().unwrap().contains_key("token"));
 
@@ -161,6 +164,7 @@ fn activation_rejects_unknown_versions_fields_and_nil_attempts() {
         identity().session_id(),
         ATTEMPT_ID,
         "Not_A_DNS_Label",
+        BrokerMappingExpectationV1::Absent,
     )
     .is_err());
     assert_unknown_field_rejected(&activation());
@@ -200,7 +204,8 @@ fn activated_session_returns_validated_profile_binding_and_fixed_cwd() {
     let profile = ProfileRef::new("codex-strict", "sha256-image-v7").unwrap();
     let response =
         ActivatedSessionV1::new(&activation, profile.clone(), &binding(), "/workspace").unwrap();
-    let decoded: ActivatedSessionV1 = decode_frame(&encode_frame(&response).unwrap()).unwrap();
+    let decoded: ActivatedSessionV1 =
+        serde_json::from_slice(&serde_json::to_vec(&response).unwrap()).unwrap();
 
     let (actual_profile, actual_binding, actual_cwd) =
         decoded.into_validated_parts(&activation).unwrap();
@@ -210,7 +215,10 @@ fn activated_session_returns_validated_profile_binding_and_fixed_cwd() {
 
     let mut relative = serde_json::to_value(&response).unwrap();
     relative["workerCwd"] = json!("broker/workspace");
-    assert!(decode_frame::<ActivatedSessionV1>(&serde_json::to_vec(&relative).unwrap()).is_err());
+    assert!(
+        serde_json::from_slice::<ActivatedSessionV1>(&serde_json::to_vec(&relative).unwrap())
+            .is_err()
+    );
 
     let other = BridgeIdentity::from_values(
         "team-b",
@@ -219,7 +227,8 @@ fn activated_session_returns_validated_profile_binding_and_fixed_cwd() {
         ProfileRef::new("codex-strict", "ignored").unwrap(),
     )
     .unwrap();
-    let other_request = ActivationRequestV1::from_identity(&other);
+    let other_request =
+        ActivationRequestV1::from_identity(&other, BrokerMappingExpectationV1::Present);
     assert!(response
         .clone()
         .into_validated_parts(&other_request)
@@ -230,6 +239,7 @@ fn activated_session_returns_validated_profile_binding_and_fixed_cwd() {
         activation.session_id(),
         activation.attempt_id(),
         "other-profile",
+        BrokerMappingExpectationV1::Present,
     )
     .unwrap();
     assert!(matches!(
@@ -238,7 +248,200 @@ fn activated_session_returns_validated_profile_binding_and_fixed_cwd() {
             .into_validated_parts(&other_profile_request),
         Err(WireProtocolError::ProfileMismatch)
     ));
+    let mut unknown = serde_json::to_value(&response).unwrap();
+    add_unknown_field(&mut unknown);
+    assert!(
+        serde_json::from_slice::<ActivatedSessionV1>(&serde_json::to_vec(&unknown).unwrap())
+            .is_err()
+    );
+}
+
+#[test]
+fn activation_requires_an_explicit_broker_mapping_expectation() {
+    let present = activation();
+    assert_eq!(
+        present.broker_mapping_expectation(),
+        BrokerMappingExpectationV1::Present
+    );
+
+    let absent =
+        ActivationRequestV1::from_identity(&identity(), BrokerMappingExpectationV1::Absent);
+    let absent_json = serde_json::to_value(&absent).unwrap();
+    assert_eq!(absent_json["brokerMappingExpectation"], "absent");
+
+    let mut missing = serde_json::to_value(&present).unwrap();
+    missing
+        .as_object_mut()
+        .unwrap()
+        .remove("brokerMappingExpectation");
+    assert!(decode_frame::<ActivationRequestV1>(&serde_json::to_vec(&missing).unwrap()).is_err());
+
+    let mut unknown = serde_json::to_value(&present).unwrap();
+    unknown["brokerMappingExpectation"] = json!("unknown");
+    assert!(decode_frame::<ActivationRequestV1>(&serde_json::to_vec(&unknown).unwrap()).is_err());
+}
+
+#[test]
+fn activation_response_returns_one_typed_validated_outcome() {
+    let request = activation();
+    let profile = ProfileRef::new("codex-strict", "sha256-image-v7").unwrap();
+    let activated =
+        ActivatedSessionV1::new(&request, profile.clone(), &binding(), "/workspace").unwrap();
+    let response = ActivationResponseV1::activated(activated);
+    let encoded = encode_frame(&response).unwrap();
+    let json: Value = serde_json::from_slice(&encoded).unwrap();
+
+    assert_eq!(json["outcome"], "activated");
+    assert_eq!(json["payload"]["version"], 1);
+    let decoded: ActivationResponseV1 = decode_frame(&encoded).unwrap();
+    match decoded.into_validated_outcome(&request).unwrap() {
+        ValidatedActivationOutcomeV1::Activated {
+            profile: actual_profile,
+            binding: actual_binding,
+            worker_cwd,
+        } => {
+            assert_eq!(actual_profile, profile);
+            assert_eq!(actual_binding, binding());
+            assert_eq!(worker_cwd, "/workspace");
+        }
+        ValidatedActivationOutcomeV1::MappingAbsent => {
+            panic!("expected an activated outcome")
+        }
+    }
     assert_unknown_field_rejected(&response);
+
+    let mut unsupported_payload_version = json;
+    unsupported_payload_version["payload"]["version"] = json!(2);
+    assert!(decode_frame::<ActivationResponseV1>(
+        &serde_json::to_vec(&unsupported_payload_version).unwrap()
+    )
+    .is_err());
+}
+
+#[test]
+fn mapping_absent_response_requires_present_expectation_and_exact_correlation() {
+    let request = activation();
+    let response = ActivationResponseV1::mapping_absent(&request).unwrap();
+    let encoded = encode_frame(&response).unwrap();
+    let json: Value = serde_json::from_slice(&encoded).unwrap();
+
+    assert_eq!(json["outcome"], "mapping_absent");
+    assert_eq!(json["payload"]["version"], 1);
+    assert_eq!(json["payload"]["scopeId"], request.scope_id().as_hex());
+    assert_eq!(json["payload"]["sessionId"], request.session_id().as_hex());
+    assert_eq!(
+        json["payload"]["attemptId"],
+        request.attempt_id().to_string()
+    );
+    assert_eq!(
+        decode_frame::<ActivationResponseV1>(&encoded)
+            .unwrap()
+            .into_validated_outcome(&request)
+            .unwrap(),
+        ValidatedActivationOutcomeV1::MappingAbsent
+    );
+
+    let absent_request =
+        ActivationRequestV1::from_identity(&identity(), BrokerMappingExpectationV1::Absent);
+    assert!(matches!(
+        decode_frame::<ActivationResponseV1>(&encoded)
+            .unwrap()
+            .into_validated_outcome(&absent_request),
+        Err(WireProtocolError::UnexpectedMappingAbsent)
+    ));
+    assert!(matches!(
+        ActivationResponseV1::mapping_absent(&absent_request),
+        Err(WireProtocolError::UnexpectedMappingAbsent)
+    ));
+
+    for (field, replacement) in [
+        ("scopeId", json!(ScopeId::derive("other-scope").as_hex())),
+        (
+            "sessionId",
+            json!(SessionId::derive("other-scope", "other-thread").as_hex()),
+        ),
+        ("attemptId", json!(Uuid::from_u128(999).to_string())),
+    ] {
+        let mut mismatched = json.clone();
+        mismatched["payload"][field] = replacement;
+        let decoded: ActivationResponseV1 =
+            decode_frame(&serde_json::to_vec(&mismatched).unwrap()).unwrap();
+        assert!(matches!(
+            decoded.into_validated_outcome(&request),
+            Err(WireProtocolError::MappingAbsentMismatch(actual)) if actual == field
+        ));
+    }
+}
+
+#[test]
+fn mapping_absent_wire_payload_fails_closed() {
+    let request = activation();
+    let response = ActivationResponseV1::mapping_absent(&request).unwrap();
+    let value = serde_json::to_value(&response).unwrap();
+
+    for (field, replacement) in [("version", json!(2)), ("attemptId", json!(Uuid::nil()))] {
+        let mut invalid = value.clone();
+        invalid["payload"][field] = replacement;
+        assert!(
+            decode_frame::<ActivationResponseV1>(&serde_json::to_vec(&invalid).unwrap()).is_err()
+        );
+    }
+
+    let mut unknown_payload = value.clone();
+    unknown_payload["payload"]["controllerDebug"] = json!("secret detail");
+    assert!(
+        decode_frame::<ActivationResponseV1>(&serde_json::to_vec(&unknown_payload).unwrap())
+            .is_err()
+    );
+
+    let mut unknown_outcome = value.clone();
+    unknown_outcome["outcome"] = json!("mapping_maybe_absent");
+    assert!(
+        decode_frame::<ActivationResponseV1>(&serde_json::to_vec(&unknown_outcome).unwrap())
+            .is_err()
+    );
+
+    assert_unknown_field_rejected(&response);
+}
+
+#[test]
+fn activation_response_envelope_rejects_variant_confusion() {
+    let request = activation();
+    let absent =
+        serde_json::to_value(ActivationResponseV1::mapping_absent(&request).unwrap()).unwrap();
+    let activated = serde_json::to_value(ActivationResponseV1::activated(
+        ActivatedSessionV1::new(
+            &request,
+            ProfileRef::new("codex-strict", "sha256-image-v7").unwrap(),
+            &binding(),
+            "/workspace",
+        )
+        .unwrap(),
+    ))
+    .unwrap();
+
+    let mut activated_tag_with_absent_payload = absent.clone();
+    activated_tag_with_absent_payload["outcome"] = json!("activated");
+
+    let mut absent_tag_with_activated_payload = activated;
+    absent_tag_with_activated_payload["outcome"] = json!("mapping_absent");
+
+    let mut missing_payload = absent.clone();
+    missing_payload.as_object_mut().unwrap().remove("payload");
+
+    let mut outer_version = absent;
+    outer_version["version"] = json!(1);
+
+    for invalid in [
+        activated_tag_with_absent_payload,
+        absent_tag_with_activated_payload,
+        missing_payload,
+        outer_version,
+    ] {
+        assert!(
+            decode_frame::<ActivationResponseV1>(&serde_json::to_vec(&invalid).unwrap()).is_err()
+        );
+    }
 }
 
 #[test]
@@ -266,10 +469,10 @@ fn control_plane_strings_are_bounded_and_cwd_is_canonical_by_construction() {
     let valid = ActivatedSessionV1::new(&activation(), profile, &binding(), "/workspace").unwrap();
     let mut oversized_on_wire = serde_json::to_value(valid).unwrap();
     oversized_on_wire["profile"]["version"] = json!(oversized_profile.version());
-    assert!(
-        decode_frame::<ActivatedSessionV1>(&serde_json::to_vec(&oversized_on_wire).unwrap())
-            .is_err()
-    );
+    assert!(serde_json::from_slice::<ActivatedSessionV1>(
+        &serde_json::to_vec(&oversized_on_wire).unwrap()
+    )
+    .is_err());
 
     let oversized_worker_session = "s".repeat(MAX_WORKER_SESSION_ID_BYTES + 1);
     let action = lifecycle_action(LifecycleKind::Suspend, &oversized_worker_session);
@@ -414,12 +617,8 @@ fn public_protocol_results_have_codes_but_no_controller_detail_channel() {
 
 #[test]
 fn every_top_level_message_rejects_an_unsupported_version() {
-    let profile = ProfileRef::new("codex-strict", "v1").unwrap();
     assert_version_rejected(&activation());
     assert_version_rejected(&SessionBindingV1::from(&binding()));
-    assert_version_rejected(
-        &ActivatedSessionV1::new(&activation(), profile, &binding(), "/workspace").unwrap(),
-    );
     assert_version_rejected(
         &LifecycleRequestV1::from_bridge_action(&lifecycle_action(
             LifecycleKind::Suspend,
@@ -442,7 +641,7 @@ fn only_acp_frames_receive_the_large_data_plane_limit() {
     for limit in [
         max_frame_len::<ActivationRequestV1>(),
         max_frame_len::<SessionBindingV1>(),
-        max_frame_len::<ActivatedSessionV1>(),
+        max_frame_len::<ActivationResponseV1>(),
         max_frame_len::<LifecycleRequestV1>(),
         max_frame_len::<WorkerRegistrationV1>(),
         max_frame_len::<ProtocolResultV1>(),

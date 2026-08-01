@@ -65,6 +65,10 @@ pub enum WireProtocolError {
     BindingMismatch(&'static str),
     #[error("activated profile does not match the requested profile name")]
     ProfileMismatch,
+    #[error("mapping-absent response does not match activation field {0}")]
+    MappingAbsentMismatch(&'static str),
+    #[error("mapping-absent response requires a present broker mapping expectation")]
+    UnexpectedMappingAbsent,
     #[error("protocol result requestId does not match the lifecycle request")]
     ResultRequestIdMismatch,
 }
@@ -299,8 +303,21 @@ impl<'de> Deserialize<'de> for AcpPayload {
     }
 }
 
+/// Whether the broker has a durable opaque ACP session mapping for this
+/// logical session. This is reconciliation input, never controller authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrokerMappingExpectationV1 {
+    Absent,
+    Present,
+}
+
 /// First bridge message used to activate or resume one broker-derived
 /// session. Transport credentials are deliberately absent.
+///
+/// This V1 contract is still pre-release. The required broker-mapping field
+/// and the corresponding response envelope must be deployed to bridge and
+/// controller peers together; they are not compatible with the earlier draft.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ActivationRequestV1 {
@@ -308,6 +325,7 @@ pub struct ActivationRequestV1 {
     scope_id: ScopeId,
     session_id: SessionId,
     attempt_id: NonNilUuid,
+    broker_mapping_expectation: BrokerMappingExpectationV1,
     requested_profile_name: RequestedProfileName,
 }
 
@@ -317,22 +335,28 @@ impl ActivationRequestV1 {
         session_id: SessionId,
         attempt_id: Uuid,
         requested_profile_name: impl Into<String>,
+        broker_mapping_expectation: BrokerMappingExpectationV1,
     ) -> Result<Self, WireProtocolError> {
         Ok(Self {
             version: Version1,
             scope_id,
             session_id,
             attempt_id: NonNilUuid::attempt(attempt_id)?,
+            broker_mapping_expectation,
             requested_profile_name: RequestedProfileName::new(requested_profile_name)?,
         })
     }
 
-    pub fn from_identity(identity: &BridgeIdentity) -> Self {
+    pub fn from_identity(
+        identity: &BridgeIdentity,
+        broker_mapping_expectation: BrokerMappingExpectationV1,
+    ) -> Self {
         Self::new(
             identity.scope_id(),
             identity.session_id(),
             identity.broker_attempt_id(),
             identity.profile().name(),
+            broker_mapping_expectation,
         )
         .expect("BridgeIdentity already contains validated activation values")
     }
@@ -347,6 +371,10 @@ impl ActivationRequestV1 {
 
     pub fn attempt_id(&self) -> Uuid {
         self.attempt_id.0
+    }
+
+    pub fn broker_mapping_expectation(&self) -> BrokerMappingExpectationV1 {
+        self.broker_mapping_expectation
     }
 
     pub fn requested_profile_name(&self) -> &str {
@@ -480,6 +508,108 @@ impl ActivatedSessionV1 {
         self.validate_for(activation)?;
         let binding = self.binding.to_binding()?;
         Ok((self.profile.0, binding, self.worker_cwd.0))
+    }
+}
+
+/// Correlated controller assertion that no durable worker generation remains
+/// for a broker mapping that the activation request expected to exist.
+///
+/// Correlation is not the absence proof itself. The controller may construct
+/// this payload only after an authenticated, serialized reconciliation has
+/// authoritatively observed the anchor and every owned resource as absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MappingAbsentV1 {
+    version: Version1,
+    scope_id: ScopeId,
+    session_id: SessionId,
+    attempt_id: NonNilUuid,
+}
+
+impl MappingAbsentV1 {
+    fn for_request(request: &ActivationRequestV1) -> Self {
+        Self {
+            version: Version1,
+            scope_id: request.scope_id,
+            session_id: request.session_id,
+            attempt_id: request.attempt_id,
+        }
+    }
+
+    fn validate_for(&self, request: &ActivationRequestV1) -> Result<(), WireProtocolError> {
+        if request.broker_mapping_expectation != BrokerMappingExpectationV1::Present {
+            return Err(WireProtocolError::UnexpectedMappingAbsent);
+        }
+        if self.scope_id != request.scope_id {
+            return Err(WireProtocolError::MappingAbsentMismatch("scopeId"));
+        }
+        if self.session_id != request.session_id {
+            return Err(WireProtocolError::MappingAbsentMismatch("sessionId"));
+        }
+        if self.attempt_id != request.attempt_id {
+            return Err(WireProtocolError::MappingAbsentMismatch("attemptId"));
+        }
+        Ok(())
+    }
+}
+
+/// Validated activation data exposed to the broker. Raw response fields are
+/// not available until the response has been correlated with its request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidatedActivationOutcomeV1 {
+    Activated {
+        profile: ProfileRef,
+        binding: SessionBinding,
+        worker_cwd: String,
+    },
+    MappingAbsent,
+}
+
+/// Closed activation response union. The adjacent `outcome` tag keeps the
+/// response kind explicit while each versioned payload rejects unknown data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "outcome",
+    content = "payload",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum ActivationResponseV1 {
+    Activated(ActivatedSessionV1),
+    MappingAbsent(MappingAbsentV1),
+}
+
+impl ActivationResponseV1 {
+    pub fn activated(session: ActivatedSessionV1) -> Self {
+        Self::Activated(session)
+    }
+
+    pub fn mapping_absent(request: &ActivationRequestV1) -> Result<Self, WireProtocolError> {
+        let absence = MappingAbsentV1::for_request(request);
+        absence.validate_for(request)?;
+        Ok(Self::MappingAbsent(absence))
+    }
+
+    /// Consume an untrusted controller response and expose one typed outcome
+    /// only after exact correlation with the originating request.
+    pub fn into_validated_outcome(
+        self,
+        request: &ActivationRequestV1,
+    ) -> Result<ValidatedActivationOutcomeV1, WireProtocolError> {
+        match self {
+            Self::Activated(session) => {
+                let (profile, binding, worker_cwd) = session.into_validated_parts(request)?;
+                Ok(ValidatedActivationOutcomeV1::Activated {
+                    profile,
+                    binding,
+                    worker_cwd,
+                })
+            }
+            Self::MappingAbsent(absence) => {
+                absence.validate_for(request)?;
+                Ok(ValidatedActivationOutcomeV1::MappingAbsent)
+            }
+        }
     }
 }
 
@@ -679,7 +809,7 @@ macro_rules! control_wire_messages {
 control_wire_messages!(
     ActivationRequestV1,
     SessionBindingV1,
-    ActivatedSessionV1,
+    ActivationResponseV1,
     LifecycleRequestV1,
     WorkerRegistrationV1,
     ProtocolResultV1,
