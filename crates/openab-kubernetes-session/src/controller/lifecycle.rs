@@ -4,6 +4,7 @@ use crate::identity::SessionId;
 use crate::state::SessionPhase;
 use crate::store::{AnchorStoreError, ConfigMapAnchorStore, StoredAnchor};
 use crate::wire::{LifecycleRequestV1, WireProtocolError};
+use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -107,6 +108,40 @@ impl LifecycleCoordinator {
                 Err(LifecycleError::PhaseRejected)
             }
         }
+    }
+
+    /// Persist an automatic compute suspension only when a fresh controller
+    /// observation is still `Ready` and expired at the scan-owned cutoff.
+    ///
+    /// `false` means the inventory scheduling hint became stale. This path
+    /// deliberately rejects `Busy` sessions and never invokes the provisioner;
+    /// normal durable-intent reconciliation removes compute after the intent
+    /// is committed.
+    pub(crate) async fn accept_expired_ready(
+        &self,
+        session_id: SessionId,
+        cutoff: DateTime<Utc>,
+    ) -> Result<bool, LifecycleError> {
+        let _guard = self.locks.lock(session_id).await;
+        let Some(observed) = self.store.get(session_id).await? else {
+            return Ok(false);
+        };
+        if observed.state().scope_id() != self.store.scope_id()
+            || observed.state().session_id() != session_id
+        {
+            return Err(LifecycleError::StaleBinding);
+        }
+        if observed.state().phase() != SessionPhase::Ready
+            || observed.state().compute_deadline_at() > cutoff
+        {
+            return Ok(false);
+        }
+
+        let mut next = observed.state().clone();
+        next.transition(observed.state().fence(), SessionPhase::Suspending)
+            .map_err(|_| LifecycleError::InvalidAnchor)?;
+        self.store.replace(&observed, &next).await?;
+        Ok(true)
     }
 
     /// Reconcile generation-scoped compute to absence for a previously

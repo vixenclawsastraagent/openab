@@ -10,9 +10,10 @@ use openab_kubernetes_session::controller::{
     ActivityEvent, ActivityOutcome, ActivityTurnId, BootstrapPresence, CleanupProgress,
     ConsumedBootstrap, ControllerCoordinatorConfigError, ControllerCoordinators,
     DurableIntentError, DurableIntentOutcome, DurableIntentReport, GenerationProvisioner,
-    GenerationProvisionerError, LifecycleProvisioner, LifecycleReconcileOutcome, ObservedWorker,
-    RegistrationProvisioner, RegistrationProvisionerError, ReleaseCleanupProgress, ReleaseOutcome,
-    ReleaseProvisioner, ReleasedChildrenAbsentProof, VerifiedBootstrap, WorkerBootstrapAuth,
+    GenerationProvisionerError, LifecycleDeadlineOutcome, LifecycleDeadlineReport, LifecycleError,
+    LifecycleProvisioner, LifecycleReconcileOutcome, ObservedWorker, RegistrationProvisioner,
+    RegistrationProvisionerError, ReleaseCleanupProgress, ReleaseOutcome, ReleaseProvisioner,
+    ReleasedChildrenAbsentProof, VerifiedBootstrap, WorkerBootstrapAuth,
 };
 use openab_kubernetes_session::identity::{ResourceNames, ScopeId, SessionId};
 use openab_kubernetes_session::profile_config::ControllerPolicy;
@@ -232,6 +233,21 @@ fn anchor_in_phase(session_id: SessionId, phase: SessionPhase, version: &str) ->
     anchor
 }
 
+fn anchor_with_deadlines(
+    session_id: SessionId,
+    phase: SessionPhase,
+    last_activity_at: chrono::DateTime<Utc>,
+    compute_deadline_at: chrono::DateTime<Utc>,
+    storage_deadline_at: chrono::DateTime<Utc>,
+) -> SessionAnchorV1 {
+    let anchor = anchor_in_phase(session_id, phase, "2026-08-01");
+    let mut value = serde_json::to_value(anchor).unwrap();
+    value["lastActivityAt"] = json!(last_activity_at);
+    value["computeDeadlineAt"] = json!(compute_deadline_at);
+    value["storageDeadlineAt"] = json!(storage_deadline_at);
+    serde_json::from_value(value).unwrap()
+}
+
 fn provisioning_with_pod(session_id: SessionId, version: &str) -> SessionAnchorV1 {
     let mut anchor = base_anchor(session_id, version);
     let fence = anchor.fence().clone();
@@ -353,6 +369,8 @@ async fn assert_no_request(
 }
 
 fn assert_public_report_type(_report: &DurableIntentReport) {}
+
+fn assert_public_deadline_report_type(_report: &LifecycleDeadlineReport) {}
 
 #[tokio::test]
 async fn composition_root_indexes_exact_profile_revisions_and_rejects_duplicates() {
@@ -778,6 +796,454 @@ async fn composition_root_serializes_live_activity_and_suspend_for_one_session()
     send.send_response(json_response(StatusCode::OK, lifecycle_body));
 
     lifecycle.await.unwrap().unwrap();
+    assert_eq!(fake.calls(), (0, 0, 0, 0));
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn expired_ready_deadline_durably_accepts_compute_suspension_only() {
+    let now = Utc::now();
+    let anchor = anchor_with_deadlines(
+        session_id("discord:expired-ready"),
+        SessionPhase::Ready,
+        now - Duration::hours(2),
+        now - Duration::hours(1),
+        now + Duration::hours(70),
+    );
+    let (store, handle) = store_and_handle();
+    let fake = Arc::new(FakeProvisioner::default());
+    let root = coordinators(store, [profile("2026-08-01")], fake.clone()).unwrap();
+    let task = tokio::spawn(async move { root.scan_lifecycle_deadlines().await });
+    let mut handle = std::pin::pin!(handle);
+
+    let (list, send) = handle.next_request().await.unwrap();
+    assert_eq!(list.method(), Method::GET);
+    send.send_response(json_response(
+        StatusCode::OK,
+        config_map_list(std::slice::from_ref(&anchor)),
+    ));
+    let (get, send) = handle.next_request().await.unwrap();
+    assert_eq!(get.method(), Method::GET);
+    send.send_response(json_response(
+        StatusCode::OK,
+        config_map(&anchor, "rv-fresh"),
+    ));
+    let (replace, send) = handle.next_request().await.unwrap();
+    assert_eq!(replace.method(), Method::PUT);
+    let mut body = request_body(replace).await;
+    let written: SessionAnchorV1 =
+        serde_json::from_str(body["data"]["anchor.json"].as_str().unwrap()).unwrap();
+    assert_eq!(written.phase(), SessionPhase::Suspending);
+    assert_eq!(written.last_prompt_turn_id(), None);
+    assert_eq!(written.last_activity_at(), anchor.last_activity_at());
+    assert_eq!(written.compute_deadline_at(), anchor.compute_deadline_at());
+    assert_eq!(written.storage_deadline_at(), anchor.storage_deadline_at());
+    body["metadata"]["resourceVersion"] = json!("rv-suspending");
+    send.send_response(json_response(StatusCode::OK, body));
+
+    let report = task.await.unwrap().unwrap();
+    assert_public_deadline_report_type(&report);
+    assert_eq!(report.results().len(), 1);
+    assert!(matches!(
+        report.results()[0].outcome(),
+        Some(LifecycleDeadlineOutcome::ComputeSuspensionAccepted)
+    ));
+    assert_eq!(fake.calls(), (0, 0, 0, 0));
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn deadline_scan_never_suspends_busy_or_not_due_compute() {
+    let now = Utc::now();
+    let anchors = vec![
+        anchor_with_deadlines(
+            session_id("discord:expired-busy"),
+            SessionPhase::Busy,
+            now - Duration::hours(2),
+            now - Duration::hours(1),
+            now + Duration::hours(70),
+        ),
+        anchor_with_deadlines(
+            session_id("discord:not-due"),
+            SessionPhase::Ready,
+            now,
+            now + Duration::hours(1),
+            now + Duration::hours(72),
+        ),
+        anchor_with_deadlines(
+            session_id("discord:provisioning"),
+            SessionPhase::Provisioning,
+            now - Duration::hours(2),
+            now - Duration::hours(1),
+            now + Duration::hours(70),
+        ),
+        anchor_with_deadlines(
+            session_id("discord:suspending"),
+            SessionPhase::Suspending,
+            now - Duration::hours(2),
+            now - Duration::hours(1),
+            now + Duration::hours(70),
+        ),
+        anchor_with_deadlines(
+            session_id("discord:blocked"),
+            SessionPhase::Blocked,
+            now - Duration::hours(2),
+            now - Duration::hours(1),
+            now + Duration::hours(70),
+        ),
+        anchor_with_deadlines(
+            session_id("discord:deleting"),
+            SessionPhase::Deleting,
+            now - Duration::hours(2),
+            now - Duration::hours(1),
+            now + Duration::hours(70),
+        ),
+        anchor_with_deadlines(
+            session_id("discord:suspended-retained"),
+            SessionPhase::Suspended,
+            now - Duration::hours(2),
+            now - Duration::hours(1),
+            now + Duration::hours(70),
+        ),
+    ];
+    let (store, handle) = store_and_handle();
+    let fake = Arc::new(FakeProvisioner::default());
+    let root = coordinators(store, [profile("2026-08-01")], fake.clone()).unwrap();
+    let task = tokio::spawn(async move { root.scan_lifecycle_deadlines().await });
+    let mut handle = std::pin::pin!(handle);
+
+    let (list, send) = handle.next_request().await.unwrap();
+    assert_eq!(list.method(), Method::GET);
+    send.send_response(json_response(StatusCode::OK, config_map_list(&anchors)));
+
+    let report = task.await.unwrap().unwrap();
+    assert_eq!(report.results().len(), 7);
+    assert!(report
+        .results()
+        .iter()
+        .all(|result| matches!(result.outcome(), Some(LifecycleDeadlineOutcome::Noop))));
+    assert_eq!(fake.calls(), (0, 0, 0, 0));
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn expired_suspended_storage_is_advisory_without_any_mutation() {
+    let now = Utc::now();
+    let anchor = anchor_with_deadlines(
+        session_id("discord:release-eligible"),
+        SessionPhase::Suspended,
+        now - Duration::hours(4),
+        now - Duration::hours(3),
+        now - Duration::hours(2),
+    );
+    let (store, handle) = store_and_handle();
+    let fake = Arc::new(FakeProvisioner::default());
+    let root = coordinators(store, [profile("2026-08-01")], fake.clone()).unwrap();
+    let task = tokio::spawn(async move { root.scan_lifecycle_deadlines().await });
+    let mut handle = std::pin::pin!(handle);
+
+    let (list, send) = handle.next_request().await.unwrap();
+    assert_eq!(list.method(), Method::GET);
+    send.send_response(json_response(
+        StatusCode::OK,
+        config_map_list(std::slice::from_ref(&anchor)),
+    ));
+
+    let report = task.await.unwrap().unwrap();
+    assert!(matches!(
+        report.results()[0].outcome(),
+        Some(LifecycleDeadlineOutcome::StorageDeadlineExpiredObservation)
+    ));
+    assert_eq!(fake.calls(), (0, 0, 0, 0));
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn fresh_activity_or_phase_drift_invalidates_an_expired_compute_hint() {
+    let now = Utc::now();
+    let scheduled = anchor_with_deadlines(
+        session_id("discord:deadline-drift"),
+        SessionPhase::Ready,
+        now - Duration::hours(2),
+        now - Duration::hours(1),
+        now + Duration::hours(70),
+    );
+    let fresh = anchor_with_deadlines(
+        scheduled.session_id(),
+        SessionPhase::Busy,
+        now,
+        now + Duration::hours(1),
+        now + Duration::hours(72),
+    );
+    let (store, handle) = store_and_handle();
+    let fake = Arc::new(FakeProvisioner::default());
+    let root = coordinators(store, [profile("2026-08-01")], fake.clone()).unwrap();
+    let task = tokio::spawn(async move { root.scan_lifecycle_deadlines().await });
+    let mut handle = std::pin::pin!(handle);
+
+    let (list, send) = handle.next_request().await.unwrap();
+    assert_eq!(list.method(), Method::GET);
+    send.send_response(json_response(
+        StatusCode::OK,
+        config_map_list(std::slice::from_ref(&scheduled)),
+    ));
+    let (get, send) = handle.next_request().await.unwrap();
+    assert_eq!(get.method(), Method::GET);
+    send.send_response(json_response(
+        StatusCode::OK,
+        config_map(&fresh, "rv-fresh"),
+    ));
+
+    let report = task.await.unwrap().unwrap();
+    assert!(matches!(
+        report.results()[0].outcome(),
+        Some(LifecycleDeadlineOutcome::StaleObservation)
+    ));
+    assert_eq!(fake.calls(), (0, 0, 0, 0));
+    assert_no_request(&mut handle).await;
+
+    let refreshed = anchor_with_deadlines(
+        scheduled.session_id(),
+        SessionPhase::Ready,
+        now,
+        now + Duration::hours(1),
+        now + Duration::hours(72),
+    );
+    let (store, handle) = store_and_handle();
+    let fake = Arc::new(FakeProvisioner::default());
+    let root = coordinators(store, [profile("2026-08-01")], fake.clone()).unwrap();
+    let task = tokio::spawn(async move { root.scan_lifecycle_deadlines().await });
+    let mut handle = std::pin::pin!(handle);
+    let (list, send) = handle.next_request().await.unwrap();
+    assert_eq!(list.method(), Method::GET);
+    send.send_response(json_response(
+        StatusCode::OK,
+        config_map_list(std::slice::from_ref(&scheduled)),
+    ));
+    let (get, send) = handle.next_request().await.unwrap();
+    assert_eq!(get.method(), Method::GET);
+    send.send_response(json_response(
+        StatusCode::OK,
+        config_map(&refreshed, "rv-refreshed"),
+    ));
+
+    let report = task.await.unwrap().unwrap();
+    assert!(matches!(
+        report.results()[0].outcome(),
+        Some(LifecycleDeadlineOutcome::StaleObservation)
+    ));
+    assert_eq!(fake.calls(), (0, 0, 0, 0));
+    assert_no_request(&mut handle).await;
+
+    let (store, handle) = store_and_handle();
+    let fake = Arc::new(FakeProvisioner::default());
+    let root = coordinators(store, [profile("2026-08-01")], fake.clone()).unwrap();
+    let task = tokio::spawn(async move { root.scan_lifecycle_deadlines().await });
+    let mut handle = std::pin::pin!(handle);
+    let (list, send) = handle.next_request().await.unwrap();
+    assert_eq!(list.method(), Method::GET);
+    send.send_response(json_response(
+        StatusCode::OK,
+        config_map_list(std::slice::from_ref(&scheduled)),
+    ));
+    let (get, send) = handle.next_request().await.unwrap();
+    assert_eq!(get.method(), Method::GET);
+    send.send_response(missing_response());
+
+    let report = task.await.unwrap().unwrap();
+    assert!(matches!(
+        report.results()[0].outcome(),
+        Some(LifecycleDeadlineOutcome::StaleObservation)
+    ));
+    assert_eq!(fake.calls(), (0, 0, 0, 0));
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn deadline_cas_failure_is_isolated_and_does_not_acknowledge_suspend() {
+    let now = Utc::now();
+    let mut anchors = vec![
+        anchor_with_deadlines(
+            session_id("discord:deadline-a"),
+            SessionPhase::Ready,
+            now - Duration::hours(2),
+            now - Duration::hours(1),
+            now + Duration::hours(70),
+        ),
+        anchor_with_deadlines(
+            session_id("discord:deadline-b"),
+            SessionPhase::Ready,
+            now - Duration::hours(2),
+            now - Duration::hours(1),
+            now + Duration::hours(70),
+        ),
+    ];
+    anchors.sort_unstable_by_key(|anchor| ResourceNames::new(anchor.session_id()).anchor());
+    let failed_session = anchors[0].session_id();
+    let accepted_session = anchors[1].session_id();
+    let (store, handle) = store_and_handle();
+    let fake = Arc::new(FakeProvisioner::default());
+    let root = coordinators(store, [profile("2026-08-01")], fake.clone()).unwrap();
+    let task = tokio::spawn(async move { root.scan_lifecycle_deadlines().await });
+    let mut handle = std::pin::pin!(handle);
+
+    let (list, send) = handle.next_request().await.unwrap();
+    assert_eq!(list.method(), Method::GET);
+    send.send_response(json_response(StatusCode::OK, config_map_list(&anchors)));
+    for (index, anchor) in anchors.iter().enumerate() {
+        let (get, send) = handle.next_request().await.unwrap();
+        assert_eq!(get.method(), Method::GET);
+        send.send_response(json_response(
+            StatusCode::OK,
+            config_map(anchor, "rv-fresh"),
+        ));
+        let (replace, send) = handle.next_request().await.unwrap();
+        assert_eq!(replace.method(), Method::PUT);
+        if index == 0 {
+            send.send_response(json_response(
+                StatusCode::CONFLICT,
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "Status",
+                    "status": "Failure",
+                    "reason": "Conflict",
+                    "code": 409
+                }),
+            ));
+        } else {
+            let mut body = request_body(replace).await;
+            body["metadata"]["resourceVersion"] = json!("rv-suspending");
+            send.send_response(json_response(StatusCode::OK, body));
+        }
+    }
+
+    let report = task.await.unwrap().unwrap();
+    let failed = report
+        .results()
+        .iter()
+        .find(|result| result.session_id() == failed_session)
+        .unwrap();
+    assert!(matches!(
+        failed.error(),
+        Some(LifecycleError::Store(AnchorStoreError::Conflict {
+            operation: StoreOperation::Replace,
+            ..
+        }))
+    ));
+    let accepted = report
+        .results()
+        .iter()
+        .find(|result| result.session_id() == accepted_session)
+        .unwrap();
+    assert!(matches!(
+        accepted.outcome(),
+        Some(LifecycleDeadlineOutcome::ComputeSuspensionAccepted)
+    ));
+    assert_eq!(fake.calls(), (0, 0, 0, 0));
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn deadline_inventory_failure_aborts_before_any_session_operation() {
+    let (store, handle) = store_and_handle();
+    let fake = Arc::new(FakeProvisioner::default());
+    let root = coordinators(store, [profile("2026-08-01")], fake.clone()).unwrap();
+    let task = tokio::spawn(async move { root.scan_lifecycle_deadlines().await });
+    let mut handle = std::pin::pin!(handle);
+
+    let (list, send) = handle.next_request().await.unwrap();
+    assert_eq!(list.method(), Method::GET);
+    send.send_response(json_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        json!({
+            "apiVersion": "v1",
+            "kind": "Status",
+            "status": "Failure",
+            "reason": "InternalError",
+            "code": 500
+        }),
+    ));
+
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(AnchorStoreError::Kubernetes {
+            operation: StoreOperation::List,
+            ..
+        })
+    ));
+    assert_eq!(fake.calls(), (0, 0, 0, 0));
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn deadline_scan_rechecks_after_live_activity_releases_the_shared_lock() {
+    let now = Utc::now();
+    let anchor = anchor_with_deadlines(
+        session_id("discord:deadline-activity-race"),
+        SessionPhase::Ready,
+        now - Duration::hours(2),
+        now - Duration::hours(1),
+        now + Duration::hours(70),
+    );
+    let binding = SessionBinding::new(
+        anchor.scope_id(),
+        anchor.session_id(),
+        anchor.fence().clone(),
+        anchor.incarnation_id(),
+    )
+    .unwrap();
+    let turn_id = ActivityTurnId::from_uuid(Uuid::from_u128(0x500)).unwrap();
+    let (store, handle) = store_and_handle();
+    let fake = Arc::new(FakeProvisioner::default());
+    let root = Arc::new(coordinators(store, [profile("2026-08-01")], fake.clone()).unwrap());
+
+    let activity_root = Arc::clone(&root);
+    let activity = tokio::spawn(async move {
+        activity_root
+            .activity()
+            .record(&binding, turn_id, ActivityEvent::PromptStarted)
+            .await
+    });
+    let mut handle = std::pin::pin!(handle);
+    let (get, send) = handle.next_request().await.unwrap();
+    assert_eq!(get.method(), Method::GET);
+    send.send_response(json_response(
+        StatusCode::OK,
+        config_map(&anchor, "rv-ready"),
+    ));
+    let (replace, activity_send) = handle.next_request().await.unwrap();
+    assert_eq!(replace.method(), Method::PUT);
+    let mut activity_body = request_body(replace).await;
+    let busy: SessionAnchorV1 =
+        serde_json::from_str(activity_body["data"]["anchor.json"].as_str().unwrap()).unwrap();
+    assert_eq!(busy.phase(), SessionPhase::Busy);
+
+    let scan_root = Arc::clone(&root);
+    let scan = tokio::spawn(async move { scan_root.scan_lifecycle_deadlines().await });
+    let (list, send) = handle.next_request().await.unwrap();
+    assert_eq!(list.method(), Method::GET);
+    send.send_response(json_response(
+        StatusCode::OK,
+        config_map_list(std::slice::from_ref(&anchor)),
+    ));
+    assert_no_request(&mut handle).await;
+
+    activity_body["metadata"]["resourceVersion"] = json!("rv-activity");
+    activity_send.send_response(json_response(StatusCode::OK, activity_body));
+    assert_eq!(activity.await.unwrap().unwrap(), ActivityOutcome::Recorded);
+
+    let (get, send) = handle.next_request().await.unwrap();
+    assert_eq!(get.method(), Method::GET);
+    send.send_response(json_response(
+        StatusCode::OK,
+        config_map(&busy, "rv-activity"),
+    ));
+
+    let report = scan.await.unwrap().unwrap();
+    assert!(matches!(
+        report.results()[0].outcome(),
+        Some(LifecycleDeadlineOutcome::StaleObservation)
+    ));
     assert_eq!(fake.calls(), (0, 0, 0, 0));
     assert_no_request(&mut handle).await;
 }

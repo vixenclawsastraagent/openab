@@ -22,7 +22,8 @@ pub use cleanup::{
 };
 pub use composition::{
     ControllerCoordinatorConfigError, ControllerCoordinators, DurableIntentError,
-    DurableIntentOutcome, DurableIntentReport, DurableIntentResult,
+    DurableIntentOutcome, DurableIntentReport, DurableIntentResult, LifecycleDeadlineOutcome,
+    LifecycleDeadlineReport, LifecycleDeadlineResult,
 };
 pub use generation::{
     AllChildrenAbsentProof, ComputeAbsentProof, KubernetesGenerationProvisioner,

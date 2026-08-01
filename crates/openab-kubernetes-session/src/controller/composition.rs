@@ -8,8 +8,9 @@ use super::{
 use crate::identity::SessionId;
 use crate::profile_config::ControllerPolicy;
 use crate::resources::MvpWorkerProfile;
-use crate::state::{ProfileRef, SessionPhase};
+use crate::state::{ProfileRef, SessionAnchorV1, SessionPhase};
 use crate::store::{AnchorStoreError, ConfigMapAnchorStore};
+use chrono::{DateTime, Utc};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use thiserror::Error;
@@ -115,6 +116,65 @@ impl DurableIntentReport {
     pub fn results(&self) -> &[DurableIntentResult] {
         &self.results
     }
+}
+
+/// Stable outcome from one lifecycle-deadline scan candidate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LifecycleDeadlineOutcome {
+    /// The scheduled anchor does not require deadline maintenance.
+    Noop,
+    /// A fresh expired `Ready` anchor is durably `Suspending`.
+    ComputeSuspensionAccepted,
+    /// A validated inventory snapshot observed an expired storage deadline.
+    /// This stale-tolerant telemetry never authorizes deletion or release.
+    StorageDeadlineExpiredObservation,
+    /// A fresh compute observation no longer matched the scheduling hint.
+    StaleObservation,
+}
+
+/// One deterministic per-session entry in a lifecycle-deadline report.
+#[derive(Debug)]
+pub struct LifecycleDeadlineResult {
+    session_id: SessionId,
+    scheduled_phase: SessionPhase,
+    result: Result<LifecycleDeadlineOutcome, LifecycleError>,
+}
+
+impl LifecycleDeadlineResult {
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub fn scheduled_phase(&self) -> SessionPhase {
+        self.scheduled_phase
+    }
+
+    pub fn outcome(&self) -> Option<&LifecycleDeadlineOutcome> {
+        self.result.as_ref().ok()
+    }
+
+    pub fn error(&self) -> Option<&LifecycleError> {
+        self.result.as_ref().err()
+    }
+}
+
+/// Complete result of one sequential, bounded lifecycle-deadline scan.
+#[derive(Debug, Default)]
+pub struct LifecycleDeadlineReport {
+    results: Vec<LifecycleDeadlineResult>,
+}
+
+impl LifecycleDeadlineReport {
+    pub fn results(&self) -> &[LifecycleDeadlineResult] {
+        &self.results
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScheduledDeadlineAction {
+    Noop,
+    SuspendCompute,
+    ReportStorageDeadlineExpiry,
 }
 
 /// Composition root for every controller operation in one deployment scope.
@@ -237,6 +297,50 @@ impl ControllerCoordinators {
         Ok(DurableIntentReport { results })
     }
 
+    /// Scan absolute lifecycle deadlines using one controller-owned cutoff.
+    ///
+    /// Inventory is only a scheduling hint for compute mutation. Every
+    /// expired `Ready` candidate takes the shared session lock, performs a
+    /// fresh GET, rechecks its deadline, and persists one CAS transition to
+    /// `Suspending`. Expired storage is reported only for an already
+    /// `Suspended` snapshot as stale-tolerant telemetry. The observation is
+    /// not deletion or release authority, and this method never invokes
+    /// release or a Kubernetes provisioner.
+    pub async fn scan_lifecycle_deadlines(
+        &self,
+    ) -> Result<LifecycleDeadlineReport, AnchorStoreError> {
+        let cutoff = Utc::now();
+        let inventory = self.store.list_inventory().await?;
+        let mut results = Vec::with_capacity(inventory.len());
+        for scheduled in inventory {
+            let session_id = scheduled.state().session_id();
+            let scheduled_phase = scheduled.state().phase();
+            let result = match scheduled_deadline_action(scheduled.state(), cutoff) {
+                ScheduledDeadlineAction::Noop => Ok(LifecycleDeadlineOutcome::Noop),
+                ScheduledDeadlineAction::ReportStorageDeadlineExpiry => {
+                    Ok(LifecycleDeadlineOutcome::StorageDeadlineExpiredObservation)
+                }
+                ScheduledDeadlineAction::SuspendCompute => self
+                    .lifecycle
+                    .accept_expired_ready(session_id, cutoff)
+                    .await
+                    .map(|accepted| {
+                        if accepted {
+                            LifecycleDeadlineOutcome::ComputeSuspensionAccepted
+                        } else {
+                            LifecycleDeadlineOutcome::StaleObservation
+                        }
+                    }),
+            };
+            results.push(LifecycleDeadlineResult {
+                session_id,
+                scheduled_phase,
+                result,
+            });
+        }
+        Ok(LifecycleDeadlineReport { results })
+    }
+
     async fn reconcile_candidate(
         &self,
         session_id: SessionId,
@@ -340,5 +444,119 @@ impl ControllerCoordinators {
                 }
             })
             .map_err(DurableIntentError::Activation)
+    }
+}
+
+fn scheduled_deadline_action(
+    anchor: &SessionAnchorV1,
+    cutoff: DateTime<Utc>,
+) -> ScheduledDeadlineAction {
+    match anchor.phase() {
+        SessionPhase::Ready if anchor.compute_deadline_at() <= cutoff => {
+            ScheduledDeadlineAction::SuspendCompute
+        }
+        SessionPhase::Suspended if anchor.storage_deadline_at() <= cutoff => {
+            ScheduledDeadlineAction::ReportStorageDeadlineExpiry
+        }
+        SessionPhase::Provisioning
+        | SessionPhase::Ready
+        | SessionPhase::Busy
+        | SessionPhase::Suspending
+        | SessionPhase::Suspended
+        | SessionPhase::Deleting
+        | SessionPhase::Blocked => ScheduledDeadlineAction::Noop,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::{ScopeId, SessionId};
+    use chrono::{Duration, TimeZone};
+    use uuid::Uuid;
+
+    fn anchor(
+        phase: SessionPhase,
+        last_activity_at: DateTime<Utc>,
+        compute_deadline_at: DateTime<Utc>,
+        storage_deadline_at: DateTime<Utc>,
+    ) -> SessionAnchorV1 {
+        let mut anchor = SessionAnchorV1::new(
+            SessionId::derive("scope", "discord:deadline-boundary"),
+            ScopeId::derive("scope"),
+            ProfileRef::new("codex-strict", "2026-08-01").unwrap(),
+            Uuid::from_u128(0x100),
+            Uuid::from_u128(0x200),
+            last_activity_at,
+            compute_deadline_at,
+            storage_deadline_at,
+        )
+        .unwrap();
+        let fence = anchor.fence().clone();
+        anchor.observe_pod(&fence, "pod-uid").unwrap();
+        anchor.transition(&fence, SessionPhase::Ready).unwrap();
+        match phase {
+            SessionPhase::Ready => {}
+            SessionPhase::Busy => anchor.transition(&fence, SessionPhase::Busy).unwrap(),
+            SessionPhase::Suspended => {
+                anchor.transition(&fence, SessionPhase::Suspending).unwrap();
+                anchor.confirm_pod_deleted(&fence, "pod-uid").unwrap();
+                anchor.transition(&fence, SessionPhase::Suspended).unwrap();
+            }
+            other => panic!("unsupported test phase: {other:?}"),
+        }
+        anchor
+    }
+
+    #[test]
+    fn deadline_classifier_includes_the_boundary_and_never_treats_busy_as_idle() {
+        let cutoff = Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).unwrap();
+        let last_activity_at = cutoff - Duration::hours(2);
+
+        for compute_deadline_at in [cutoff - Duration::nanoseconds(1), cutoff] {
+            let ready = anchor(
+                SessionPhase::Ready,
+                last_activity_at,
+                compute_deadline_at,
+                cutoff + Duration::hours(72),
+            );
+            assert_eq!(
+                scheduled_deadline_action(&ready, cutoff),
+                ScheduledDeadlineAction::SuspendCompute
+            );
+        }
+
+        let future = anchor(
+            SessionPhase::Ready,
+            last_activity_at,
+            cutoff + Duration::nanoseconds(1),
+            cutoff + Duration::hours(72),
+        );
+        assert_eq!(
+            scheduled_deadline_action(&future, cutoff),
+            ScheduledDeadlineAction::Noop
+        );
+
+        let busy = anchor(
+            SessionPhase::Busy,
+            last_activity_at,
+            cutoff - Duration::nanoseconds(1),
+            cutoff + Duration::hours(72),
+        );
+        assert_eq!(
+            scheduled_deadline_action(&busy, cutoff),
+            ScheduledDeadlineAction::Noop
+        );
+
+        let suspended = anchor(
+            SessionPhase::Suspended,
+            last_activity_at,
+            cutoff - Duration::hours(1),
+            cutoff,
+        );
+        assert_eq!(
+            scheduled_deadline_action(&suspended, cutoff),
+            ScheduledDeadlineAction::ReportStorageDeadlineExpiry
+        );
     }
 }

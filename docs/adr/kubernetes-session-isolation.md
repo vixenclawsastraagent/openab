@@ -77,8 +77,8 @@ The first version is intentionally bounded:
 
 - automatically persist non-destructive compute suspension only for a
   `Ready` session whose compute-idle deadline has expired;
-- report a `Suspended` session whose storage deadline has expired as eligible
-  for release, without mutating or deleting its resources; and
+- report that a `Suspended` session's storage deadline has expired as an
+  advisory observation, without mutating or deleting its resources; and
 - begin destructive release only after an explicit, fenced request.
 
 ### 3.2 Deferred lifecycle behavior
@@ -281,15 +281,16 @@ writer from recreating perfectly matching resources between proofs.
 
  Suspended -- explicit reset ---------------------> Deleting --> Absent
       |
-      +-- retention expiry --> report release eligibility (no mutation)
+      +-- retention expiry --> report deadline-expired observation (no mutation)
 ```
 
 Compute idle expiry suspends the worker Pod but retains resumable private
 storage. In the MVP, storage retention expiry is advisory: reconciliation
-reports release eligibility but does not mutate the anchor, PVC, or generation
-resources. Only an explicit reset starts fenced, controller-managed destructive
-cleanup. Broker shutdown follows the non-destructive path. Bridge or broker
-failure leaves the session reconcilable; it never implies destructive release.
+reports a stale-tolerant deadline observation but does not mutate the anchor,
+PVC, or generation resources. The observation is not release authorization.
+Only an explicit reset starts fenced, controller-managed destructive cleanup.
+Broker shutdown follows the non-destructive path. Bridge or broker failure
+leaves the session reconcilable; it never implies destructive release.
 
 `Released` proves that the Kubernetes PVC API object is absent; it does not by
 itself prove that a backing PersistentVolume or cloud disk has been physically
