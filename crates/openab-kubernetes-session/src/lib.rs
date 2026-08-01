@@ -4,6 +4,9 @@ pub mod state;
 pub mod wire;
 
 #[cfg(feature = "controller")]
+pub mod controller;
+
+#[cfg(feature = "controller")]
 pub mod resources;
 
 #[cfg(feature = "controller")]
