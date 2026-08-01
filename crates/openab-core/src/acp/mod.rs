@@ -12,7 +12,7 @@ pub use protocol::{classify_notification, parse_turn_result, AcpEvent, TurnResul
 /// Broker-owned context passed only to ACP bridge processes that explicitly
 /// opt into OpenAB's versioned session runtime contract.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum SessionContextMode {
+pub(crate) enum SessionContextMode {
     #[default]
     None,
     OpenabV1,

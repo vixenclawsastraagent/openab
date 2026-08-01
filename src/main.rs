@@ -502,22 +502,33 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let session_context = if cfg.kubernetes_session.is_some() {
-        acp::SessionContextMode::OpenabV1
-    } else {
-        acp::SessionContextMode::None
+    let kubernetes_scope = cfg
+        .kubernetes_session
+        .as_ref()
+        .map(|runtime| runtime.scope.clone());
+    let agent_config = cfg.agent;
+    let max_sessions = cfg.pool.max_sessions;
+    let hung_threshold_secs = cfg
+        .pool
+        .prompt_hard_timeout_secs
+        .saturating_add(cfg.pool.hung_grace_secs);
+    let default_config_options = cfg.pool.default_config_options;
+    let pool = match kubernetes_scope {
+        Some(scope) => acp::SessionPool::try_new_with_kubernetes_session_isolation(
+            agent_config,
+            max_sessions,
+            hung_threshold_secs,
+            default_config_options,
+            &scope,
+        )?,
+        None => acp::SessionPool::new(
+            agent_config,
+            max_sessions,
+            hung_threshold_secs,
+            default_config_options,
+        ),
     };
-    let pool = Arc::new(
-        acp::SessionPool::new(
-            cfg.agent,
-            cfg.pool.max_sessions,
-            cfg.pool
-                .prompt_hard_timeout_secs
-                .saturating_add(cfg.pool.hung_grace_secs),
-            cfg.pool.default_config_options,
-        )
-        .try_with_session_context(session_context)?,
-    );
+    let pool = Arc::new(pool);
     let ttl_secs = cfg.pool.session_ttl_hours * 3600;
 
     // Resolve STT config (auto-detect GROQ_API_KEY from env)

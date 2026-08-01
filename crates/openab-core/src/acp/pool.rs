@@ -5,7 +5,10 @@ use crate::acp::protocol::ConfigOption;
 use crate::acp::SessionContextMode;
 use crate::config::AgentConfig;
 use anyhow::{anyhow, Result};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -16,6 +19,137 @@ use tracing::{info, warn};
 /// transient failure worth preserving the session ID for retry, as opposed to
 /// a permanent agent-side rejection.
 const TRANSIENT_LOAD_ERRORS: &[&str] = &["timeout waiting for", "channel closed"];
+const KUBERNETES_RUNTIME_STATE_VERSION: &str = "kubernetes-v1";
+const MAX_KUBERNETES_SCOPE_BYTES: usize = 253;
+
+fn kubernetes_scope_partition(scope: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"openab-scope-v1");
+    hasher.update([0]);
+    hasher.update(scope.as_bytes());
+    let digest = hasher.finalize();
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
+}
+
+fn validate_kubernetes_scope(scope: &str) -> Result<()> {
+    if scope.trim().is_empty() || scope != scope.trim() || scope.len() > MAX_KUBERNETES_SCOPE_BYTES
+    {
+        return Err(anyhow!(
+            "Kubernetes session scope must be non-empty, trimmed, and at most {MAX_KUBERNETES_SCOPE_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
+
+fn kubernetes_openab_dir_from_home(home: Option<OsString>) -> Result<PathBuf> {
+    let home = home
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("HOME must be set for Kubernetes session isolation"))?;
+    if !home.is_absolute() || home.parent().is_none() {
+        return Err(anyhow!(
+            "HOME must be an absolute, non-root directory for Kubernetes session isolation"
+        ));
+    }
+    let metadata = std::fs::metadata(&home)
+        .map_err(|error| anyhow!("failed to inspect HOME {}: {error}", home.display()))?;
+    if !metadata.is_dir() {
+        return Err(anyhow!(
+            "HOME {} is not a directory for Kubernetes session isolation",
+            home.display()
+        ));
+    }
+    let home = std::fs::canonicalize(&home)
+        .map_err(|error| anyhow!("failed to resolve HOME {}: {error}", home.display()))?;
+    if !home.is_absolute() || home.parent().is_none() {
+        return Err(anyhow!(
+            "resolved HOME must be an absolute, non-root directory for Kubernetes session isolation"
+        ));
+    }
+    Ok(home.join(".openab"))
+}
+
+fn reject_unsafe_mapping_entry(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(anyhow!(
+            "Kubernetes session mapping {} must not be a symbolic link",
+            path.display()
+        )),
+        Ok(metadata) if !metadata.is_file() => Err(anyhow!(
+            "Kubernetes session mapping {} is not a regular file",
+            path.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(anyhow!(
+            "failed to inspect Kubernetes session mapping {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn reject_symlinked_runtime_path(root: &Path, target: &Path) -> Result<()> {
+    let relative = target.strip_prefix(root).map_err(|_| {
+        anyhow!(
+            "Kubernetes session state path {} escapes {}",
+            target.display(),
+            root.display()
+        )
+    })?;
+    let mut current = root.to_path_buf();
+    for component in std::iter::once(root.as_os_str()).chain(relative.iter()) {
+        if component != root.as_os_str() {
+            current.push(component);
+        }
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(anyhow!(
+                    "Kubernetes session state path {} must not contain symbolic links",
+                    current.display()
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(anyhow!(
+                    "Kubernetes session state path {} is not a directory",
+                    current.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(anyhow!(
+                    "failed to inspect Kubernetes session state path {}: {error}",
+                    current.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn create_private_runtime_directory(root: &Path, path: &Path) -> Result<()> {
+    reject_symlinked_runtime_path(root, path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700).create(path)?;
+        reject_symlinked_runtime_path(root, path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)?;
+        reject_symlinked_runtime_path(root, path)?;
+    }
+
+    Ok(())
+}
 
 /// Combined state protected by a single lock to prevent deadlocks.
 /// Lock ordering: never await a per-connection mutex while holding `state`.
@@ -215,6 +349,61 @@ impl SessionPool {
         )
     }
 
+    /// Construct the explicitly enabled Kubernetes session runtime without
+    /// reading or writing the local-process runtime's mapping or workspace
+    /// metadata. Each configured scope owns a domain-separated state path.
+    pub fn try_new_with_kubernetes_session_isolation(
+        config: AgentConfig,
+        max_sessions: usize,
+        hung_threshold_secs: u64,
+        default_config_options: HashMap<String, String>,
+        scope: &str,
+    ) -> Result<Self> {
+        let openab_dir = kubernetes_openab_dir_from_home(std::env::var_os("HOME"))?;
+        Self::try_new_kubernetes_with_root(
+            config,
+            max_sessions,
+            hung_threshold_secs,
+            default_config_options,
+            &openab_dir,
+            scope,
+        )
+    }
+
+    fn try_new_kubernetes_with_root(
+        config: AgentConfig,
+        max_sessions: usize,
+        hung_threshold_secs: u64,
+        default_config_options: HashMap<String, String>,
+        openab_dir: &Path,
+        scope: &str,
+    ) -> Result<Self> {
+        validate_kubernetes_scope(scope)?;
+        let runtime_directory = openab_dir
+            .join("session-runtimes")
+            .join(KUBERNETES_RUNTIME_STATE_VERSION)
+            .join(kubernetes_scope_partition(scope));
+        create_private_runtime_directory(openab_dir, &runtime_directory).map_err(|error| {
+            anyhow!(
+                "failed to create Kubernetes session state directory {}: {error}",
+                runtime_directory.display()
+            )
+        })?;
+        let mapping_path = runtime_directory.join("thread_map.json");
+        reject_unsafe_mapping_entry(&mapping_path)?;
+
+        Self::new_with_runtime_paths(
+            config,
+            max_sessions,
+            hung_threshold_secs,
+            default_config_options,
+            mapping_path,
+            runtime_directory.join("session_meta.json"),
+            false,
+        )
+        .try_with_session_context(SessionContextMode::OpenabV1)
+    }
+
     fn new_with_paths(
         config: AgentConfig,
         max_sessions: usize,
@@ -223,8 +412,32 @@ impl SessionPool {
         mapping_path: PathBuf,
         meta_path: PathBuf,
     ) -> Self {
+        Self::new_with_runtime_paths(
+            config,
+            max_sessions,
+            hung_threshold_secs,
+            default_config_options,
+            mapping_path,
+            meta_path,
+            true,
+        )
+    }
+
+    fn new_with_runtime_paths(
+        config: AgentConfig,
+        max_sessions: usize,
+        hung_threshold_secs: u64,
+        default_config_options: HashMap<String, String>,
+        mapping_path: PathBuf,
+        meta_path: PathBuf,
+        load_session_workdirs: bool,
+    ) -> Self {
         let (suspended, mapping_load_error) = Self::load_mapping(&mapping_path);
-        let (session_workdirs, _) = Self::load_mapping(&meta_path);
+        let session_workdirs = if load_session_workdirs {
+            Self::load_mapping(&meta_path).0
+        } else {
+            HashMap::new()
+        };
         Self {
             state: RwLock::new(PoolState {
                 active: HashMap::new(),
@@ -252,7 +465,7 @@ impl SessionPool {
     /// Enable broker-owned context for an explicitly configured session
     /// runtime bridge. The default constructor remains behavior-compatible
     /// with local ACP and AgentCore agents.
-    pub fn try_with_session_context(mut self, mode: SessionContextMode) -> Result<Self> {
+    fn try_with_session_context(mut self, mode: SessionContextMode) -> Result<Self> {
         if mode == SessionContextMode::OpenabV1 {
             if let Some(error) = self.mapping_load_error.as_deref() {
                 return Err(anyhow!(
@@ -588,9 +801,34 @@ impl SessionPool {
         // initializing this one.
         if let Some(existing) = state.active.get(thread_id).cloned() {
             let Ok(existing) = existing.try_lock() else {
+                if let Some(lifecycle) = lifecycle_handle.as_ref() {
+                    drop(state);
+                    return Err(isolated::rollback_uncommitted_session(
+                        lifecycle,
+                        anyhow!(
+                            "isolated session became active while a replacement was provisioning"
+                        ),
+                        strict_reservation,
+                        uncommitted_provenance,
+                    )
+                    .await);
+                }
                 return Ok(false);
             };
             if existing.alive() {
+                if let Some(lifecycle) = lifecycle_handle.as_ref() {
+                    drop(existing);
+                    drop(state);
+                    return Err(isolated::rollback_uncommitted_session(
+                        lifecycle,
+                        anyhow!(
+                            "isolated session became active while a replacement was provisioning"
+                        ),
+                        strict_reservation,
+                        uncommitted_provenance,
+                    )
+                    .await);
+                }
                 return Ok(false);
             }
             warn!(thread_id, "stale connection, rebuilding");
@@ -644,28 +882,36 @@ impl SessionPool {
             return Err(error);
         }
 
-        let mut persisted = state.persisted.clone();
-        if cancel_session_id.is_empty() {
-            persisted.remove(thread_id);
-        } else {
-            persisted.insert(thread_id.to_string(), cancel_session_id.clone());
-        }
-        if self.session_context == SessionContextMode::OpenabV1 && persisted != state.persisted {
-            if let Err(error) = isolated::write_mapping_file(&self.mapping_path, &persisted) {
-                drop(state);
-                let lifecycle = lifecycle_handle
-                    .as_ref()
-                    .expect("strict sessions always have a lifecycle handle");
-                return Err(isolated::rollback_uncommitted_session(
-                    lifecycle,
-                    error,
-                    strict_reservation,
-                    uncommitted_provenance,
-                )
-                .await);
+        if self.session_context == SessionContextMode::OpenabV1 {
+            let mut persisted = state.persisted.clone();
+            if cancel_session_id.is_empty() {
+                persisted.remove(thread_id);
+            } else {
+                persisted.insert(thread_id.to_string(), cancel_session_id.clone());
             }
+            if persisted != state.persisted {
+                if let Err(error) = isolated::write_mapping_file(&self.mapping_path, &persisted) {
+                    drop(state);
+                    let lifecycle = lifecycle_handle
+                        .as_ref()
+                        .expect("strict sessions always have a lifecycle handle");
+                    return Err(isolated::rollback_uncommitted_session(
+                        lifecycle,
+                        error,
+                        strict_reservation,
+                        uncommitted_provenance,
+                    )
+                    .await);
+                }
+            }
+            state.persisted = persisted;
+        } else if cancel_session_id.is_empty() {
+            state.persisted.remove(thread_id);
+        } else {
+            state
+                .persisted
+                .insert(thread_id.to_string(), cancel_session_id.clone());
         }
-        state.persisted = persisted;
         state.suspended.remove(thread_id);
         state.active.insert(thread_id.to_string(), new_conn);
         if let Some(lifecycle_handle) = lifecycle_handle {
@@ -1085,6 +1331,7 @@ mod tests {
     use crate::acp::SessionContextMode;
     use crate::config::AgentConfig;
     use std::collections::HashMap;
+    use std::path::Path;
     use std::sync::Arc;
     use tokio::sync::Mutex;
     use tokio::time::Instant;
@@ -1120,6 +1367,278 @@ done
             temp.join("thread_map.json"),
             temp.join("session_meta.json"),
         )
+    }
+
+    fn kubernetes_test_pool(root: &Path, scope: &str) -> anyhow::Result<SessionPool> {
+        SessionPool::try_new_kubernetes_with_root(
+            AgentConfig::default(),
+            2,
+            60,
+            HashMap::new(),
+            root,
+            scope,
+        )
+    }
+
+    #[test]
+    fn kubernetes_scope_partition_matches_the_controller_identity_vector() {
+        assert_eq!(
+            super::kubernetes_scope_partition("team-a"),
+            "c7d126d05da76b40b912226a894e8acdc3c4f80d9b0f14f8f24a782ab0e61d67"
+        );
+    }
+
+    #[test]
+    fn kubernetes_state_root_requires_a_real_absolute_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let regular_file = temp.path().join("not-a-home");
+        std::fs::write(&regular_file, "file").unwrap();
+
+        for home in [
+            None,
+            Some(std::ffi::OsString::new()),
+            Some(std::ffi::OsString::from("relative/home")),
+            Some(std::ffi::OsString::from("/")),
+            Some(regular_file.into_os_string()),
+            Some(temp.path().join("missing").into_os_string()),
+        ] {
+            assert!(super::kubernetes_openab_dir_from_home(home).is_err());
+        }
+
+        assert_eq!(
+            super::kubernetes_openab_dir_from_home(Some(temp.path().as_os_str().to_owned()))
+                .unwrap(),
+            temp.path().canonicalize().unwrap().join(".openab")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kubernetes_state_root_rejects_a_home_symlink_resolving_to_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let linked_home = temp.path().join("linked-home");
+        symlink("/", &linked_home).unwrap();
+
+        assert!(
+            super::kubernetes_openab_dir_from_home(Some(linked_home.into_os_string())).is_err()
+        );
+    }
+
+    #[test]
+    fn kubernetes_mapping_never_reads_the_local_runtime_mapping() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_mapping = temp.path().join("thread_map.json");
+        std::fs::write(&local_mapping, r#"{"discord:local":"local-session"}"#).unwrap();
+
+        let pool = kubernetes_test_pool(temp.path(), "team-a").unwrap();
+        let state = pool.state.try_read().unwrap();
+
+        assert!(state.persisted.is_empty());
+        assert!(state.suspended.is_empty());
+        assert_eq!(
+            pool.mapping_path,
+            temp.path()
+                .join("session-runtimes/kubernetes-v1")
+                .join(super::kubernetes_scope_partition("team-a"))
+                .join("thread_map.json")
+        );
+        assert!(!pool.mapping_path.to_string_lossy().contains("team-a"));
+        assert_eq!(
+            std::fs::read_to_string(local_mapping).unwrap(),
+            r#"{"discord:local":"local-session"}"#
+        );
+    }
+
+    #[test]
+    fn local_mapping_never_reads_a_kubernetes_scope_partition() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope_directory = temp
+            .path()
+            .join("session-runtimes/kubernetes-v1")
+            .join(super::kubernetes_scope_partition("team-a"));
+        std::fs::create_dir_all(&scope_directory).unwrap();
+        std::fs::write(
+            scope_directory.join("thread_map.json"),
+            r#"{"discord:strict":"strict-session"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("thread_map.json"),
+            r#"{"discord:local":"local-session"}"#,
+        )
+        .unwrap();
+
+        let pool = SessionPool::new_with_paths(
+            AgentConfig::default(),
+            2,
+            60,
+            HashMap::new(),
+            temp.path().join("thread_map.json"),
+            temp.path().join("session_meta.json"),
+        );
+        let state = pool.state.try_read().unwrap();
+
+        assert_eq!(
+            state.persisted.get("discord:local").map(String::as_str),
+            Some("local-session")
+        );
+        assert!(!state.persisted.contains_key("discord:strict"));
+    }
+
+    #[test]
+    fn kubernetes_mapping_rejects_invalid_scopes_before_touching_disk() {
+        let temp = tempfile::tempdir().unwrap();
+        for scope in ["", " team-a", "team-a ", &"x".repeat(254)] {
+            assert!(kubernetes_test_pool(temp.path(), scope).is_err());
+        }
+        assert!(!temp.path().join("session-runtimes").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kubernetes_scope_directory_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let pool = kubernetes_test_pool(temp.path(), "team-a").unwrap();
+        let mode = pool
+            .mapping_path
+            .parent()
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+
+        assert_eq!(mode, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kubernetes_state_path_rejects_preexisting_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let foreign = tempfile::tempdir().unwrap();
+        symlink(foreign.path(), temp.path().join("session-runtimes")).unwrap();
+
+        let error = kubernetes_test_pool(temp.path(), "team-a")
+            .err()
+            .expect("symlinked state parent must be rejected");
+
+        assert!(error.to_string().contains("symbolic links"));
+        assert!(foreign.path().read_dir().unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kubernetes_mapping_rejects_a_preexisting_file_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let foreign = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(foreign.path(), r#"{"discord:foreign":"session"}"#).unwrap();
+        let scope_directory = temp
+            .path()
+            .join("session-runtimes/kubernetes-v1")
+            .join(super::kubernetes_scope_partition("team-a"));
+        std::fs::create_dir_all(&scope_directory).unwrap();
+        symlink(foreign.path(), scope_directory.join("thread_map.json")).unwrap();
+
+        let error = kubernetes_test_pool(temp.path(), "team-a")
+            .err()
+            .expect("symlinked mapping must be rejected");
+
+        assert!(error.to_string().contains("must not be a symbolic link"));
+        assert_eq!(
+            std::fs::read_to_string(foreign.path()).unwrap(),
+            r#"{"discord:foreign":"session"}"#
+        );
+    }
+
+    #[test]
+    fn kubernetes_mapping_is_partitioned_between_scopes() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope_a_directory = temp
+            .path()
+            .join("session-runtimes/kubernetes-v1")
+            .join(super::kubernetes_scope_partition("team-a"));
+        std::fs::create_dir_all(&scope_a_directory).unwrap();
+        std::fs::write(
+            scope_a_directory.join("thread_map.json"),
+            r#"{"discord:thread":"scope-a-session"}"#,
+        )
+        .unwrap();
+
+        let scope_a = kubernetes_test_pool(temp.path(), "team-a").unwrap();
+        let scope_b = kubernetes_test_pool(temp.path(), "team-b").unwrap();
+
+        assert_eq!(
+            scope_a
+                .state
+                .try_read()
+                .unwrap()
+                .persisted
+                .get("discord:thread")
+                .map(String::as_str),
+            Some("scope-a-session")
+        );
+        assert!(scope_b.state.try_read().unwrap().persisted.is_empty());
+        assert_ne!(scope_a.mapping_path, scope_b.mapping_path);
+    }
+
+    #[test]
+    fn corrupt_local_mapping_cannot_block_kubernetes_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("thread_map.json"), "{not-json").unwrap();
+
+        let pool = kubernetes_test_pool(temp.path(), "team-a").unwrap();
+
+        assert!(pool.mapping_load_error.is_none());
+        assert!(pool.state.try_read().unwrap().persisted.is_empty());
+    }
+
+    #[test]
+    fn corrupt_kubernetes_mapping_blocks_only_its_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope_a_directory = temp
+            .path()
+            .join("session-runtimes/kubernetes-v1")
+            .join(super::kubernetes_scope_partition("team-a"));
+        std::fs::create_dir_all(&scope_a_directory).unwrap();
+        std::fs::write(scope_a_directory.join("thread_map.json"), "{not-json").unwrap();
+
+        let error = kubernetes_test_pool(temp.path(), "team-a")
+            .err()
+            .expect("scope A must reject its corrupt mapping");
+        let scope_b = kubernetes_test_pool(temp.path(), "team-b").unwrap();
+
+        assert!(error
+            .to_string()
+            .contains("cannot enable Kubernetes session isolation"));
+        assert!(scope_b.state.try_read().unwrap().persisted.is_empty());
+    }
+
+    #[test]
+    fn kubernetes_mode_does_not_load_session_workdir_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope_directory = temp
+            .path()
+            .join("session-runtimes/kubernetes-v1")
+            .join(super::kubernetes_scope_partition("team-a"));
+        std::fs::create_dir_all(&scope_directory).unwrap();
+        std::fs::write(
+            scope_directory.join("session_meta.json"),
+            r#"{"discord:thread":"/broker/worktree"}"#,
+        )
+        .unwrap();
+
+        let pool = kubernetes_test_pool(temp.path(), "team-a").unwrap();
+
+        assert!(pool.state.try_read().unwrap().session_workdirs.is_empty());
     }
 
     #[cfg(unix)]
