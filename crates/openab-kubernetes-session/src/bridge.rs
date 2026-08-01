@@ -1,6 +1,5 @@
 use crate::identity::{ScopeId, SessionId};
 use crate::state::{Fence, ProfileRef};
-use async_trait::async_trait;
 use serde_json::{json, Map, Value};
 use std::env;
 use thiserror::Error;
@@ -16,9 +15,7 @@ pub const SESSION_ATTEMPT_ID_ENV: &str = "OPENAB_SESSION_ATTEMPT_ID";
 /// transport-frame bound. A relay may split one message into many small frames.
 pub const MAX_LOGICAL_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
-const INVALID_STATE_CODE: i64 = -32001;
 const CONTROLLER_ERROR_CODE: i64 = -32000;
-const INVALID_BINDING_CODE: i64 = -32003;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum BridgeIdentityError {
@@ -32,8 +29,8 @@ pub enum BridgeIdentityError {
     InvalidAttemptId,
 }
 
-/// Opaque identity derived from the two broker-owned environment values and
-/// trusted bridge configuration. The raw chat-thread key is not retained.
+/// Opaque identity derived from broker-owned values and trusted bridge
+/// configuration. The raw chat-thread key is not retained.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeIdentity {
     scope_id: ScopeId,
@@ -99,53 +96,6 @@ impl BridgeIdentity {
     pub fn profile(&self) -> &ProfileRef {
         &self.profile
     }
-
-    fn activation_request(&self, intent: ActivationIntent) -> ActivateRequest {
-        ActivateRequest {
-            scope_id: self.scope_id,
-            session_id: self.session_id,
-            broker_attempt_id: self.broker_attempt_id,
-            profile: self.profile.clone(),
-            intent,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActivationIntent {
-    New,
-    Load,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActivateRequest {
-    scope_id: ScopeId,
-    session_id: SessionId,
-    broker_attempt_id: Uuid,
-    profile: ProfileRef,
-    intent: ActivationIntent,
-}
-
-impl ActivateRequest {
-    pub fn scope_id(&self) -> ScopeId {
-        self.scope_id
-    }
-
-    pub fn session_id(&self) -> SessionId {
-        self.session_id
-    }
-
-    pub fn broker_attempt_id(&self) -> Uuid {
-        self.broker_attempt_id
-    }
-
-    pub fn profile(&self) -> &ProfileRef {
-        &self.profile
-    }
-
-    pub fn intent(&self) -> ActivationIntent {
-        self.intent
-    }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -154,7 +104,11 @@ pub enum SessionBindingError {
     NilIncarnationId,
 }
 
-/// Controller-issued binding for one active worker generation.
+/// Controller-issued authority for exactly one worker generation.
+///
+/// The controller must select and mutate Kubernetes resources with this
+/// broker-derived binding. `worker_session_id` values are ACP data only and
+/// must never be used as an authorization or resource-selection key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionBinding {
     scope_id: ScopeId,
@@ -197,18 +151,26 @@ impl SessionBinding {
         self.incarnation_id
     }
 
-    fn validate_for(&self, request: &ActivateRequest) -> Result<(), BindingMismatch> {
-        if self.scope_id != request.scope_id {
-            return Err(BindingMismatch("scopeId"));
+    fn validate_for(&self, identity: &BridgeIdentity) -> Result<(), &'static str> {
+        if self.scope_id != identity.scope_id {
+            return Err("scopeId");
         }
-        if self.session_id != request.session_id {
-            return Err(BindingMismatch("sessionId"));
+        if self.session_id != identity.session_id {
+            return Err("sessionId");
         }
-        if self.fence.attempt_id() != request.broker_attempt_id {
-            return Err(BindingMismatch("attemptId"));
+        if self.fence.attempt_id() != identity.broker_attempt_id {
+            return Err("attemptId");
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum BridgeConfigError {
+    #[error("worker cwd must be a non-empty absolute Linux path without NUL bytes")]
+    InvalidWorkerCwd,
+    #[error("controller binding does not match broker identity field {0}")]
+    BindingMismatch(&'static str),
 }
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
@@ -225,34 +187,76 @@ impl ControllerError {
     }
 }
 
-/// Minimal controller boundary needed by the protocol kernel.
-///
-/// Implementations own transport timeouts, authentication, durable cleanup
-/// intent, and retries. An `Ok(())` release means the destructive intent is
-/// durable, not that Kubernetes storage has already disappeared.
-#[async_trait]
-pub trait SessionControllerClient: Send + Sync {
-    async fn activate(
-        &mut self,
-        request: ActivateRequest,
-    ) -> Result<SessionBinding, ControllerError>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleKind {
+    Suspend,
+    Release,
+}
 
-    async fn suspend(&mut self, binding: &SessionBinding) -> Result<(), ControllerError>;
+/// A lifecycle request that the relay transport must send to the trusted
+/// controller. The bridge does not acknowledge the ACP request until the
+/// transport returns this action to [`BridgeKernel::finish_lifecycle`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControllerLifecycleAction {
+    action_id: Uuid,
+    kind: LifecycleKind,
+    request_id: Value,
+    binding: SessionBinding,
+    worker_session_id: String,
+}
 
-    async fn cancel_turn(&mut self, binding: &SessionBinding) -> Result<(), ControllerError>;
+impl ControllerLifecycleAction {
+    fn new(
+        kind: LifecycleKind,
+        request_id: Value,
+        binding: SessionBinding,
+        worker_session_id: String,
+    ) -> Self {
+        Self {
+            action_id: Uuid::new_v4(),
+            kind,
+            request_id,
+            binding,
+            worker_session_id,
+        }
+    }
 
-    async fn release(&mut self, binding: &SessionBinding) -> Result<(), ControllerError>;
+    pub fn kind(&self) -> LifecycleKind {
+        self.kind
+    }
+
+    pub fn request_id(&self) -> &Value {
+        &self.request_id
+    }
+
+    pub fn binding(&self) -> &SessionBinding {
+        &self.binding
+    }
+
+    pub fn worker_session_id(&self) -> &str {
+        &self.worker_session_id
+    }
+}
+
+/// One transport decision for a complete ACP logical message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BridgeAction {
+    ForwardToWorker(Value),
+    ForwardToBroker(Value),
+    Controller(ControllerLifecycleAction),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BridgeState {
     Uninitialized,
+    Initializing,
     Initialized,
+    StartingSession,
     Active,
-    /// Terminal for this broker-owned attempt. Resume uses a new bridge
-    /// process and a fresh attempt through `Initialized -> session/load`.
+    LifecyclePending,
     Closed,
     Released,
+    Failed,
 }
 
 #[derive(Debug, Error)]
@@ -263,429 +267,533 @@ pub enum BridgeProtocolError {
     InvalidJson(#[source] serde_json::Error),
     #[error("invalid JSON-RPC envelope: {0}")]
     InvalidEnvelope(&'static str),
-    #[error("session/cancel must be a notification without an id")]
-    CancelMustBeNotification,
-    #[error("controller rejected session/cancel")]
-    CancelFailed(#[source] ControllerError),
+    #[error("ACP lifecycle is invalid in the current state: {0}")]
+    InvalidState(&'static str),
+    #[error("invalid ACP lifecycle params: {0}")]
+    InvalidParams(&'static str),
+    #[error("worker cannot satisfy the isolation relay contract: {0}")]
+    WorkerCapability(&'static str),
+    #[error("worker requested a broker-host capability that isolation mode does not expose: {0}")]
+    BrokerCapability(&'static str),
+    #[error("worker returned an invalid lifecycle response: {0}")]
+    WorkerResponse(&'static str),
+    #[error("controller lifecycle completion does not match the pending action")]
+    LifecycleMismatch,
+    #[error("worker attempted to spoof a controller-owned lifecycle response")]
+    LifecycleResponseSpoof,
 }
 
-#[derive(Debug, Clone, Copy, Error)]
-#[error("controller binding does not match activation field {0}")]
-struct BindingMismatch(&'static str);
-
-#[derive(Debug)]
-struct RpcMessage {
-    id: Option<Value>,
-    method: String,
-    params: Value,
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingWorkerRequest {
+    Initialize {
+        request_id: Value,
+    },
+    New {
+        request_id: Value,
+    },
+    Load {
+        request_id: Value,
+        session_id: String,
+    },
 }
 
-#[derive(Debug)]
-struct RpcFailure {
-    code: i64,
-    message: String,
-}
-
-impl RpcFailure {
-    fn invalid_params(message: impl Into<String>) -> Self {
-        Self {
-            code: -32602,
-            message: message.into(),
-        }
-    }
-
-    fn invalid_state(expected: &'static str) -> Self {
-        Self {
-            code: INVALID_STATE_CODE,
-            message: format!("session lifecycle is not ready; expected {expected}"),
-        }
-    }
-
-    fn method_not_found() -> Self {
-        Self {
-            code: -32601,
-            message: "method not implemented by the bridge kernel".to_string(),
-        }
-    }
-
-    fn controller(error: ControllerError) -> Self {
-        Self {
-            code: CONTROLLER_ERROR_CODE,
-            message: error.to_string(),
-        }
-    }
-
-    fn binding(error: BindingMismatch) -> Self {
-        Self {
-            code: INVALID_BINDING_CODE,
-            message: error.to_string(),
+impl PendingWorkerRequest {
+    fn request_id(&self) -> &Value {
+        match self {
+            Self::Initialize { request_id }
+            | Self::New { request_id }
+            | Self::Load { request_id, .. } => request_id,
         }
     }
 }
 
-pub struct BridgeKernel<C> {
-    controller: C,
+/// Envelope-aware policy for a single broker-to-worker ACP relay.
+///
+/// The kernel owns no sockets and performs no controller I/O. Its caller owns
+/// bounded framing, queues, authentication, timeouts, and delivery. Messages
+/// are pass-through by default; only setup paths, advertised lifecycle
+/// capabilities, and bridge-owned lifecycle requests are intercepted.
+pub struct BridgeKernel {
     identity: BridgeIdentity,
+    binding: SessionBinding,
+    worker_cwd: String,
     state: BridgeState,
-    binding: Option<SessionBinding>,
+    worker_session_id: Option<String>,
+    pending_worker: Option<PendingWorkerRequest>,
+    pending_lifecycle: Option<ControllerLifecycleAction>,
 }
 
-impl<C> BridgeKernel<C>
-where
-    C: SessionControllerClient,
-{
-    pub fn new(controller: C, identity: BridgeIdentity) -> Self {
-        Self {
-            controller,
-            identity,
-            state: BridgeState::Uninitialized,
-            binding: None,
+impl BridgeKernel {
+    pub fn new(
+        identity: BridgeIdentity,
+        binding: SessionBinding,
+        worker_cwd: impl Into<String>,
+    ) -> Result<Self, BridgeConfigError> {
+        binding
+            .validate_for(&identity)
+            .map_err(BridgeConfigError::BindingMismatch)?;
+        let worker_cwd = worker_cwd.into();
+        if !worker_cwd.starts_with('/') || worker_cwd.contains('\0') {
+            return Err(BridgeConfigError::InvalidWorkerCwd);
         }
+        Ok(Self {
+            identity,
+            binding,
+            worker_cwd,
+            state: BridgeState::Uninitialized,
+            worker_session_id: None,
+            pending_worker: None,
+            pending_lifecycle: None,
+        })
+    }
+
+    pub fn identity(&self) -> &BridgeIdentity {
+        &self.identity
+    }
+
+    pub fn worker_cwd(&self) -> &str {
+        &self.worker_cwd
     }
 
     pub fn state(&self) -> BridgeState {
         self.state
     }
 
-    pub fn binding(&self) -> Option<&SessionBinding> {
-        self.binding.as_ref()
+    pub fn worker_session_id(&self) -> Option<&str> {
+        self.worker_session_id.as_deref()
     }
 
-    pub fn controller(&self) -> &C {
-        &self.controller
-    }
-
-    pub fn controller_mut(&mut self) -> &mut C {
-        &mut self.controller
-    }
-
-    /// Parse and handle one complete newline-delimited ACP JSON-RPC message.
-    ///
-    /// The returned value is a response object for the caller to serialize.
-    /// Notifications return `None`. This kernel deliberately does not implement
-    /// prompt relay; `session/prompt` receives a method-not-found response.
-    pub async fn handle_logical_message(
+    /// Inspect one complete message received from OAB and decide where the
+    /// transport must deliver it.
+    pub fn handle_broker_message(
         &mut self,
         bytes: &[u8],
-    ) -> Result<Option<Value>, BridgeProtocolError> {
-        let value = parse_logical_message(bytes)?;
-        let message = parse_rpc_message(value)?;
+    ) -> Result<BridgeAction, BridgeProtocolError> {
+        self.ensure_not_failed()?;
+        let parsed = parse_rpc_envelope(bytes)?;
+        self.ensure_broker_message_allowed(&parsed.kind)?;
 
-        if message.method == "session/cancel" {
-            if message.id.is_some() {
-                return Err(BridgeProtocolError::CancelMustBeNotification);
+        match &parsed.kind {
+            EnvelopeKind::Request { id, method, .. } if method == "initialize" => {
+                self.begin_initialize(id.clone(), parsed.value)
             }
-            return self.handle_cancel(&message.params).await.map(|()| None);
-        }
-
-        let Some(id) = message.id else {
-            if is_request_method(&message.method) {
-                return Err(BridgeProtocolError::InvalidEnvelope(
-                    "request method requires an id",
-                ));
+            EnvelopeKind::Request { id, method, params } if method == "session/new" => {
+                self.begin_session(id.clone(), method, params, parsed.value)
             }
-            return Ok(None);
-        };
-
-        let result = self
-            .dispatch_request(&message.method, &message.params)
-            .await;
-        Ok(Some(match result {
-            Ok(result) => rpc_result(id, result),
-            Err(error) => rpc_error(id, error),
-        }))
+            EnvelopeKind::Request { id, method, params } if method == "session/load" => {
+                self.begin_session(id.clone(), method, params, parsed.value)
+            }
+            EnvelopeKind::Request { id, method, params } if method == "session/close" => {
+                self.begin_lifecycle(LifecycleKind::Suspend, id.clone(), params)
+            }
+            EnvelopeKind::Request { id, method, params } if method == "_openab/session/release" => {
+                self.begin_lifecycle(LifecycleKind::Release, id.clone(), params)
+            }
+            EnvelopeKind::Notification { method } if is_bridge_lifecycle_method(method) => {
+                Err(BridgeProtocolError::InvalidEnvelope(
+                    "bridge lifecycle methods must be requests with an id",
+                ))
+            }
+            _ => Ok(BridgeAction::ForwardToWorker(parsed.value)),
+        }
     }
 
-    async fn dispatch_request(
+    /// Inspect one complete message received from the worker and decide where
+    /// the transport must deliver it.
+    pub fn handle_worker_message(
         &mut self,
-        method: &str,
-        params: &Value,
-    ) -> Result<Value, RpcFailure> {
-        match method {
-            "initialize" => self.initialize(params),
-            "session/new" => self.activate(params, ActivationIntent::New).await,
-            "session/load" => self.activate(params, ActivationIntent::Load).await,
-            "session/close" => self.close(params).await,
-            "_openab/session/release" => self.release(params).await,
-            _ => Err(RpcFailure::method_not_found()),
-        }
-    }
-
-    fn initialize(&mut self, params: &Value) -> Result<Value, RpcFailure> {
-        if self.state != BridgeState::Uninitialized {
-            return Err(RpcFailure::invalid_state("uninitialized bridge"));
-        }
-        validate_initialize_params(params)?;
-        self.state = BridgeState::Initialized;
-        Ok(json!({
-            "protocolVersion": 1,
-            "agentCapabilities": {
-                "loadSession": true,
-                "sessionCapabilities": {
-                    "close": {},
-                    "_meta": {
-                        "openab.dev": {
-                            "sessionRelease": {"version": 1}
-                        }
-                    }
-                }
-            },
-            "agentInfo": {
-                "name": "openab-kubernetes-session",
-                "version": env!("CARGO_PKG_VERSION")
-            },
-            "authMethods": []
-        }))
-    }
-
-    async fn activate(
-        &mut self,
-        params: &Value,
-        intent: ActivationIntent,
-    ) -> Result<Value, RpcFailure> {
-        let allowed = match intent {
-            ActivationIntent::New => self.state == BridgeState::Initialized,
-            ActivationIntent::Load => self.state == BridgeState::Initialized,
-        };
-        if !allowed {
-            return Err(RpcFailure::invalid_state(match intent {
-                ActivationIntent::New => "initialized bridge",
-                ActivationIntent::Load => "newly initialized bridge",
-            }));
-        }
-        validate_setup_params(params, intent, &self.identity.session_id.as_hex())?;
-
-        let request = self.identity.activation_request(intent);
-        let binding = self
-            .controller
-            .activate(request.clone())
-            .await
-            .map_err(RpcFailure::controller)?;
-        binding
-            .validate_for(&request)
-            .map_err(RpcFailure::binding)?;
-
-        self.binding = Some(binding);
-        self.state = BridgeState::Active;
-        Ok(match intent {
-            ActivationIntent::New => json!({"sessionId": self.identity.session_id.as_hex()}),
-            ActivationIntent::Load => json!({}),
-        })
-    }
-
-    async fn close(&mut self, params: &Value) -> Result<Value, RpcFailure> {
-        validate_session_params(params, &self.identity.session_id.as_hex())?;
-        if self.state != BridgeState::Active {
-            return Err(RpcFailure::invalid_state("active session"));
-        }
-        let binding = self
-            .binding
-            .as_ref()
-            .expect("active state always has a binding")
-            .clone();
-        self.controller
-            .suspend(&binding)
-            .await
-            .map_err(RpcFailure::controller)?;
-        self.binding = None;
-        self.state = BridgeState::Closed;
-        Ok(json!({}))
-    }
-
-    async fn release(&mut self, params: &Value) -> Result<Value, RpcFailure> {
-        validate_session_params(params, &self.identity.session_id.as_hex())?;
-        if self.state == BridgeState::Released {
-            return Ok(json!({}));
-        }
-        if self.state != BridgeState::Active {
-            return Err(RpcFailure::invalid_state("active session"));
-        }
-        let binding = self
-            .binding
-            .as_ref()
-            .expect("active state always has a binding")
-            .clone();
-        self.controller
-            .release(&binding)
-            .await
-            .map_err(RpcFailure::controller)?;
-        self.binding = None;
-        self.state = BridgeState::Released;
-        Ok(json!({}))
-    }
-
-    async fn handle_cancel(&mut self, params: &Value) -> Result<(), BridgeProtocolError> {
-        validate_session_params(params, &self.identity.session_id.as_hex())
-            .map_err(|_| BridgeProtocolError::InvalidEnvelope("invalid session/cancel params"))?;
-        if self.state != BridgeState::Active {
-            return Err(BridgeProtocolError::InvalidEnvelope(
-                "session/cancel requires an active session",
+        bytes: &[u8],
+    ) -> Result<BridgeAction, BridgeProtocolError> {
+        self.ensure_not_failed()?;
+        if matches!(self.state, BridgeState::Closed | BridgeState::Released) {
+            return Err(BridgeProtocolError::InvalidState(
+                "terminal bridge cannot accept worker messages",
             ));
         }
-        let binding = self
-            .binding
+        let mut parsed = parse_rpc_envelope(bytes)?;
+        if matches!(
+            &parsed.kind,
+            EnvelopeKind::Request { method, .. } | EnvelopeKind::Notification { method }
+                if is_broker_host_method(method)
+        ) {
+            return Err(BridgeProtocolError::BrokerCapability(
+                "filesystem and terminal methods must execute inside the worker Pod",
+            ));
+        }
+        let EnvelopeKind::Response { id, success } = &parsed.kind else {
+            return Ok(BridgeAction::ForwardToBroker(parsed.value));
+        };
+        if self
+            .pending_lifecycle
             .as_ref()
-            .expect("active state always has a binding");
-        self.controller
-            .cancel_turn(binding)
-            .await
-            .map_err(BridgeProtocolError::CancelFailed)
+            .is_some_and(|action| action.request_id() == id)
+        {
+            return Err(BridgeProtocolError::LifecycleResponseSpoof);
+        }
+        let Some(pending) = self.pending_worker.as_ref() else {
+            return Ok(BridgeAction::ForwardToBroker(parsed.value));
+        };
+        if pending.request_id() != id {
+            return Ok(BridgeAction::ForwardToBroker(parsed.value));
+        }
+
+        let pending = self
+            .pending_worker
+            .take()
+            .expect("pending worker request was checked above");
+        if !success {
+            self.state = match pending {
+                PendingWorkerRequest::Initialize { .. } => BridgeState::Uninitialized,
+                PendingWorkerRequest::New { .. } | PendingWorkerRequest::Load { .. } => {
+                    BridgeState::Initialized
+                }
+            };
+            return Ok(BridgeAction::ForwardToBroker(parsed.value));
+        }
+
+        match pending {
+            PendingWorkerRequest::Initialize { .. } => {
+                if let Err(error) = augment_initialize_response(&mut parsed.value)
+                    .and_then(|()| ensure_logical_value_size(&parsed.value))
+                {
+                    self.state = BridgeState::Failed;
+                    return Err(error);
+                }
+                self.state = BridgeState::Initialized;
+            }
+            PendingWorkerRequest::New { .. } => {
+                let Some(session_id) = response_session_id(&parsed.value) else {
+                    self.state = BridgeState::Failed;
+                    return Err(BridgeProtocolError::WorkerResponse(
+                        "session/new result must contain a non-empty sessionId",
+                    ));
+                };
+                self.worker_session_id = Some(session_id.to_string());
+                self.state = BridgeState::Active;
+            }
+            PendingWorkerRequest::Load { session_id, .. } => {
+                if !parsed.value.get("result").is_some_and(Value::is_object) {
+                    self.state = BridgeState::Failed;
+                    return Err(BridgeProtocolError::WorkerResponse(
+                        "session/load result must be an object",
+                    ));
+                }
+                self.worker_session_id = Some(session_id);
+                self.state = BridgeState::Active;
+            }
+        }
+        Ok(BridgeAction::ForwardToBroker(parsed.value))
+    }
+
+    /// Resolve the controller action emitted by [`Self::handle_broker_message`].
+    ///
+    /// Only a successful controller transport result produces an ACP `{}`
+    /// acknowledgement. A controller failure is returned to OAB as JSON-RPC
+    /// error and leaves the worker session active so the operation can retry.
+    pub fn finish_lifecycle(
+        &mut self,
+        action: &ControllerLifecycleAction,
+        result: Result<(), ControllerError>,
+    ) -> Result<BridgeAction, BridgeProtocolError> {
+        if self.pending_lifecycle.as_ref() != Some(action) {
+            return Err(BridgeProtocolError::LifecycleMismatch);
+        }
+        self.pending_lifecycle = None;
+
+        let response = match result {
+            Ok(()) => {
+                self.state = match action.kind {
+                    LifecycleKind::Suspend => BridgeState::Closed,
+                    LifecycleKind::Release => BridgeState::Released,
+                };
+                rpc_result(action.request_id.clone(), json!({}))
+            }
+            Err(_error) => {
+                self.state = BridgeState::Active;
+                rpc_error(
+                    action.request_id.clone(),
+                    CONTROLLER_ERROR_CODE,
+                    "session lifecycle controller rejected the operation".to_string(),
+                )
+            }
+        };
+        Ok(BridgeAction::ForwardToBroker(response))
+    }
+
+    fn ensure_not_failed(&self) -> Result<(), BridgeProtocolError> {
+        if self.state == BridgeState::Failed {
+            return Err(BridgeProtocolError::InvalidState(
+                "bridge is terminal after a fail-closed worker response",
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_broker_message_allowed(
+        &self,
+        envelope: &EnvelopeKind,
+    ) -> Result<(), BridgeProtocolError> {
+        let allowed = match self.state {
+            BridgeState::Uninitialized => matches!(
+                envelope,
+                EnvelopeKind::Request { method, .. } if method == "initialize"
+            ),
+            BridgeState::Initialized => {
+                matches!(
+                    envelope,
+                    EnvelopeKind::Request { method, .. }
+                        if method == "session/new" || method == "session/load"
+                ) || matches!(envelope, EnvelopeKind::Response { .. })
+            }
+            BridgeState::Active => true,
+            BridgeState::Initializing
+            | BridgeState::StartingSession
+            | BridgeState::LifecyclePending => {
+                matches!(envelope, EnvelopeKind::Response { .. })
+            }
+            BridgeState::Closed | BridgeState::Released | BridgeState::Failed => false,
+        };
+        if allowed {
+            Ok(())
+        } else {
+            Err(BridgeProtocolError::InvalidState(
+                "message is not allowed in the current bridge lifecycle state",
+            ))
+        }
+    }
+
+    fn begin_initialize(
+        &mut self,
+        request_id: Value,
+        mut message: Value,
+    ) -> Result<BridgeAction, BridgeProtocolError> {
+        if self.state != BridgeState::Uninitialized || self.pending_worker.is_some() {
+            return Err(BridgeProtocolError::InvalidState(
+                "initialize requires an uninitialized bridge",
+            ));
+        }
+        rewrite_initialize_params(&mut message)?;
+        ensure_logical_value_size(&message)?;
+        self.pending_worker = Some(PendingWorkerRequest::Initialize { request_id });
+        self.state = BridgeState::Initializing;
+        Ok(BridgeAction::ForwardToWorker(message))
+    }
+
+    fn begin_session(
+        &mut self,
+        request_id: Value,
+        method: &str,
+        params: &Value,
+        mut message: Value,
+    ) -> Result<BridgeAction, BridgeProtocolError> {
+        if self.state != BridgeState::Initialized || self.pending_worker.is_some() {
+            return Err(BridgeProtocolError::InvalidState(
+                "session/new or session/load requires an initialized bridge",
+            ));
+        }
+        let load_session_id = if method == "session/load" {
+            Some(required_session_id(params)?.to_string())
+        } else {
+            None
+        };
+        rewrite_setup_params(&mut message, &self.worker_cwd, load_session_id.is_some())?;
+        ensure_logical_value_size(&message)?;
+        self.pending_worker = Some(match load_session_id {
+            Some(session_id) => PendingWorkerRequest::Load {
+                request_id,
+                session_id,
+            },
+            None => PendingWorkerRequest::New { request_id },
+        });
+        self.state = BridgeState::StartingSession;
+        Ok(BridgeAction::ForwardToWorker(message))
+    }
+
+    fn begin_lifecycle(
+        &mut self,
+        kind: LifecycleKind,
+        request_id: Value,
+        params: &Value,
+    ) -> Result<BridgeAction, BridgeProtocolError> {
+        if self.state != BridgeState::Active || self.pending_lifecycle.is_some() {
+            return Err(BridgeProtocolError::InvalidState(
+                "session close or release requires an active session",
+            ));
+        }
+        let session_id = required_session_id(params)?;
+        if self.worker_session_id.as_deref() != Some(session_id) {
+            return Err(BridgeProtocolError::InvalidParams(
+                "sessionId does not match the active worker session",
+            ));
+        }
+        let action = ControllerLifecycleAction::new(
+            kind,
+            request_id,
+            self.binding.clone(),
+            session_id.to_string(),
+        );
+        self.pending_lifecycle = Some(action.clone());
+        self.state = BridgeState::LifecyclePending;
+        Ok(BridgeAction::Controller(action))
     }
 }
 
-fn validate_initialize_params(params: &Value) -> Result<(), RpcFailure> {
-    let object = params
-        .as_object()
-        .ok_or_else(|| RpcFailure::invalid_params("initialize params must be an object"))?;
-    ensure_keys(
-        object,
-        &[
-            "protocolVersion",
-            "clientCapabilities",
-            "clientInfo",
-            "_meta",
-        ],
-    )?;
-    if object.get("protocolVersion").and_then(Value::as_u64) != Some(1) {
-        return Err(RpcFailure::invalid_params(
-            "protocolVersion must be integer 1",
-        ));
-    }
-    if object
-        .get("clientCapabilities")
-        .is_some_and(|value| !value.is_object())
-    {
-        return Err(RpcFailure::invalid_params(
-            "clientCapabilities must be an object",
-        ));
-    }
-    if object
-        .get("clientInfo")
-        .is_some_and(|value| !value.is_object())
-    {
-        return Err(RpcFailure::invalid_params("clientInfo must be an object"));
-    }
-    validate_meta(object)
+fn rewrite_initialize_params(message: &mut Value) -> Result<(), BridgeProtocolError> {
+    let params = message
+        .get_mut("params")
+        .and_then(Value::as_object_mut)
+        .ok_or(BridgeProtocolError::InvalidParams(
+            "initialize params must be an object",
+        ))?;
+
+    // The worker must execute filesystem and terminal operations inside its
+    // own Pod. Never advertise broker-host capabilities that could turn OAB
+    // into a confused deputy if its ACP client grows those capabilities.
+    params.insert("clientCapabilities".to_string(), json!({}));
+    Ok(())
 }
 
-fn validate_setup_params(
-    params: &Value,
-    intent: ActivationIntent,
-    expected_session_id: &str,
-) -> Result<(), RpcFailure> {
-    let object = params
-        .as_object()
-        .ok_or_else(|| RpcFailure::invalid_params("session params must be an object"))?;
-    let allowed: &[&str] = match intent {
-        ActivationIntent::New => &["cwd", "mcpServers", "additionalDirectories", "_meta"],
-        ActivationIntent::Load => &[
-            "sessionId",
-            "cwd",
-            "mcpServers",
-            "additionalDirectories",
-            "_meta",
-        ],
-    };
-    ensure_keys(object, allowed)?;
-    if !object.get("cwd").is_some_and(Value::is_string) {
-        return Err(RpcFailure::invalid_params("cwd must be a string"));
-    }
-    if !object
-        .get("mcpServers")
-        .and_then(Value::as_array)
-        .is_some_and(Vec::is_empty)
-    {
-        return Err(RpcFailure::invalid_params(
-            "mcpServers must be an empty array",
-        ));
-    }
-    if object
+fn rewrite_setup_params(
+    message: &mut Value,
+    worker_cwd: &str,
+    is_load: bool,
+) -> Result<(), BridgeProtocolError> {
+    let root = message
+        .as_object_mut()
+        .expect("validated JSON-RPC envelope is an object");
+    let params = root
+        .entry("params")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or(BridgeProtocolError::InvalidParams(
+            "session setup params must be an object",
+        ))?;
+    if params
         .get("additionalDirectories")
-        .is_some_and(|value| !value.as_array().is_some_and(Vec::is_empty))
+        .is_some_and(|value| !value.is_array())
     {
-        return Err(RpcFailure::invalid_params(
-            "additionalDirectories must be absent or empty",
+        return Err(BridgeProtocolError::InvalidParams(
+            "additionalDirectories must be an array when present",
         ));
     }
-    if intent == ActivationIntent::Load {
-        validate_session_id(object, expected_session_id)?;
-    }
-    validate_meta(object)
+    params.retain(|key, _| key == "_meta" || (is_load && key == "sessionId"));
+    params.insert("cwd".to_string(), Value::String(worker_cwd.to_string()));
+    params.insert("mcpServers".to_string(), json!([]));
+    params.insert("additionalDirectories".to_string(), json!([]));
+    Ok(())
 }
 
-fn validate_session_params(params: &Value, expected_session_id: &str) -> Result<(), RpcFailure> {
-    let object = params
+fn required_session_id(params: &Value) -> Result<&str, BridgeProtocolError> {
+    params
         .as_object()
-        .ok_or_else(|| RpcFailure::invalid_params("session params must be an object"))?;
-    ensure_keys(object, &["sessionId", "_meta"])?;
-    validate_session_id(object, expected_session_id)?;
-    validate_meta(object)
+        .and_then(|params| params.get("sessionId"))
+        .and_then(Value::as_str)
+        .filter(|session_id| !session_id.is_empty())
+        .ok_or(BridgeProtocolError::InvalidParams(
+            "sessionId must be a non-empty string",
+        ))
 }
 
-fn validate_session_id(
-    object: &Map<String, Value>,
-    expected_session_id: &str,
-) -> Result<(), RpcFailure> {
-    if object.get("sessionId").and_then(Value::as_str) != Some(expected_session_id) {
-        return Err(RpcFailure::invalid_params(
-            "sessionId does not match this bridge",
+fn response_session_id(message: &Value) -> Option<&str> {
+    message
+        .get("result")
+        .and_then(Value::as_object)
+        .and_then(|result| result.get("sessionId"))
+        .and_then(Value::as_str)
+        .filter(|session_id| !session_id.is_empty())
+}
+
+fn augment_initialize_response(message: &mut Value) -> Result<(), BridgeProtocolError> {
+    let result = message
+        .get_mut("result")
+        .and_then(Value::as_object_mut)
+        .ok_or(BridgeProtocolError::WorkerCapability(
+            "initialize result must be an object",
+        ))?;
+    let capabilities = result
+        .get_mut("agentCapabilities")
+        .and_then(Value::as_object_mut)
+        .ok_or(BridgeProtocolError::WorkerCapability(
+            "agentCapabilities must be an object",
+        ))?;
+    if capabilities.get("loadSession") != Some(&Value::Bool(true)) {
+        return Err(BridgeProtocolError::WorkerCapability(
+            "loadSession=true is required",
         ));
     }
+
+    let session_capabilities = object_entry(capabilities, "sessionCapabilities").ok_or(
+        BridgeProtocolError::WorkerCapability("sessionCapabilities must be an object"),
+    )?;
+    session_capabilities.insert("close".to_string(), json!({}));
+    let metadata = object_entry(session_capabilities, "_meta").ok_or(
+        BridgeProtocolError::WorkerCapability("sessionCapabilities._meta must be an object"),
+    )?;
+    let openab =
+        object_entry(metadata, "openab.dev").ok_or(BridgeProtocolError::WorkerCapability(
+            "sessionCapabilities._meta.openab.dev must be an object",
+        ))?;
+    openab.insert("sessionRelease".to_string(), json!({"version": 1}));
     Ok(())
 }
 
-fn validate_meta(object: &Map<String, Value>) -> Result<(), RpcFailure> {
-    if object
-        .get("_meta")
-        .is_some_and(|value| !value.is_null() && !value.is_object())
-    {
-        return Err(RpcFailure::invalid_params(
-            "_meta must be an object or null",
-        ));
-    }
-    Ok(())
+fn object_entry<'a>(
+    object: &'a mut Map<String, Value>,
+    key: &str,
+) -> Option<&'a mut Map<String, Value>> {
+    object
+        .entry(key.to_string())
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
 }
 
-fn ensure_keys(object: &Map<String, Value>, allowed: &[&str]) -> Result<(), RpcFailure> {
-    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
-        return Err(RpcFailure::invalid_params(
-            "params contain an unsupported field",
-        ));
-    }
-    Ok(())
-}
-
-fn is_request_method(method: &str) -> bool {
+fn is_bridge_lifecycle_method(method: &str) -> bool {
     matches!(
         method,
-        "initialize"
-            | "session/new"
-            | "session/load"
-            | "session/close"
-            | "session/prompt"
-            | "_openab/session/release"
+        "initialize" | "session/new" | "session/load" | "session/close" | "_openab/session/release"
     )
 }
 
-fn parse_rpc_message(value: Value) -> Result<RpcMessage, BridgeProtocolError> {
-    let Value::Object(mut object) = value else {
-        return Err(BridgeProtocolError::InvalidEnvelope(
+fn is_broker_host_method(method: &str) -> bool {
+    method.starts_with("fs/") || method.starts_with("terminal/")
+}
+
+#[derive(Debug)]
+struct ParsedEnvelope {
+    value: Value,
+    kind: EnvelopeKind,
+}
+
+#[derive(Debug)]
+enum EnvelopeKind {
+    Request {
+        id: Value,
+        method: String,
+        params: Value,
+    },
+    Notification {
+        method: String,
+    },
+    Response {
+        id: Value,
+        success: bool,
+    },
+}
+
+fn parse_rpc_envelope(bytes: &[u8]) -> Result<ParsedEnvelope, BridgeProtocolError> {
+    let value = parse_logical_message(bytes)?;
+    let object = value
+        .as_object()
+        .ok_or(BridgeProtocolError::InvalidEnvelope(
             "message must be an object",
-        ));
-    };
+        ))?;
     if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         return Err(BridgeProtocolError::InvalidEnvelope(
             "jsonrpc must equal 2.0",
         ));
     }
-    let method = object
-        .remove("method")
-        .and_then(|method| method.as_str().map(str::to_owned))
-        .filter(|method| !method.is_empty())
-        .ok_or(BridgeProtocolError::InvalidEnvelope(
-            "method must be a non-empty string",
-        ))?;
-    let id = object.remove("id");
+
+    let id = object.get("id").cloned();
     if id
         .as_ref()
         .is_some_and(|id| !id.is_number() && !id.is_string())
@@ -694,11 +802,63 @@ fn parse_rpc_message(value: Value) -> Result<RpcMessage, BridgeProtocolError> {
             "id must be a number or string",
         ));
     }
-    Ok(RpcMessage {
-        id,
-        method,
-        params: object.remove("params").unwrap_or(Value::Null),
-    })
+    let method = object.get("method");
+    let has_result = object.contains_key("result");
+    let has_error = object.contains_key("error");
+
+    let kind = if let Some(method) = method {
+        if has_result || has_error {
+            return Err(BridgeProtocolError::InvalidEnvelope(
+                "request or notification cannot contain result or error",
+            ));
+        }
+        let method = method
+            .as_str()
+            .filter(|method| !method.is_empty())
+            .ok_or(BridgeProtocolError::InvalidEnvelope(
+                "method must be a non-empty string",
+            ))?
+            .to_string();
+        if object
+            .get("params")
+            .is_some_and(|params| !params.is_object() && !params.is_array())
+        {
+            return Err(BridgeProtocolError::InvalidEnvelope(
+                "params must be an object or array when present",
+            ));
+        }
+        let params = object.get("params").cloned().unwrap_or(Value::Null);
+        match id {
+            Some(id) => EnvelopeKind::Request { id, method, params },
+            None => EnvelopeKind::Notification { method },
+        }
+    } else {
+        let id = id.ok_or(BridgeProtocolError::InvalidEnvelope(
+            "response must contain an id",
+        ))?;
+        if has_result == has_error {
+            return Err(BridgeProtocolError::InvalidEnvelope(
+                "response must contain exactly one of result or error",
+            ));
+        }
+        if has_error {
+            let error = object.get("error").and_then(Value::as_object).ok_or(
+                BridgeProtocolError::InvalidEnvelope("response error must be an object"),
+            )?;
+            if error.get("code").is_none_or(|code| code.as_i64().is_none())
+                || !error.get("message").is_some_and(Value::is_string)
+            {
+                return Err(BridgeProtocolError::InvalidEnvelope(
+                    "response error must contain an integer code and string message",
+                ));
+            }
+        }
+        EnvelopeKind::Response {
+            id,
+            success: has_result,
+        }
+    };
+    Ok(ParsedEnvelope { value, kind })
 }
 
 /// Parse one complete logical message after bounded accumulation.
@@ -708,6 +868,24 @@ fn parse_rpc_message(value: Value) -> Result<RpcMessage, BridgeProtocolError> {
 /// enforces the payload bound before JSON decoding.
 pub fn parse_logical_message(bytes: &[u8]) -> Result<Value, BridgeProtocolError> {
     parse_logical_message_with_limit(bytes, MAX_LOGICAL_MESSAGE_BYTES)
+}
+
+fn ensure_logical_value_size(value: &Value) -> Result<(), BridgeProtocolError> {
+    ensure_logical_value_size_with_limit(value, MAX_LOGICAL_MESSAGE_BYTES)
+}
+
+fn ensure_logical_value_size_with_limit(
+    value: &Value,
+    maximum: usize,
+) -> Result<(), BridgeProtocolError> {
+    let bytes = serde_json::to_vec(value).expect("a serde_json::Value always serializes as JSON");
+    if bytes.len() > maximum {
+        return Err(BridgeProtocolError::MessageTooLarge {
+            bytes: bytes.len(),
+            maximum,
+        });
+    }
+    Ok(())
 }
 
 fn parse_logical_message_with_limit(
@@ -729,11 +907,11 @@ fn rpc_result(id: Value, result: Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "result": result})
 }
 
-fn rpc_error(id: Value, error: RpcFailure) -> Value {
+fn rpc_error(id: Value, code: i64, message: String) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": id,
-        "error": {"code": error.code, "message": error.message},
+        "error": {"code": code, "message": message},
     })
 }
 
@@ -753,6 +931,18 @@ mod tests {
                 bytes: 5,
                 maximum: 4
             })
+        ));
+    }
+
+    #[test]
+    fn rewritten_logical_message_must_still_fit_the_outbound_limit() {
+        let value = json!({"value": "1234"});
+        let encoded_len = serde_json::to_vec(&value).unwrap().len();
+
+        assert!(ensure_logical_value_size_with_limit(&value, encoded_len).is_ok());
+        assert!(matches!(
+            ensure_logical_value_size_with_limit(&value, encoded_len - 1),
+            Err(BridgeProtocolError::MessageTooLarge { .. })
         ));
     }
 

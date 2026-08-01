@@ -157,11 +157,15 @@ intercepts only the lifecycle and security-sensitive setup needed to:
 - replace broker filesystem paths with the profile-owned worker directory;
 - prevent broker-provided filesystem or MCP mounts from crossing the trust
   boundary;
+- suppress broker-host filesystem and terminal capabilities, and reject any
+  worker request that attempts to delegate those operations back to the
+  broker;
 - suspend compute without deleting retained state; and
 - request explicit, fenced destructive release.
 
-All other valid ACP requests, notifications, responses, and agent-initiated
-requests pass through with bounded frames, messages, queues, and timeouts.
+All other valid ACP requests, notifications, responses, and non-host-capability
+agent requests pass through with bounded frames, messages, queues, and
+timeouts. Filesystem and terminal work executes inside the worker Pod.
 
 ### 4.2 Controller and relay
 
