@@ -196,6 +196,19 @@ their separate logical-message bound. Socket adapters must additionally use
 bounded queues and backpressure rather than accumulating valid frames without
 limit.
 
+The worker WebSocket adapter accepts only an already-upgraded connection whose
+transport has produced the single-use bootstrap authority. JSON envelopes use
+WebSocket text messages; the first application message must be
+`Registration`, and every later application message must be ACP. Ping and Pong
+remain transport control messages and do not reset the fixed registration
+deadline. Binary messages are never reinterpreted as UTF-8 JSON. The adapter
+sets both WebSocket frame and message limits to the wire ACP ceiling, uses a
+finite write buffer, and applies a deadline to every send, flush, and close.
+A bounded, sanitized fatal result may be sent before registration is accepted.
+After registration, EOF, Close, timeout, transport failure, or protocol failure
+drops both socket halves and fences the exact relay attachment before any
+controller I/O; courtesy socket writes never delay that fail-closed transition.
+
 ### 4.2 Controller and relay
 
 The controller and relay are one trusted process in the initial design. A

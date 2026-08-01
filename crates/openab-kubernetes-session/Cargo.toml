@@ -10,11 +10,26 @@ license = "MIT"
 
 [features]
 default = []
-controller = ["dep:getrandom", "dep:k8s-openapi", "dep:kube", "dep:subtle", "dep:tokio", "dep:toml"]
+controller = [
+    "dep:futures-util",
+    "dep:getrandom",
+    "dep:k8s-openapi",
+    "dep:kube",
+    "dep:subtle",
+    "dep:tokio",
+    "dep:tokio-tungstenite",
+    "dep:toml",
+]
 
 [dependencies]
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
+futures-util = {
+    version = "0.3",
+    default-features = false,
+    features = ["sink", "std"],
+    optional = true,
+}
 getrandom = { version = "0.4", optional = true }
 hex = "0.4"
 k8s-openapi = { version = "=0.28.0", features = ["v1_32"], optional = true }
@@ -24,11 +39,12 @@ serde_json = "1"
 sha2 = "0.10"
 subtle = { version = "2", optional = true }
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt", "sync"], optional = true }
+tokio = { version = "1", features = ["io-util", "macros", "rt", "sync", "time"], optional = true }
+tokio-tungstenite = { version = "0.21", default-features = false, optional = true }
 toml = { version = "0.8", optional = true }
 uuid = { version = "1", features = ["serde", "v4"] }
 
 [dev-dependencies]
 http = "1"
-tokio = { version = "1", features = ["macros", "rt", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "rt", "time"] }
 tower-test = "0.4"

@@ -473,7 +473,11 @@ impl RelayOrchestrator {
         mut attachment: RelayAttachment<M>,
     ) -> Result<RelayLossOutcome, ControllerServiceError> {
         let connection = attachment.disarm();
-        match self.registry.begin_connection_loss(&connection) {
+        let loss = self.registry.begin_connection_loss(&connection);
+        // The registry is already fenced. Release every queued byte lease and
+        // delivery reporter before controller I/O, which may be slow or fail.
+        drop(attachment);
+        match loss {
             RelayConnectionLoss::ContainmentRequired(ticket) => {
                 let outcome = self.controller.connection_lost(ticket.authority()).await?;
                 self.registry.complete_containment(&ticket);
@@ -884,19 +888,26 @@ struct RegisteredWorkerParts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::controller::RendezvousRouteError;
+    use crate::controller::{
+        serve_worker_websocket, worker_websocket_config, RendezvousRouteError, WorkerWebSocketError,
+    };
     use crate::identity::ScopeId;
     use crate::state::Fence;
     use crate::wire::{
-        decode_frame, ActivationResponseV1, BrokerMappingExpectationV1, ControllerToWorkerV1,
-        HandshakeOutcomeV1, SessionBindingV1, ValidatedActivationOutcomeV1, WireMessage,
+        decode_frame, encode_frame, ActivationResponseV1, BrokerMappingExpectationV1,
+        ControllerToWorkerV1, HandshakeOutcomeV1, SessionBindingV1, ValidatedActivationOutcomeV1,
+        WireMessage, WorkerToControllerV1, MAX_ACP_FRAME_BYTES, MAX_CONTROL_FRAME_BYTES,
         MAX_PROFILE_VERSION_BYTES,
     };
+    use futures_util::{SinkExt, StreamExt};
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use tokio::io::{duplex, DuplexStream};
     use tokio::sync::Semaphore;
     use tokio::time::{timeout, Duration};
+    use tokio_tungstenite::tungstenite::{protocol::Role, Message};
+    use tokio_tungstenite::WebSocketStream;
     use uuid::Uuid;
 
     const RAW_SCOPE: &str = "organization-secret-team-a";
@@ -1200,6 +1211,41 @@ mod tests {
     fn decode_outbound<M: WireMessage>(queued: RelayOutboundItem<M>) -> M {
         let frame = queued.into_encoded_frame().unwrap();
         decode_frame(frame.as_bytes()).unwrap()
+    }
+
+    fn websocket_text<M: WireMessage>(message: &M) -> Message {
+        Message::Text(String::from_utf8(encode_frame(message).unwrap()).unwrap())
+    }
+
+    type TestWorkerWebSocket = WebSocketStream<DuplexStream>;
+
+    async fn worker_websocket_pair() -> (TestWorkerWebSocket, TestWorkerWebSocket) {
+        let (worker_io, controller_io) = duplex(256 * 1024);
+        let worker = WebSocketStream::from_raw_socket(
+            worker_io,
+            Role::Client,
+            Some(worker_websocket_config()),
+        )
+        .await;
+        let controller = WebSocketStream::from_raw_socket(
+            controller_io,
+            Role::Server,
+            Some(worker_websocket_config()),
+        )
+        .await;
+        (worker, controller)
+    }
+
+    async fn receive_websocket_text<M: WireMessage>(socket: &mut TestWorkerWebSocket) -> M {
+        let frame = timeout(Duration::from_secs(1), socket.next())
+            .await
+            .expect("the relay should write a WebSocket frame")
+            .expect("the relay should keep the WebSocket open")
+            .expect("the relay should write a valid WebSocket frame");
+        let Message::Text(text) = frame else {
+            panic!("the relay wire protocol must use text frames")
+        };
+        decode_frame(text.as_bytes()).unwrap()
     }
 
     fn orchestrator(controller: Arc<FakeController>) -> (RelayOrchestrator, RendezvousRegistry) {
@@ -2864,6 +2910,665 @@ mod tests {
         ));
         let queued = worker.outbound().recv().await.unwrap();
         assert_eq!(decode_outbound(queued), ControllerToWorkerV1::Acp(message));
+    }
+
+    #[test]
+    fn worker_websocket_limits_cover_the_wire_ceiling() {
+        let config = worker_websocket_config();
+        assert_eq!(config.max_message_size, Some(MAX_ACP_FRAME_BYTES));
+        assert_eq!(config.max_frame_size, Some(MAX_ACP_FRAME_BYTES));
+        assert!(!config.accept_unmasked_frames);
+        assert_eq!(config.write_buffer_size, 0);
+        assert_eq!(
+            config.max_write_buffer_size,
+            MAX_ACP_FRAME_BYTES + MAX_CONTROL_FRAME_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_websocket_registers_once_and_routes_both_directions() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let (relay, _registry) = orchestrator(Arc::clone(&controller));
+        let BridgeOpenOutcome::Attached(mut bridge) = relay
+            .activate_bridge(activation_request(BrokerMappingExpectationV1::Absent))
+            .await
+            .unwrap()
+        else {
+            panic!("durable generation must attach")
+        };
+        let (mut worker_socket, controller_socket) = worker_websocket_pair().await;
+        let driver = tokio::spawn(serve_worker_websocket(
+            relay.clone(),
+            controller_socket,
+            auth(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        ));
+
+        worker_socket
+            .send(Message::Ping(vec![0x14, 0x61]))
+            .await
+            .unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(1), worker_socket.next())
+                .await
+                .expect("the worker ping should be flushed")
+                .expect("the relay should keep the WebSocket open")
+                .expect("the relay should send a valid pong"),
+            Message::Pong(vec![0x14, 0x61])
+        );
+        worker_socket
+            .send(websocket_text(&WorkerToControllerV1::Registration(
+                registration(),
+            )))
+            .await
+            .unwrap();
+        let ControllerToWorkerV1::ProtocolResult(result) =
+            receive_websocket_text(&mut worker_socket).await
+        else {
+            panic!("the first controller frame must be the pairing result")
+        };
+        assert_eq!(
+            result.into_handshake_outcome().unwrap(),
+            HandshakeOutcomeV1::Ack
+        );
+        worker_socket
+            .send(Message::Ping(vec![0x14, 0x62]))
+            .await
+            .unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(1), worker_socket.next())
+                .await
+                .expect("the registered worker ping should be flushed")
+                .expect("the relay should keep the registered socket open")
+                .expect("the relay should send a valid registered pong"),
+            Message::Pong(vec![0x14, 0x62])
+        );
+        assert!(matches!(
+            decode_outbound(bridge.outbound().recv().await.unwrap()),
+            ControllerToBridgeV1::Activation(_)
+        ));
+
+        let from_worker = AcpMessageV1::new(json!({
+            "jsonrpc": "2.0",
+            "method": "session/prompt",
+            "params": {"prompt": "from worker"}
+        }))
+        .unwrap();
+        worker_socket
+            .send(websocket_text(&WorkerToControllerV1::Acp(
+                from_worker.clone(),
+            )))
+            .await
+            .unwrap();
+        assert_eq!(
+            decode_outbound(
+                timeout(Duration::from_secs(1), bridge.outbound().recv())
+                    .await
+                    .expect("worker ACP should reach the bridge")
+                    .unwrap()
+            ),
+            ControllerToBridgeV1::Acp(from_worker)
+        );
+
+        let to_worker = AcpMessageV1::new(json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "result": {"stopReason": "end_turn"}
+        }))
+        .unwrap();
+        assert_eq!(
+            relay
+                .route_acp(bridge.connection(), to_worker.clone())
+                .await
+                .unwrap(),
+            RelayAcpDeliveryOutcome::Delivered
+        );
+        assert_eq!(
+            receive_websocket_text::<ControllerToWorkerV1>(&mut worker_socket).await,
+            ControllerToWorkerV1::Acp(to_worker)
+        );
+
+        worker_socket.close(None).await.unwrap();
+        let outcome = timeout(Duration::from_secs(1), driver)
+            .await
+            .expect("worker close should complete containment")
+            .expect("worker driver task should not panic")
+            .expect("worker close should be contained");
+        assert_eq!(
+            outcome,
+            RelayLossOutcome::Contained(OrphanContainmentOutcome::ContainmentAccepted)
+        );
+        assert_eq!(controller.losses.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn worker_websocket_rejects_acp_before_registration() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let (relay, _registry) = orchestrator(Arc::clone(&controller));
+        let (mut worker_socket, controller_socket) = worker_websocket_pair().await;
+        let driver = tokio::spawn(serve_worker_websocket(
+            relay,
+            controller_socket,
+            auth(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        ));
+        let acp = AcpMessageV1::new(json!({"jsonrpc": "2.0", "method": "initialize"})).unwrap();
+
+        worker_socket
+            .send(websocket_text(&WorkerToControllerV1::Acp(acp)))
+            .await
+            .unwrap();
+        let ControllerToWorkerV1::ProtocolResult(result) =
+            receive_websocket_text(&mut worker_socket).await
+        else {
+            panic!("a rejected handshake must return a sanitized result")
+        };
+        assert_eq!(
+            result.into_handshake_outcome().unwrap(),
+            HandshakeOutcomeV1::Fatal(FatalCode::InvalidMessage)
+        );
+        assert!(matches!(
+            driver.await.unwrap(),
+            Err(WorkerWebSocketError::ExpectedRegistration)
+        ));
+        assert_eq!(controller.losses.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn binary_acp_after_registration_is_contained_without_routing() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let (relay, _registry) = orchestrator(Arc::clone(&controller));
+        let BridgeOpenOutcome::Attached(mut bridge) = relay
+            .activate_bridge(activation_request(BrokerMappingExpectationV1::Absent))
+            .await
+            .unwrap()
+        else {
+            panic!("durable generation must attach")
+        };
+        let (mut worker_socket, controller_socket) = worker_websocket_pair().await;
+        let driver = tokio::spawn(serve_worker_websocket(
+            relay,
+            controller_socket,
+            auth(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        ));
+        worker_socket
+            .send(websocket_text(&WorkerToControllerV1::Registration(
+                registration(),
+            )))
+            .await
+            .unwrap();
+        let _: ControllerToWorkerV1 = receive_websocket_text(&mut worker_socket).await;
+        drop(bridge.outbound().recv().await.unwrap());
+
+        let acp = WorkerToControllerV1::Acp(
+            AcpMessageV1::new(json!({"jsonrpc": "2.0", "method": "session/prompt"})).unwrap(),
+        );
+        worker_socket
+            .send(Message::Binary(encode_frame(&acp).unwrap()))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            timeout(Duration::from_secs(1), driver)
+                .await
+                .expect("binary ACP should terminate the worker driver")
+                .unwrap(),
+            Err(WorkerWebSocketError::ExpectedTextAcp)
+        ));
+        assert!(matches!(
+            bridge.outbound().try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+        assert_eq!(controller.losses.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn worker_websocket_rejects_binary_registration_without_decoding_it() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let (relay, _registry) = orchestrator(Arc::clone(&controller));
+        let (mut worker_socket, controller_socket) = worker_websocket_pair().await;
+        let driver = tokio::spawn(serve_worker_websocket(
+            relay,
+            controller_socket,
+            auth(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        ));
+
+        worker_socket
+            .send(Message::Binary(
+                encode_frame(&WorkerToControllerV1::Registration(registration())).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let ControllerToWorkerV1::ProtocolResult(result) =
+            receive_websocket_text(&mut worker_socket).await
+        else {
+            panic!("a rejected binary frame must return a sanitized result")
+        };
+        assert_eq!(
+            result.into_handshake_outcome().unwrap(),
+            HandshakeOutcomeV1::Fatal(FatalCode::InvalidMessage)
+        );
+        assert!(matches!(
+            driver.await.unwrap(),
+            Err(WorkerWebSocketError::ExpectedTextRegistration)
+        ));
+        assert_eq!(controller.losses.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn worker_websocket_registration_timeout_is_one_fixed_deadline() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let (relay, _registry) = orchestrator(Arc::clone(&controller));
+        let (mut worker_socket, controller_socket) = worker_websocket_pair().await;
+        let driver = tokio::spawn(serve_worker_websocket(
+            relay,
+            controller_socket,
+            auth(),
+            Duration::from_millis(20),
+            Duration::from_secs(1),
+        ));
+
+        let ControllerToWorkerV1::ProtocolResult(result) =
+            receive_websocket_text(&mut worker_socket).await
+        else {
+            panic!("a timed-out handshake must return a sanitized result")
+        };
+        assert_eq!(
+            result.into_handshake_outcome().unwrap(),
+            HandshakeOutcomeV1::Fatal(FatalCode::Unavailable)
+        );
+        assert!(matches!(
+            driver.await.unwrap(),
+            Err(WorkerWebSocketError::RegistrationTimedOut)
+        ));
+        assert_eq!(controller.losses.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn worker_websocket_retains_backpressured_frames_in_order() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let (relay, _registry) = orchestrator(Arc::clone(&controller));
+        let BridgeOpenOutcome::Attached(mut bridge) = relay
+            .activate_bridge(activation_request(BrokerMappingExpectationV1::Absent))
+            .await
+            .unwrap()
+        else {
+            panic!("durable generation must attach")
+        };
+        let (mut worker_socket, controller_socket) = worker_websocket_pair().await;
+        let driver = tokio::spawn(serve_worker_websocket(
+            relay,
+            controller_socket,
+            auth(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        ));
+        worker_socket
+            .send(websocket_text(&WorkerToControllerV1::Registration(
+                registration(),
+            )))
+            .await
+            .unwrap();
+        let ControllerToWorkerV1::ProtocolResult(result) =
+            receive_websocket_text(&mut worker_socket).await
+        else {
+            panic!("the worker must receive its pairing result")
+        };
+        assert_eq!(
+            result.into_handshake_outcome().unwrap(),
+            HandshakeOutcomeV1::Ack
+        );
+        worker_socket
+            .send(Message::Ping(vec![0x14, 0x70]))
+            .await
+            .unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(1), worker_socket.next())
+                .await
+                .expect("the backpressure test reader should be active")
+                .unwrap()
+                .unwrap(),
+            Message::Pong(vec![0x14, 0x70])
+        );
+
+        let first = AcpMessageV1::new(json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"sequence": 1}
+        }))
+        .unwrap();
+        let second = AcpMessageV1::new(json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"sequence": 2}
+        }))
+        .unwrap();
+        worker_socket
+            .send(websocket_text(&WorkerToControllerV1::Acp(first.clone())))
+            .await
+            .unwrap();
+        worker_socket
+            .send(websocket_text(&WorkerToControllerV1::Acp(second.clone())))
+            .await
+            .unwrap();
+        worker_socket
+            .send(Message::Ping(vec![0x14, 0x71]))
+            .await
+            .unwrap();
+
+        assert!(
+            timeout(Duration::from_millis(100), worker_socket.next())
+                .await
+                .is_err(),
+            "the reader must stop at the first backpressured ACP frame"
+        );
+
+        assert!(matches!(
+            decode_outbound(bridge.outbound().recv().await.unwrap()),
+            ControllerToBridgeV1::Activation(_)
+        ));
+        assert_eq!(
+            decode_outbound(
+                timeout(Duration::from_secs(1), bridge.outbound().recv())
+                    .await
+                    .expect("the first retained ACP frame should be retried")
+                    .unwrap()
+            ),
+            ControllerToBridgeV1::Acp(first)
+        );
+        assert_eq!(
+            decode_outbound(
+                timeout(Duration::from_secs(1), bridge.outbound().recv())
+                    .await
+                    .expect("the second ACP frame should follow the first")
+                    .unwrap()
+            ),
+            ControllerToBridgeV1::Acp(second)
+        );
+        assert_eq!(
+            timeout(Duration::from_secs(1), worker_socket.next())
+                .await
+                .expect("the reader should resume after exact ACP retries")
+                .unwrap()
+                .unwrap(),
+            Message::Pong(vec![0x14, 0x71])
+        );
+
+        worker_socket.close(None).await.unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(1), driver)
+                .await
+                .expect("worker close should complete containment")
+                .unwrap()
+                .unwrap(),
+            RelayLossOutcome::Contained(OrphanContainmentOutcome::ContainmentAccepted)
+        ));
+        assert_eq!(controller.losses.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_worker_websocket_fails_closed_through_attachment_drop() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let (relay, _registry) = orchestrator(Arc::clone(&controller));
+        let BridgeOpenOutcome::Attached(mut bridge) = relay
+            .activate_bridge(activation_request(BrokerMappingExpectationV1::Absent))
+            .await
+            .unwrap()
+        else {
+            panic!("durable generation must attach")
+        };
+        let (mut worker_socket, controller_socket) = worker_websocket_pair().await;
+        let driver = tokio::spawn(serve_worker_websocket(
+            relay,
+            controller_socket,
+            auth(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        ));
+        worker_socket
+            .send(websocket_text(&WorkerToControllerV1::Registration(
+                registration(),
+            )))
+            .await
+            .unwrap();
+        let _: ControllerToWorkerV1 = receive_websocket_text(&mut worker_socket).await;
+        drop(bridge.outbound().recv().await.unwrap());
+
+        driver.abort();
+        assert!(driver.await.unwrap_err().is_cancelled());
+        wait_for_losses(&controller, 1).await;
+        assert_eq!(controller.losses.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stalled_worker_write_times_out_and_releases_the_global_budget() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let large = AcpMessageV1::new(json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"chunk": "x".repeat(512 * 1024)}
+        }))
+        .unwrap();
+        let limit = large.encoded_payload_bytes() + MAX_CONTROL_FRAME_BYTES;
+        let budget = RelayByteBudget::new(NonZeroUsize::new(limit).unwrap()).unwrap();
+        let (relay, _registry) = orchestrator_with_budget(Arc::clone(&controller), budget.clone());
+        let BridgeOpenOutcome::Attached(mut bridge) = relay
+            .activate_bridge(activation_request(BrokerMappingExpectationV1::Absent))
+            .await
+            .unwrap()
+        else {
+            panic!("durable generation must attach")
+        };
+        let (mut worker_socket, controller_socket) = worker_websocket_pair().await;
+        let driver = tokio::spawn(serve_worker_websocket(
+            relay.clone(),
+            controller_socket,
+            auth(),
+            Duration::from_secs(1),
+            Duration::from_millis(20),
+        ));
+        worker_socket
+            .send(websocket_text(&WorkerToControllerV1::Registration(
+                registration(),
+            )))
+            .await
+            .unwrap();
+        let _: ControllerToWorkerV1 = receive_websocket_text(&mut worker_socket).await;
+        drop(bridge.outbound().recv().await.unwrap());
+        assert_eq!(budget.available_bytes(), limit);
+
+        assert_eq!(
+            relay.route_acp(bridge.connection(), large).await.unwrap(),
+            RelayAcpDeliveryOutcome::Delivered
+        );
+        assert_eq!(budget.available_bytes(), 0);
+        assert!(matches!(
+            timeout(Duration::from_secs(1), driver)
+                .await
+                .expect("a stalled worker write must reach its deadline")
+                .unwrap(),
+            Err(WorkerWebSocketError::WriteTimedOut)
+        ));
+        assert_eq!(budget.available_bytes(), limit);
+        assert_eq!(controller.losses.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn worker_ping_flood_cannot_starve_outbound_acp() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let (relay, _registry) = orchestrator(Arc::clone(&controller));
+        let BridgeOpenOutcome::Attached(mut bridge) = relay
+            .activate_bridge(activation_request(BrokerMappingExpectationV1::Absent))
+            .await
+            .unwrap()
+        else {
+            panic!("durable generation must attach")
+        };
+        let (mut worker_socket, controller_socket) = worker_websocket_pair().await;
+        let driver = tokio::spawn(serve_worker_websocket(
+            relay.clone(),
+            controller_socket,
+            auth(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        ));
+        worker_socket
+            .send(websocket_text(&WorkerToControllerV1::Registration(
+                registration(),
+            )))
+            .await
+            .unwrap();
+        let _: ControllerToWorkerV1 = receive_websocket_text(&mut worker_socket).await;
+        drop(bridge.outbound().recv().await.unwrap());
+
+        let (mut ping_sink, mut response_stream) = worker_socket.split();
+        let flood = tokio::spawn(async move {
+            while ping_sink
+                .send(Message::Ping(vec![0x14, 0x63]))
+                .await
+                .is_ok()
+            {}
+        });
+        tokio::task::yield_now().await;
+        let expected = AcpMessageV1::new(json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"mustNotStarve": true}
+        }))
+        .unwrap();
+        assert_eq!(
+            relay
+                .route_acp(bridge.connection(), expected.clone())
+                .await
+                .unwrap(),
+            RelayAcpDeliveryOutcome::Delivered
+        );
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                match response_stream.next().await.unwrap().unwrap() {
+                    Message::Text(text) => {
+                        let frame: ControllerToWorkerV1 = decode_frame(text.as_bytes()).unwrap();
+                        if frame == ControllerToWorkerV1::Acp(expected.clone()) {
+                            break;
+                        }
+                    }
+                    Message::Pong(_) => {}
+                    frame => panic!("unexpected worker flood response: {frame:?}"),
+                }
+            }
+        })
+        .await
+        .expect("Ping traffic must not starve queued ACP");
+
+        flood.abort();
+        let _ = flood.await;
+        drop(response_stream);
+        driver.abort();
+        let _ = driver.await;
+        wait_for_losses(&controller, 1).await;
+        assert_eq!(controller.losses.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_loss_releases_queued_bytes_before_controller_io() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let limit = 4 * 64 * 1024;
+        let budget = RelayByteBudget::new(NonZeroUsize::new(limit).unwrap()).unwrap();
+        let (relay, _registry) = orchestrator_with_budget(Arc::clone(&controller), budget.clone());
+        let BridgeOpenOutcome::Attached(mut bridge) = relay
+            .activate_bridge(activation_request(BrokerMappingExpectationV1::Absent))
+            .await
+            .unwrap()
+        else {
+            panic!("durable generation must attach")
+        };
+        let mut worker = relay.register_worker(registration(), auth()).await.unwrap();
+        drop(bridge.outbound().recv().await.unwrap());
+        drop(worker.outbound().recv().await.unwrap());
+        let queued = AcpMessageV1::new(json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"queued": true}
+        }))
+        .unwrap();
+        assert_eq!(
+            relay.route_acp(bridge.connection(), queued).await.unwrap(),
+            RelayAcpDeliveryOutcome::Delivered
+        );
+        assert!(budget.available_bytes() < limit);
+
+        let gate = Gate::new();
+        controller.set_loss_gate(gate.clone());
+        let loss = tokio::spawn({
+            let relay = relay.clone();
+            async move { relay.connection_lost(worker).await }
+        });
+        gate.started.acquire().await.unwrap().forget();
+
+        assert_eq!(budget.available_bytes(), limit);
+        let late = AcpMessageV1::new(json!({"jsonrpc": "2.0"})).unwrap();
+        assert!(matches!(
+            relay.route_acp(bridge.connection(), late).await,
+            Err(RelayDeliveryError::Rendezvous(
+                RendezvousRouteError::Quiescing
+            ))
+        ));
+        gate.release.add_permits(1);
+        assert_eq!(
+            loss.await.unwrap().unwrap(),
+            RelayLossOutcome::Contained(OrphanContainmentOutcome::ContainmentAccepted)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_explicit_loss_retains_its_containment_ticket() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let (relay, registry) = orchestrator(Arc::clone(&controller));
+        let BridgeOpenOutcome::Attached(mut bridge) = relay
+            .activate_bridge(activation_request(BrokerMappingExpectationV1::Absent))
+            .await
+            .unwrap()
+        else {
+            panic!("durable generation must attach")
+        };
+        let mut worker = relay.register_worker(registration(), auth()).await.unwrap();
+        drop(bridge.outbound().recv().await.unwrap());
+        drop(worker.outbound().recv().await.unwrap());
+        let gate = Gate::new();
+        controller.set_loss_gate(gate.clone());
+        let loss = tokio::spawn({
+            let relay = relay.clone();
+            async move { relay.connection_lost(worker).await }
+        });
+        gate.started.acquire().await.unwrap().forget();
+
+        loss.abort();
+        assert!(loss.await.unwrap_err().is_cancelled());
+        assert_eq!(registry.pending_containments().len(), 1);
+        assert!(matches!(
+            relay
+                .route_acp(
+                    bridge.connection(),
+                    AcpMessageV1::new(json!({"jsonrpc": "2.0"})).unwrap(),
+                )
+                .await,
+            Err(RelayDeliveryError::Rendezvous(
+                RendezvousRouteError::Quiescing
+            ))
+        ));
+
+        gate.release.add_permits(1);
+        let report = relay.retry_pending_containments().await;
+        assert_eq!(report.completed(), 1);
+        assert!(report.failures().is_empty());
+        assert!(registry.pending_containments().is_empty());
     }
 
     #[tokio::test]

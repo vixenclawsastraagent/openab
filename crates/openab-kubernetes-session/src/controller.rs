@@ -10,6 +10,7 @@ mod relay;
 mod release;
 mod rendezvous;
 mod service;
+mod worker_websocket;
 
 pub use activation::{
     ActivationCoordinator, ActivationError, ActivationPreparation, ActivationTiming,
@@ -65,3 +66,4 @@ pub use service::{
     ControllerService, ControllerServiceConfigError, ControllerServiceError,
     LifecycleServiceOutcome,
 };
+pub use worker_websocket::{serve_worker_websocket, worker_websocket_config, WorkerWebSocketError};
