@@ -10,9 +10,10 @@ use openab_kubernetes_session::controller::{
     ActivationError, ActivityError, BootstrapPresence, CleanupProgress, ConsumedBootstrap,
     ControllerCoordinators, ControllerService, ControllerServiceConfigError,
     ControllerServiceError, GenerationProvisioner, GenerationProvisionerError, LifecycleError,
-    LifecycleProvisioner, LifecycleServiceOutcome, ObservedWorker, RegistrationError,
-    RegistrationProvisioner, RegistrationProvisionerError, ReleaseCleanupProgress, ReleaseError,
-    ReleaseProvisioner, ReleasedChildrenAbsentProof, VerifiedBootstrap, WorkerBootstrapAuth,
+    LifecycleProvisioner, LifecycleServiceOutcome, ObservedWorker, OrphanAuthority,
+    OrphanContainmentOutcome, RegistrationError, RegistrationProvisioner,
+    RegistrationProvisionerError, ReleaseCleanupProgress, ReleaseError, ReleaseProvisioner,
+    ReleasedChildrenAbsentProof, VerifiedBootstrap, WorkerBootstrapAuth,
 };
 use openab_kubernetes_session::identity::{ResourceNames, ScopeId, SessionId};
 use openab_kubernetes_session::profile_config::ControllerPolicy;
@@ -20,7 +21,7 @@ use openab_kubernetes_session::resources::{
     EgressPort, EgressProtocol, MvpWorkerProfile, PersistentWorkspace, PvcAccessMode,
     RunAsIdentity, TrustedEgressRule, WorkerResources,
 };
-use openab_kubernetes_session::state::{ProfileRef, SessionAnchorV1, SessionPhase};
+use openab_kubernetes_session::state::{Fence, ProfileRef, SessionAnchorV1, SessionPhase};
 use openab_kubernetes_session::store::{ConfigMapAnchorStore, StoredAnchor};
 use openab_kubernetes_session::wire::{
     ActivationRequestV1, BrokerMappingExpectationV1, FatalCode, LifecycleRequestV1,
@@ -662,6 +663,135 @@ async fn lifecycle_maps_suspend_and_pending_release() {
         LifecycleServiceOutcome::ReleasePending
     );
     assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn trusted_orphan_signal_durably_contains_the_exact_worker() {
+    let ready = ready_anchor("discord:orphaned-worker", "2026-08-02");
+    let exact_binding = binding(&ready);
+    let authority = OrphanAuthority::new(exact_binding, POD_UID).unwrap();
+    let (store, handle) = store_and_handle();
+    let root = coordinators(
+        store,
+        [profile("2026-08-02")],
+        Arc::new(FakeProvisioner::default()),
+    );
+    let service = Arc::new(ControllerService::new(root, [profile_ref("2026-08-02")]).unwrap());
+    let first_service = Arc::clone(&service);
+    let first_authority = authority.clone();
+    let task = tokio::spawn(async move { first_service.connection_lost(&first_authority).await });
+    let mut handle = std::pin::pin!(handle);
+
+    let (get, send) = handle.next_request().await.unwrap();
+    assert_eq!(get.method(), Method::GET);
+    send.send_response(json_response(
+        StatusCode::OK,
+        config_map(&ready, "anchor-rv-1"),
+    ));
+    let (replace, send) = handle.next_request().await.unwrap();
+    assert_eq!(replace.method(), Method::PUT);
+    let mut body = request_body(replace).await;
+    let contained: SessionAnchorV1 =
+        serde_json::from_str(body["data"]["anchor.json"].as_str().unwrap()).unwrap();
+    assert_eq!(contained.phase(), SessionPhase::Blocked);
+    assert_eq!(contained.pod_uid(), Some(POD_UID));
+    body["metadata"]["resourceVersion"] = json!("anchor-rv-2");
+    send.send_response(json_response(StatusCode::OK, body));
+
+    assert_eq!(
+        task.await.unwrap().unwrap(),
+        OrphanContainmentOutcome::ContainmentAccepted
+    );
+
+    let retry_service = Arc::clone(&service);
+    let retry = tokio::spawn(async move { retry_service.connection_lost(&authority).await });
+    let (get, send) = handle.next_request().await.unwrap();
+    assert_eq!(get.method(), Method::GET);
+    send.send_response(json_response(
+        StatusCode::OK,
+        config_map(&contained, "anchor-rv-2"),
+    ));
+    assert_eq!(
+        retry.await.unwrap().unwrap(),
+        OrphanContainmentOutcome::AlreadyQuiescing
+    );
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn stale_orphan_authority_cannot_contain_the_current_generation() {
+    let ready = ready_anchor("discord:stale-orphan", "2026-08-02");
+    let stale_binding = SessionBinding::new(
+        ready.scope_id(),
+        ready.session_id(),
+        Fence::new(ready.fence().generation() + 1, Uuid::from_u128(0x999)).unwrap(),
+        ready.incarnation_id(),
+    )
+    .unwrap();
+    let stale = OrphanAuthority::new(stale_binding, POD_UID).unwrap();
+    let wrong_pod = OrphanAuthority::new(binding(&ready), "replacement-pod-uid").unwrap();
+
+    for authority in [stale, wrong_pod] {
+        let (store, handle) = store_and_handle();
+        let root = coordinators(
+            store,
+            [profile("2026-08-02")],
+            Arc::new(FakeProvisioner::default()),
+        );
+        let service = ControllerService::new(root, [profile_ref("2026-08-02")]).unwrap();
+        let task = tokio::spawn(async move { service.connection_lost(&authority).await });
+        let mut handle = std::pin::pin!(handle);
+
+        let (get, send) = handle.next_request().await.unwrap();
+        assert_eq!(get.method(), Method::GET);
+        send.send_response(json_response(
+            StatusCode::OK,
+            config_map(&ready, "anchor-rv-1"),
+        ));
+        assert_eq!(
+            task.await.unwrap().unwrap(),
+            OrphanContainmentOutcome::StaleObservation
+        );
+        assert_no_request(&mut handle).await;
+    }
+}
+
+#[tokio::test]
+async fn wrong_scope_orphan_authority_fails_before_kubernetes() {
+    let ready = ready_anchor("discord:wrong-scope-orphan", "2026-08-02");
+    let wrong_scope = SessionBinding::new(
+        ScopeId::derive("another-private-scope"),
+        ready.session_id(),
+        ready.fence().clone(),
+        ready.incarnation_id(),
+    )
+    .unwrap();
+    let authority = OrphanAuthority::new(wrong_scope, POD_UID).unwrap();
+    let (store, handle) = store_and_handle();
+    let root = coordinators(
+        store,
+        [profile("2026-08-02")],
+        Arc::new(FakeProvisioner::default()),
+    );
+    let service = ControllerService::new(root, [profile_ref("2026-08-02")]).unwrap();
+    let task = tokio::spawn(async move { service.connection_lost(&authority).await });
+    let mut handle = std::pin::pin!(handle);
+
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(ControllerServiceError::Lifecycle(
+            LifecycleError::ScopeMismatch
+        ))
+    ));
+    assert_no_request(&mut handle).await;
+}
+
+#[test]
+fn orphan_authority_rejects_malformed_pod_uids() {
+    let ready = ready_anchor("discord:invalid-orphan-authority", "2026-08-02");
+    for pod_uid in ["", "bad/pod", "bad\\pod", "bad\npod"] {
+        assert!(OrphanAuthority::new(binding(&ready), pod_uid).is_err());
+    }
 }
 
 #[test]

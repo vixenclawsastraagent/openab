@@ -164,6 +164,61 @@ pub struct LifecycleDeadlineReport {
     results: Vec<LifecycleDeadlineResult>,
 }
 
+/// Stable outcome from one startup orphan-containment candidate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartupOrphanOutcome {
+    /// The scheduled phase cannot own a registered live relay lane.
+    Noop,
+    /// A fresh active anchor is durably `Blocked` for safe recycling.
+    ContainmentAccepted,
+    /// The active inventory observation became stale before containment.
+    StaleObservation,
+}
+
+/// One deterministic per-session entry in a startup orphan report.
+#[derive(Debug)]
+pub struct StartupOrphanResult {
+    session_id: SessionId,
+    scheduled_phase: SessionPhase,
+    result: Result<StartupOrphanOutcome, LifecycleError>,
+}
+
+impl StartupOrphanResult {
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub fn scheduled_phase(&self) -> SessionPhase {
+        self.scheduled_phase
+    }
+
+    pub fn outcome(&self) -> Option<&StartupOrphanOutcome> {
+        self.result.as_ref().ok()
+    }
+
+    pub fn error(&self) -> Option<&LifecycleError> {
+        self.result.as_ref().err()
+    }
+}
+
+/// Complete result of one sequential startup orphan-containment pass.
+#[derive(Debug, Default)]
+pub struct StartupOrphanReport {
+    results: Vec<StartupOrphanResult>,
+}
+
+impl StartupOrphanReport {
+    pub fn results(&self) -> &[StartupOrphanResult] {
+        &self.results
+    }
+
+    /// Whether every scheduled active candidate was either durably contained
+    /// or proven stale by a fresh locked observation.
+    pub fn containment_complete(&self) -> bool {
+        self.results.iter().all(|result| result.result.is_ok())
+    }
+}
+
 impl LifecycleDeadlineReport {
     pub fn results(&self) -> &[LifecycleDeadlineResult] {
         &self.results
@@ -428,6 +483,48 @@ impl ControllerCoordinators {
             });
         }
         Ok(LifecycleDeadlineReport { results })
+    }
+
+    /// Contain every worker that could have been registered before this
+    /// controller process started.
+    ///
+    /// This must run while relay traffic admission and readiness are closed:
+    /// process restart discards all authenticated in-memory lanes, and a
+    /// consumed bootstrap credential cannot authorize transparent worker
+    /// reconnection. Each active inventory candidate is re-read under the
+    /// shared session lock before its non-destructive intent is persisted.
+    /// Per-session failures remain visible in the report and must keep the
+    /// executable from declaring startup recovery complete.
+    pub async fn quiesce_startup_orphans(&self) -> Result<StartupOrphanReport, AnchorStoreError> {
+        let inventory = self.store.list_inventory().await?;
+        let mut results = Vec::with_capacity(inventory.len());
+        for scheduled in inventory {
+            let session_id = scheduled.state().session_id();
+            let scheduled_phase = scheduled.state().phase();
+            let result = if matches!(
+                scheduled_phase,
+                SessionPhase::Provisioning | SessionPhase::Ready | SessionPhase::Busy
+            ) {
+                self.lifecycle
+                    .accept_startup_orphan(session_id)
+                    .await
+                    .map(|accepted| {
+                        if accepted {
+                            StartupOrphanOutcome::ContainmentAccepted
+                        } else {
+                            StartupOrphanOutcome::StaleObservation
+                        }
+                    })
+            } else {
+                Ok(StartupOrphanOutcome::Noop)
+            };
+            results.push(StartupOrphanResult {
+                session_id,
+                scheduled_phase,
+                result,
+            });
+        }
+        Ok(StartupOrphanReport { results })
     }
 
     async fn reconcile_candidate(

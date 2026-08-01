@@ -2,8 +2,9 @@ use super::composition::{ActivationDispatchError, RegistrationDispatchError};
 use super::{
     ActivationError, ActivationPreparation, ActivationTiming, ActivityError, ActivityEvent,
     ActivityOutcome, ActivityTurnId, ControllerCoordinators, DurableIntentReport,
-    GenerationProvisionerError, LifecycleDeadlineReport, LifecycleError, RegisteredWorker,
-    RegistrationError, ReleaseError, ReleaseOutcome, WorkerBootstrapAuth,
+    GenerationProvisionerError, LifecycleDeadlineReport, LifecycleError, OrphanAuthority,
+    OrphanContainmentOutcome, RegisteredWorker, RegistrationError, ReleaseError, ReleaseOutcome,
+    StartupOrphanReport, WorkerBootstrapAuth,
 };
 use crate::bridge::{LifecycleKind, SessionBinding};
 use crate::profile_config::ControllerPolicy;
@@ -207,6 +208,32 @@ impl ControllerService {
             .record(binding, turn_id, event)
             .await
             .map_err(ControllerServiceError::Activity)
+    }
+
+    /// Persist non-destructive containment after an authenticated broker or
+    /// worker relay lane is lost. Delayed callbacks from older generations are
+    /// returned as benign stale observations by the lifecycle coordinator.
+    pub async fn connection_lost(
+        &self,
+        authority: &OrphanAuthority,
+    ) -> Result<OrphanContainmentOutcome, ControllerServiceError> {
+        self.coordinators
+            .lifecycle()
+            .accept_connection_loss(authority)
+            .await
+            .map_err(ControllerServiceError::Lifecycle)
+    }
+
+    /// Quiesce active generations left without authenticated in-memory lanes
+    /// by a controller restart. The executable must call this before opening
+    /// relay traffic or declaring readiness.
+    pub async fn quiesce_startup_orphans(
+        &self,
+    ) -> Result<StartupOrphanReport, ControllerServiceError> {
+        self.coordinators
+            .quiesce_startup_orphans()
+            .await
+            .map_err(ControllerServiceError::Store)
     }
 
     /// Continue only intents already made durable before this pass.

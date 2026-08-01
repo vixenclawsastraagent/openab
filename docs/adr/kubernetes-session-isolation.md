@@ -353,6 +353,44 @@ Only an explicit reset starts fenced, controller-managed destructive cleanup.
 Broker shutdown follows the non-destructive path. Bridge or broker failure
 leaves the session reconcilable; it never implies destructive release.
 
+### 6.1 Unexpected connection loss and controller restart
+
+Unexpected loss is not treated as a graceful close. Once the trusted relay
+decides that an authenticated broker or worker lane is lost, it stops routing
+that generation and submits the exact session binding and observed Pod UID for
+durable containment. Under the shared session lock, the controller performs a
+fresh anchor read and compare-and-swap transition from `Provisioning`, `Ready`,
+or `Busy` to the recovery-only `Blocked` phase. Entering `Blocked` clears any
+in-flight prompt-turn identifier. It never starts destructive release and
+retains the lifecycle anchor and private PVC.
+
+A delayed callback whose scope, session, generation, attempt, incarnation, or
+Pod UID no longer matches is a stale observation and cannot affect the current
+generation. The in-memory rendezvous registry must additionally assign a
+unique connection ID to each installed lane. When a matching lane closes, the
+registry atomically changes `Active(connection ID)` to `Quiescing(connection
+ID)` before calling the controller; it must not briefly remove the slot and
+allow another socket with the same binding to install. A transient persistence
+failure keeps the slot quiescing and fail closed until retry succeeds.
+
+Controller restart discards every process-local authenticated lane. Before it
+admits relay traffic or reports readiness, the controller therefore lists all
+anchors and schedules every observed `Provisioning`, `Ready`, and `Busy`
+session for the same fresh-read `Blocked` transition. The LIST is only a hint;
+each candidate is locked and re-read before mutation. LIST, GET, or CAS failure
+keeps startup containment incomplete and readiness false. Once all candidates
+are durably contained or freshly proven to have moved to a safe phase, normal
+reconciliation may clean `Blocked` and `Suspending` compute and continue any
+previously authorized `Deleting` intent. Readiness need not wait for Pod
+deletion, because the old generation is already durably barred from routing.
+
+The MVP deliberately provides no transparent same-generation reconnect. After
+compute absence is proven, a newly spawned bridge uses a fresh attempt ID to
+advance the clean `Blocked` anchor to the next generation and loads the
+retained ACP session from its private PVC. An interrupted prompt is not
+automatically replayed: its worktree may contain partial private changes, so a
+human or higher-level workflow decides whether to retry.
+
 `Released` proves that the Kubernetes PVC API object is absent; it does not by
 itself prove that a backing PersistentVolume or cloud disk has been physically
 destroyed. Whether and when backing storage is removed depends on the PV or

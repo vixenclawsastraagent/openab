@@ -24,13 +24,17 @@ pub use cleanup::{
 pub use composition::{
     ControllerCoordinatorConfigError, ControllerCoordinators, DurableIntentError,
     DurableIntentOutcome, DurableIntentReport, DurableIntentResult, LifecycleDeadlineOutcome,
-    LifecycleDeadlineReport, LifecycleDeadlineResult,
+    LifecycleDeadlineReport, LifecycleDeadlineResult, StartupOrphanOutcome, StartupOrphanReport,
+    StartupOrphanResult,
 };
 pub use generation::{
     AllChildrenAbsentProof, ComputeAbsentProof, KubernetesGenerationProvisioner,
     ReleasedChildrenAbsentProof,
 };
-pub use lifecycle::{LifecycleCoordinator, LifecycleError, LifecycleReconcileOutcome};
+pub use lifecycle::{
+    LifecycleCoordinator, LifecycleError, LifecycleReconcileOutcome, OrphanAuthority,
+    OrphanAuthorityError, OrphanContainmentOutcome,
+};
 pub use locks::{SessionLockGuard, SessionLocks};
 pub use registration::{
     BootstrapPresence, ConsumedBootstrap, RegisteredWorker, RegistrationCoordinator,

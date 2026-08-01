@@ -19,6 +19,58 @@ pub enum LifecycleReconcileOutcome {
     Blocked,
 }
 
+/// Exact generation observation retained by the trusted rendezvous registry.
+///
+/// Construction does not grant authority. The lifecycle coordinator still
+/// compares every field with a fresh durable anchor under the session lock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrphanAuthority {
+    binding: SessionBinding,
+    pod_uid: String,
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum OrphanAuthorityError {
+    #[error("orphan authority Pod UID must be a non-empty printable identifier")]
+    InvalidPodUid,
+}
+
+impl OrphanAuthority {
+    pub fn new(
+        binding: SessionBinding,
+        pod_uid: impl Into<String>,
+    ) -> Result<Self, OrphanAuthorityError> {
+        let pod_uid = pod_uid.into();
+        if !(1..=256).contains(&pod_uid.len())
+            || !pod_uid
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic() && byte != b'/' && byte != b'\\')
+        {
+            return Err(OrphanAuthorityError::InvalidPodUid);
+        }
+        Ok(Self { binding, pod_uid })
+    }
+
+    pub fn binding(&self) -> &SessionBinding {
+        &self.binding
+    }
+
+    pub fn pod_uid(&self) -> &str {
+        &self.pod_uid
+    }
+}
+
+/// Result of containing an authenticated relay lane after connection loss.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrphanContainmentOutcome {
+    /// The exact active generation is durably blocked for safe recycling.
+    ContainmentAccepted,
+    /// The exact generation was already in a contained lifecycle phase.
+    AlreadyQuiescing,
+    /// The callback no longer identifies the current durable generation.
+    StaleObservation,
+}
+
 /// Sanitized lifecycle failures. Nested sources are retained for trusted
 /// controller logs, while each transport-facing display string is static.
 #[derive(Debug, Error)]
@@ -97,10 +149,7 @@ impl LifecycleCoordinator {
 
         match observed.state().phase() {
             SessionPhase::Ready | SessionPhase::Busy => {
-                let mut next = observed.state().clone();
-                next.transition(binding.fence(), SessionPhase::Suspending)
-                    .map_err(|_| LifecycleError::InvalidAnchor)?;
-                self.store.replace(&observed, &next).await?;
+                self.persist_suspending(observed).await?;
                 Ok(())
             }
             SessionPhase::Suspending | SessionPhase::Suspended => Ok(()),
@@ -108,6 +157,75 @@ impl LifecycleCoordinator {
                 Err(LifecycleError::PhaseRejected)
             }
         }
+    }
+
+    /// Contain an exact authenticated generation after its broker or worker
+    /// relay lane is lost.
+    ///
+    /// A delayed callback from an older generation is a benign stale
+    /// observation. It must never contain a replacement generation. Before
+    /// invoking this method, the rendezvous registry must atomically replace
+    /// its matching active connection ID with a quiescing marker and reject a
+    /// same-binding replacement. Once accepted, the generation can resume
+    /// only through a new fenced activation.
+    pub async fn accept_connection_loss(
+        &self,
+        authority: &OrphanAuthority,
+    ) -> Result<OrphanContainmentOutcome, LifecycleError> {
+        let binding = authority.binding();
+        if binding.scope_id() != self.store.scope_id() {
+            return Err(LifecycleError::ScopeMismatch);
+        }
+
+        let _guard = self.locks.lock(binding.session_id()).await;
+        let Some(observed) = self.store.get(binding.session_id()).await? else {
+            return Ok(OrphanContainmentOutcome::StaleObservation);
+        };
+        if validate_binding(&observed, binding, self.store.scope_id()).is_err()
+            || observed.state().pod_uid() != Some(authority.pod_uid())
+        {
+            return Ok(OrphanContainmentOutcome::StaleObservation);
+        }
+
+        match observed.state().phase() {
+            SessionPhase::Provisioning | SessionPhase::Ready | SessionPhase::Busy => {
+                self.persist_phase(observed, SessionPhase::Blocked).await?;
+                Ok(OrphanContainmentOutcome::ContainmentAccepted)
+            }
+            SessionPhase::Suspending
+            | SessionPhase::Suspended
+            | SessionPhase::Deleting
+            | SessionPhase::Blocked => Ok(OrphanContainmentOutcome::AlreadyQuiescing),
+        }
+    }
+
+    /// Durably contain one startup inventory candidate while traffic
+    /// admission is still closed.
+    ///
+    /// The caller's inventory is only a scheduling hint. This method owns the
+    /// shared session lock and fresh read, and returns `false` when the active
+    /// observation disappeared or changed phase before the CAS.
+    pub(crate) async fn accept_startup_orphan(
+        &self,
+        session_id: SessionId,
+    ) -> Result<bool, LifecycleError> {
+        let _guard = self.locks.lock(session_id).await;
+        let Some(observed) = self.store.get(session_id).await? else {
+            return Ok(false);
+        };
+        if observed.state().scope_id() != self.store.scope_id()
+            || observed.state().session_id() != session_id
+        {
+            return Err(LifecycleError::StaleBinding);
+        }
+        if !matches!(
+            observed.state().phase(),
+            SessionPhase::Provisioning | SessionPhase::Ready | SessionPhase::Busy
+        ) {
+            return Ok(false);
+        }
+        self.persist_phase(observed, SessionPhase::Blocked).await?;
+        Ok(true)
     }
 
     /// Persist an automatic compute suspension only when a fresh controller
@@ -234,6 +352,22 @@ impl LifecycleCoordinator {
             }
             _ => Err(LifecycleError::PhaseRejected),
         }
+    }
+
+    async fn persist_suspending(&self, observed: StoredAnchor) -> Result<(), LifecycleError> {
+        self.persist_phase(observed, SessionPhase::Suspending).await
+    }
+
+    async fn persist_phase(
+        &self,
+        observed: StoredAnchor,
+        phase: SessionPhase,
+    ) -> Result<(), LifecycleError> {
+        let mut next = observed.state().clone();
+        next.transition(observed.state().fence(), phase)
+            .map_err(|_| LifecycleError::InvalidAnchor)?;
+        self.store.replace(&observed, &next).await?;
+        Ok(())
     }
 }
 

@@ -13,7 +13,8 @@ use openab_kubernetes_session::controller::{
     GenerationProvisionerError, LifecycleDeadlineOutcome, LifecycleDeadlineReport, LifecycleError,
     LifecycleProvisioner, LifecycleReconcileOutcome, ObservedWorker, RegistrationProvisioner,
     RegistrationProvisionerError, ReleaseCleanupProgress, ReleaseOutcome, ReleaseProvisioner,
-    ReleasedChildrenAbsentProof, VerifiedBootstrap, WorkerBootstrapAuth,
+    ReleasedChildrenAbsentProof, StartupOrphanOutcome, StartupOrphanReport, VerifiedBootstrap,
+    WorkerBootstrapAuth,
 };
 use openab_kubernetes_session::identity::{ResourceNames, ScopeId, SessionId};
 use openab_kubernetes_session::profile_config::ControllerPolicy;
@@ -372,6 +373,8 @@ fn assert_public_report_type(_report: &DurableIntentReport) {}
 
 fn assert_public_deadline_report_type(_report: &LifecycleDeadlineReport) {}
 
+fn assert_public_startup_orphan_report_type(_report: &StartupOrphanReport) {}
+
 #[tokio::test]
 async fn composition_root_indexes_exact_profile_revisions_and_rejects_duplicates() {
     let (store, _handle) = store_and_handle();
@@ -431,6 +434,210 @@ async fn stable_live_phases_are_noops_without_fresh_gets_or_provisioner_calls() 
         .results()
         .iter()
         .all(|result| matches!(result.outcome(), Some(DurableIntentOutcome::Noop))));
+    assert_eq!(fake.calls(), (0, 0, 0, 0));
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn startup_contains_every_unrecoverable_live_generation_without_touching_retained_state() {
+    let ready = anchor_in_phase(
+        session_id("discord:startup-ready-orphan"),
+        SessionPhase::Ready,
+        "2026-08-01",
+    );
+    let mut busy = anchor_in_phase(
+        session_id("discord:startup-busy-orphan"),
+        SessionPhase::Busy,
+        "2026-08-01",
+    );
+    let mut busy_value = serde_json::to_value(&busy).unwrap();
+    busy_value["lastPromptTurnId"] = json!(Uuid::from_u128(0x500));
+    busy = serde_json::from_value(busy_value).unwrap();
+    let suspended = anchor_in_phase(
+        session_id("discord:startup-suspended"),
+        SessionPhase::Suspended,
+        "2026-08-01",
+    );
+    let provisioning = base_anchor(
+        session_id("discord:startup-provisioning-orphan"),
+        "2026-08-01",
+    );
+    let anchors = vec![ready, busy, provisioning, suspended];
+    let (store, handle) = store_and_handle();
+    let fake = Arc::new(FakeProvisioner::default());
+    let root = coordinators(store, [profile("2026-08-01")], fake.clone()).unwrap();
+    let task = tokio::spawn(async move { root.quiesce_startup_orphans().await });
+    let mut handle = std::pin::pin!(handle);
+
+    let (list, send) = handle.next_request().await.unwrap();
+    assert_eq!(list.method(), Method::GET);
+    send.send_response(json_response(StatusCode::OK, config_map_list(&anchors)));
+
+    for _ in 0..3 {
+        let (get, send) = handle.next_request().await.unwrap();
+        assert_eq!(get.method(), Method::GET);
+        let requested_name = get.uri().path().rsplit('/').next().unwrap();
+        let anchor = anchors
+            .iter()
+            .find(|anchor| ResourceNames::new(anchor.session_id()).anchor() == requested_name)
+            .unwrap();
+        assert!(matches!(
+            anchor.phase(),
+            SessionPhase::Provisioning | SessionPhase::Ready | SessionPhase::Busy
+        ));
+        send.send_response(json_response(
+            StatusCode::OK,
+            config_map(anchor, "rv-fresh"),
+        ));
+
+        let (replace, send) = handle.next_request().await.unwrap();
+        assert_eq!(replace.method(), Method::PUT);
+        let mut body = request_body(replace).await;
+        let next: SessionAnchorV1 =
+            serde_json::from_str(body["data"]["anchor.json"].as_str().unwrap()).unwrap();
+        assert_eq!(next.phase(), SessionPhase::Blocked);
+        assert_eq!(next.pod_uid(), anchor.pod_uid());
+        assert_eq!(next.last_prompt_turn_id(), None);
+        body["metadata"]["resourceVersion"] = json!("rv-suspending");
+        send.send_response(json_response(StatusCode::OK, body));
+    }
+
+    let report = task.await.unwrap().unwrap();
+    assert_public_startup_orphan_report_type(&report);
+    assert_eq!(report.results().len(), 4);
+    assert!(report.containment_complete());
+    for result in report.results() {
+        match result.scheduled_phase() {
+            SessionPhase::Provisioning | SessionPhase::Ready | SessionPhase::Busy => {
+                assert!(matches!(
+                    result.outcome(),
+                    Some(StartupOrphanOutcome::ContainmentAccepted)
+                ))
+            }
+            SessionPhase::Suspended => {
+                assert!(matches!(result.outcome(), Some(StartupOrphanOutcome::Noop)))
+            }
+            phase => panic!("unexpected scheduled phase: {phase:?}"),
+        }
+    }
+    assert_eq!(fake.calls(), (0, 0, 0, 0));
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn startup_orphan_inventory_is_only_a_hint_and_fresh_containment_is_required() {
+    let scheduled = anchor_in_phase(
+        session_id("discord:startup-phase-drift"),
+        SessionPhase::Ready,
+        "2026-08-01",
+    );
+    let fresh = anchor_in_phase(
+        scheduled.session_id(),
+        SessionPhase::Suspended,
+        "2026-08-01",
+    );
+    let (store, handle) = store_and_handle();
+    let fake = Arc::new(FakeProvisioner::default());
+    let root = coordinators(store, [profile("2026-08-01")], fake.clone()).unwrap();
+    let task = tokio::spawn(async move { root.quiesce_startup_orphans().await });
+    let mut handle = std::pin::pin!(handle);
+
+    let (_list, send) = handle.next_request().await.unwrap();
+    send.send_response(json_response(
+        StatusCode::OK,
+        config_map_list(std::slice::from_ref(&scheduled)),
+    ));
+    let (get, send) = handle.next_request().await.unwrap();
+    assert_eq!(get.method(), Method::GET);
+    send.send_response(json_response(
+        StatusCode::OK,
+        config_map(&fresh, "rv-fresh"),
+    ));
+
+    let report = task.await.unwrap().unwrap();
+    assert!(report.containment_complete());
+    assert!(matches!(
+        report.results()[0].outcome(),
+        Some(StartupOrphanOutcome::StaleObservation)
+    ));
+    assert_eq!(fake.calls(), (0, 0, 0, 0));
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn startup_orphan_cas_failure_keeps_containment_incomplete() {
+    let active = anchor_in_phase(
+        session_id("discord:startup-cas-failure"),
+        SessionPhase::Busy,
+        "2026-08-01",
+    );
+    let (store, handle) = store_and_handle();
+    let fake = Arc::new(FakeProvisioner::default());
+    let root = coordinators(store, [profile("2026-08-01")], fake.clone()).unwrap();
+    let task = tokio::spawn(async move { root.quiesce_startup_orphans().await });
+    let mut handle = std::pin::pin!(handle);
+
+    let (_list, send) = handle.next_request().await.unwrap();
+    send.send_response(json_response(
+        StatusCode::OK,
+        config_map_list(std::slice::from_ref(&active)),
+    ));
+    let (_get, send) = handle.next_request().await.unwrap();
+    send.send_response(json_response(
+        StatusCode::OK,
+        config_map(&active, "rv-fresh"),
+    ));
+    let (replace, send) = handle.next_request().await.unwrap();
+    assert_eq!(replace.method(), Method::PUT);
+    send.send_response(json_response(
+        StatusCode::CONFLICT,
+        json!({
+            "apiVersion": "v1",
+            "kind": "Status",
+            "status": "Failure",
+            "reason": "Conflict",
+            "code": 409
+        }),
+    ));
+
+    let report = task.await.unwrap().unwrap();
+    assert!(!report.containment_complete());
+    assert!(matches!(
+        report.results()[0].error(),
+        Some(LifecycleError::Store(_))
+    ));
+    assert_eq!(fake.calls(), (0, 0, 0, 0));
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn startup_orphan_inventory_failure_never_claims_containment() {
+    let (store, handle) = store_and_handle();
+    let fake = Arc::new(FakeProvisioner::default());
+    let root = coordinators(store, [profile("2026-08-01")], fake.clone()).unwrap();
+    let task = tokio::spawn(async move { root.quiesce_startup_orphans().await });
+    let mut handle = std::pin::pin!(handle);
+
+    let (list, send) = handle.next_request().await.unwrap();
+    assert_eq!(list.method(), Method::GET);
+    send.send_response(json_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        json!({
+            "apiVersion": "v1",
+            "kind": "Status",
+            "status": "Failure",
+            "reason": "InternalError",
+            "code": 500
+        }),
+    ));
+
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(AnchorStoreError::Kubernetes {
+            operation: StoreOperation::List,
+            ..
+        })
+    ));
     assert_eq!(fake.calls(), (0, 0, 0, 0));
     assert_no_request(&mut handle).await;
 }
