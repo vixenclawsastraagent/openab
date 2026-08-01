@@ -54,8 +54,9 @@ pub use rendezvous::{
     AcpRouteOutcome, PendingActivation, RelayBackpressure, RelayByteBudget, RelayByteBudgetError,
     RelayConnection, RelayConnectionId, RelayConnectionLoss, RelayContainmentCompletion,
     RelayContainmentTicket, RelayInstallation, RelayLane, RelayOutboundFrame, RelayOutboundItem,
-    RelayPairingOutcome, RendezvousFatalError, RendezvousHealth, RendezvousInstallError,
-    RendezvousLifecycleError, RendezvousRegistry, RendezvousRouteError, MIN_RELAY_BYTE_BUDGET,
+    RelayOutboundWriteGuard, RelayPairingOutcome, RendezvousFatalError, RendezvousHealth,
+    RendezvousInstallError, RendezvousLifecycleError, RendezvousRegistry, RendezvousRouteError,
+    MIN_RELAY_BYTE_BUDGET,
 };
 pub(crate) use rendezvous::{
     LifecycleAcquireOutcome, LifecycleAdmission, LifecycleDeliveryOutcome, RelayLifecycleTerminal,

@@ -362,8 +362,9 @@ impl<M> std::fmt::Debug for RelayOutboundItem<M> {
 
 /// Encoded outbound bytes that retain their process-wide queue lease.
 ///
-/// A transport writer borrows [`Self::as_bytes`] for the actual write and
-/// drops this value only after the write completes or is cancelled.
+/// A transport writer either borrows [`Self::as_bytes`] for the actual write,
+/// or consumes this value with [`Self::into_write_parts`] when its transport
+/// requires ownership of the payload.
 #[must_use = "hold the encoded frame until the transport write completes"]
 pub struct RelayOutboundFrame {
     bytes: Vec<u8>,
@@ -376,14 +377,35 @@ impl RelayOutboundFrame {
         &self.bytes
     }
 
+    /// Transfer the encoded payload without copying it.
+    ///
+    /// The returned guard retains both the process-wide byte lease and any
+    /// lifecycle delivery reporter. The writer must keep it alive until the
+    /// write future completes, then call [`RelayOutboundWriteGuard::mark_written`]
+    /// only after a successful write. Dropping the guard keeps lifecycle
+    /// delivery fail closed.
+    pub fn into_write_parts(self) -> (Vec<u8>, RelayOutboundWriteGuard) {
+        let Self {
+            bytes,
+            _byte_budget,
+            write_reporter,
+        } = self;
+        (
+            bytes,
+            RelayOutboundWriteGuard {
+                _byte_budget,
+                write_reporter,
+            },
+        )
+    }
+
     /// Report that the exact encoded frame reached the transport successfully.
     ///
     /// Lifecycle completion remains fail closed unless the writer consumes the
     /// frame through this method after its write future returns success.
-    pub fn mark_written(mut self) {
-        if let Some(reporter) = self.write_reporter.as_mut() {
-            reporter.report_written();
-        }
+    pub fn mark_written(self) {
+        let (_, write_guard) = self.into_write_parts();
+        write_guard.mark_written();
     }
 }
 
@@ -392,6 +414,34 @@ impl std::fmt::Debug for RelayOutboundFrame {
         formatter
             .debug_struct("RelayOutboundFrame")
             .field("bytes", &self.bytes.len())
+            .field("charged_bytes", &self._byte_budget.bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Completion guard for one owned outbound transport payload.
+///
+/// This value is deliberately not cloneable: there is exactly one byte-budget
+/// lease and at most one lifecycle completion report for each encoded frame.
+#[must_use = "hold the write guard until the transport write completes"]
+pub struct RelayOutboundWriteGuard {
+    _byte_budget: RelayByteLease,
+    write_reporter: Option<RelayWriteReporter>,
+}
+
+impl RelayOutboundWriteGuard {
+    /// Report that the exact payload reached the transport successfully.
+    pub fn mark_written(mut self) {
+        if let Some(reporter) = self.write_reporter.as_mut() {
+            reporter.report_written();
+        }
+    }
+}
+
+impl std::fmt::Debug for RelayOutboundWriteGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RelayOutboundWriteGuard")
             .field("charged_bytes", &self._byte_budget.bytes)
             .finish_non_exhaustive()
     }

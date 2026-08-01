@@ -1365,13 +1365,15 @@ mod tests {
             .unwrap()
             .into_encoded_frame()
             .unwrap();
-        let ControllerToBridgeV1::ProtocolResult(result) = decode_frame(frame.as_bytes()).unwrap()
-        else {
+        let frame_pointer = frame.as_bytes().as_ptr();
+        let (bytes, write_guard) = frame.into_write_parts();
+        assert_eq!(bytes.as_ptr(), frame_pointer);
+        let ControllerToBridgeV1::ProtocolResult(result) = decode_frame(&bytes).unwrap() else {
             panic!("suspend must emit a correlated protocol result")
         };
         assert_eq!(result.into_lifecycle_outcome(&request).unwrap(), None);
         assert!(!call.is_finished());
-        frame.mark_written();
+        write_guard.mark_written();
         assert_eq!(
             call.await.unwrap().unwrap(),
             RelayLifecycleOutcome::Suspended
@@ -2015,7 +2017,8 @@ mod tests {
             .unwrap()
             .into_encoded_frame()
             .unwrap();
-        drop(frame);
+        let (_bytes, write_guard) = frame.into_write_parts();
+        drop(write_guard);
         assert!(matches!(
             call.await.unwrap(),
             Err(RelayLifecycleError::ResultDeliveryLost)

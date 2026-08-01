@@ -633,8 +633,11 @@ async fn process_byte_budget_is_shared_and_held_until_the_writer_drops_delivery(
         .unwrap()
         .into_encoded_frame()
         .unwrap();
+    let encoded_pointer = held_by_writer.as_bytes().as_ptr();
+    let (encoded, write_guard) = held_by_writer.into_write_parts();
+    assert_eq!(encoded.as_ptr(), encoded_pointer);
     assert_eq!(
-        decode_frame::<ControllerToWorkerV1>(held_by_writer.as_bytes()).unwrap(),
+        decode_frame::<ControllerToWorkerV1>(&encoded).unwrap(),
         ControllerToWorkerV1::Acp(message.clone())
     );
     assert_eq!(budget.available_bytes(), 0);
@@ -646,7 +649,9 @@ async fn process_byte_budget_is_shared_and_held_until_the_writer_drops_delivery(
         })
     );
 
-    drop(held_by_writer);
+    drop(encoded);
+    assert_eq!(budget.available_bytes(), 0);
+    drop(write_guard);
     assert_eq!(budget.available_bytes(), limit);
     assert_eq!(
         registry_b.route_acp(bridge_b.connection(), message.clone()),
