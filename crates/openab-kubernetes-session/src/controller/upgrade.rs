@@ -1,10 +1,11 @@
-use super::bridge_websocket::MIN_RELEASE_RETRY_INTERVAL;
-use super::{
-    serve_bridge_websocket, serve_worker_websocket, BridgeWebSocketOutcome,
-    ControllerBridgeWebSocketError, RelayLossOutcome, RelayOrchestrator, WorkerBootstrapAuth,
-    WorkerWebSocketError,
+use super::bridge_websocket::{
+    serve_bridge_websocket, BridgeWebSocketOutcome, ControllerBridgeWebSocketError,
+    MIN_RELEASE_RETRY_INTERVAL,
 };
-use crate::wire::{MAX_ACP_FRAME_BYTES, MAX_CONTROL_FRAME_BYTES};
+use super::websocket::relay_websocket_config;
+use super::worker_websocket::{serve_worker_websocket, WorkerWebSocketError};
+use super::{RelayLossOutcome, RelayOrchestrator, WorkerBootstrapAuth};
+use crate::bridge::is_valid_controller_bearer_credential;
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -23,7 +24,6 @@ use tokio_tungstenite::tungstenite::http::header::{
 use tokio_tungstenite::tungstenite::http::{
     HeaderMap, HeaderName, HeaderValue, Method, StatusCode,
 };
-use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::{tungstenite, WebSocketStream};
 
 pub const BRIDGE_WEBSOCKET_PATH: &str = "/v1/bridge";
@@ -31,7 +31,6 @@ pub const WORKER_WEBSOCKET_PATH: &str = "/v1/worker";
 pub const WORKER_POD_UID_HEADER: HeaderName = HeaderName::from_static("x-openab-pod-uid");
 
 const BEARER_PREFIX: &[u8] = b"Bearer ";
-const MAX_BRIDGE_CREDENTIAL_BYTES: usize = 4 * 1024;
 const WORKER_TOKEN_HEX_BYTES: usize = 64;
 const WORKER_TOKEN_BYTES: usize = WORKER_TOKEN_HEX_BYTES / 2;
 
@@ -47,7 +46,7 @@ struct BridgeBearerVerifier {
 
 impl BridgeBearerVerifier {
     fn new(credential: &[u8]) -> Result<Self, ControllerEndpointBuildError> {
-        if !valid_bridge_credential(credential) {
+        if !is_valid_controller_bearer_credential(credential) {
             return Err(ControllerEndpointBuildError::InvalidBridgeCredential);
         }
         Ok(Self {
@@ -56,7 +55,7 @@ impl BridgeBearerVerifier {
     }
 
     fn accepts(&self, credential: &[u8]) -> bool {
-        if !valid_bridge_credential(credential) {
+        if !is_valid_controller_bearer_credential(credential) {
             return false;
         }
         let candidate: [u8; 32] = Sha256::digest(credential).into();
@@ -137,7 +136,7 @@ impl UpgradeRejection {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ControllerEndpointConfig {
     max_connections: NonZeroUsize,
-    handshake_timeout: Duration,
+    websocket_upgrade_timeout: Duration,
     activation_timeout: Duration,
     registration_timeout: Duration,
     write_timeout: Duration,
@@ -148,14 +147,14 @@ impl ControllerEndpointConfig {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         max_connections: NonZeroUsize,
-        handshake_timeout: Duration,
+        websocket_upgrade_timeout: Duration,
         activation_timeout: Duration,
         registration_timeout: Duration,
         write_timeout: Duration,
         release_retry_interval: Duration,
     ) -> Result<Self, ControllerEndpointConfigError> {
         if [
-            handshake_timeout,
+            websocket_upgrade_timeout,
             activation_timeout,
             registration_timeout,
             write_timeout,
@@ -170,7 +169,7 @@ impl ControllerEndpointConfig {
         }
         Ok(Self {
             max_connections,
-            handshake_timeout,
+            websocket_upgrade_timeout,
             activation_timeout,
             registration_timeout,
             write_timeout,
@@ -262,7 +261,7 @@ pub struct ControllerConnection {
 
 impl ControllerConnection {
     /// Upgrade and immediately dispatch one already-TLS-protected stream.
-    pub async fn serve<S>(
+    pub(super) async fn serve<S>(
         self,
         stream: S,
     ) -> Result<ControllerConnectionOutcome, ControllerConnectionError>
@@ -272,7 +271,7 @@ impl ControllerConnection {
         let (socket, authority) = accept_authenticated_websocket(
             stream,
             self.bridge_verifier,
-            self.config.handshake_timeout,
+            self.config.websocket_upgrade_timeout,
         )
         .await
         .map_err(ControllerConnectionError::from)?;
@@ -411,17 +410,6 @@ fn authorize_websocket_upgrade(
     }
 }
 
-pub(super) fn relay_websocket_config() -> WebSocketConfig {
-    WebSocketConfig {
-        write_buffer_size: 0,
-        max_write_buffer_size: MAX_ACP_FRAME_BYTES + MAX_CONTROL_FRAME_BYTES,
-        max_message_size: Some(MAX_ACP_FRAME_BYTES),
-        max_frame_size: Some(MAX_ACP_FRAME_BYTES),
-        accept_unmasked_frames: false,
-        ..WebSocketConfig::default()
-    }
-}
-
 fn authorize_bridge(
     headers: &HeaderMap,
     verifier: &BridgeBearerVerifier,
@@ -469,21 +457,6 @@ fn single_header<'a>(headers: &'a HeaderMap, name: &HeaderName) -> Option<&'a He
         return None;
     }
     Some(value)
-}
-
-fn valid_bridge_credential(value: &[u8]) -> bool {
-    if value.is_empty() || value.len() > MAX_BRIDGE_CREDENTIAL_BYTES {
-        return false;
-    }
-    let padding_start = value
-        .iter()
-        .position(|byte| *byte == b'=')
-        .unwrap_or(value.len());
-    padding_start > 0
-        && value[..padding_start].iter().copied().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
-        })
-        && value[padding_start..].iter().all(|byte| *byte == b'=')
 }
 
 #[cfg(test)]

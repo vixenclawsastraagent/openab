@@ -4,6 +4,10 @@ use http::{HeaderValue, Method, Request, StatusCode};
 use tokio::io::{duplex, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
+const BRIDGE_CREDENTIAL: &str = "bridge-secret-0123456789abcdef-0123456789abcdef";
+const BRIDGE_AUTHORIZATION: &str = "Bearer bridge-secret-0123456789abcdef-0123456789abcdef";
+const WRONG_BRIDGE_AUTHORIZATION: &str = "Bearer wrong--secret-0123456789abcdef-0123456789abcdef";
+
 fn request(path: &str, authorization: &str) -> Request<()> {
     Request::builder()
         .method(Method::GET)
@@ -78,20 +82,23 @@ fn global_connection_admission_is_bounded_and_raii() {
 
 #[test]
 fn bridge_upgrade_requires_the_exact_path_and_bearer() {
-    let verifier = BridgeBearerVerifier::new(b"bridge-secret_123").expect("verifier");
-    let request = request(BRIDGE_WEBSOCKET_PATH, "Bearer bridge-secret_123");
+    let verifier = BridgeBearerVerifier::new(BRIDGE_CREDENTIAL.as_bytes()).expect("verifier");
+    let request = request(BRIDGE_WEBSOCKET_PATH, BRIDGE_AUTHORIZATION);
 
     assert!(matches!(
         authorize_websocket_upgrade(&request, &verifier),
         Ok(UpgradeAuthority::Bridge)
     ));
-    assert!(!format!("{verifier:?}").contains("bridge-secret_123"));
+    assert!(!format!("{verifier:?}").contains(BRIDGE_CREDENTIAL));
 }
 
 #[test]
 fn bridge_bearer_mismatch_and_header_ambiguity_are_unauthorized() {
-    let verifier = BridgeBearerVerifier::new(b"bridge-secret_123").expect("verifier");
-    for credential in ["bridge-secret_124", "aridge-secret_123"] {
+    let verifier = BridgeBearerVerifier::new(BRIDGE_CREDENTIAL.as_bytes()).expect("verifier");
+    for credential in [
+        "bridge-secret-0123456789abcdef-0123456789abcdee",
+        "aridge-secret-0123456789abcdef-0123456789abcdef",
+    ] {
         let request = request(BRIDGE_WEBSOCKET_PATH, &format!("Bearer {credential}"));
         assert_eq!(
             authorize_websocket_upgrade(&request, &verifier).expect_err("wrong credential"),
@@ -110,11 +117,11 @@ fn bridge_bearer_mismatch_and_header_ambiguity_are_unauthorized() {
     );
     missing.headers_mut().append(
         AUTHORIZATION,
-        HeaderValue::from_static("Bearer bridge-secret_123"),
+        HeaderValue::from_static(BRIDGE_AUTHORIZATION),
     );
     missing.headers_mut().append(
         AUTHORIZATION,
-        HeaderValue::from_static("Bearer bridge-secret_123"),
+        HeaderValue::from_static(BRIDGE_AUTHORIZATION),
     );
     assert_eq!(
         authorize_websocket_upgrade(&missing, &verifier).expect_err("duplicate credential"),
@@ -134,6 +141,10 @@ fn bridge_verifier_rejects_unsafe_configuration_without_echoing_it() {
         assert!(!error.to_string().contains("secret"));
     }
     assert_eq!(
+        BridgeBearerVerifier::new(&[b'a'; 31]).expect_err("short credential"),
+        ControllerEndpointBuildError::InvalidBridgeCredential
+    );
+    assert_eq!(
         BridgeBearerVerifier::new(&vec![b'a'; 4 * 1024 + 1]).expect_err("oversized credential"),
         ControllerEndpointBuildError::InvalidBridgeCredential
     );
@@ -141,7 +152,7 @@ fn bridge_verifier_rejects_unsafe_configuration_without_echoing_it() {
 
 #[test]
 fn worker_upgrade_builds_only_the_existing_bootstrap_authority() {
-    let verifier = BridgeBearerVerifier::new(b"bridge-secret").expect("verifier");
+    let verifier = BridgeBearerVerifier::new(BRIDGE_CREDENTIAL.as_bytes()).expect("verifier");
     let token = [0xa5_u8; 32];
     let encoded = hex::encode(token);
     let mut request = request(WORKER_WEBSOCKET_PATH, &format!("Bearer {encoded}"));
@@ -162,7 +173,7 @@ fn worker_upgrade_builds_only_the_existing_bootstrap_authority() {
 
 #[test]
 fn worker_upgrade_rejects_malformed_or_ambiguous_transport_authority() {
-    let verifier = BridgeBearerVerifier::new(b"bridge-secret").expect("verifier");
+    let verifier = BridgeBearerVerifier::new(BRIDGE_CREDENTIAL.as_bytes()).expect("verifier");
     for token in ["00".to_owned(), "z".repeat(64), "0".repeat(66)] {
         let mut request = request(WORKER_WEBSOCKET_PATH, &format!("Bearer {token}"));
         request
@@ -207,21 +218,21 @@ fn worker_upgrade_rejects_malformed_or_ambiguous_transport_authority() {
 
 #[test]
 fn endpoint_routing_is_exact_and_non_browser() {
-    let verifier = BridgeBearerVerifier::new(b"bridge-secret").expect("verifier");
+    let verifier = BridgeBearerVerifier::new(BRIDGE_CREDENTIAL.as_bytes()).expect("verifier");
     for path in [
         "/",
         "/v1/bridge/",
         "/v1/bridge?scope=other",
         "/v1/worker/extra",
     ] {
-        let request = request(path, "Bearer bridge-secret");
+        let request = request(path, BRIDGE_AUTHORIZATION);
         assert_eq!(
             authorize_websocket_upgrade(&request, &verifier).expect_err("unknown endpoint"),
             UpgradeRejection::NotFound
         );
     }
 
-    let mut origin = request(BRIDGE_WEBSOCKET_PATH, "Bearer bridge-secret");
+    let mut origin = request(BRIDGE_WEBSOCKET_PATH, BRIDGE_AUTHORIZATION);
     origin
         .headers_mut()
         .insert(ORIGIN, HeaderValue::from_static("https://example.invalid"));
@@ -230,7 +241,7 @@ fn endpoint_routing_is_exact_and_non_browser() {
         UpgradeRejection::Forbidden
     );
 
-    let mut subprotocol = request(BRIDGE_WEBSOCKET_PATH, "Bearer bridge-secret");
+    let mut subprotocol = request(BRIDGE_WEBSOCKET_PATH, BRIDGE_AUTHORIZATION);
     subprotocol.headers_mut().insert(
         SEC_WEBSOCKET_PROTOCOL,
         HeaderValue::from_static("unexpected-protocol"),
@@ -243,7 +254,7 @@ fn endpoint_routing_is_exact_and_non_browser() {
     let post = Request::builder()
         .method(Method::POST)
         .uri(BRIDGE_WEBSOCKET_PATH)
-        .header(AUTHORIZATION, "Bearer bridge-secret")
+        .header(AUTHORIZATION, BRIDGE_AUTHORIZATION)
         .body(())
         .expect("request");
     assert_eq!(
@@ -273,14 +284,14 @@ fn rejection_response_is_static_and_non_cacheable() {
 
 #[tokio::test]
 async fn authenticated_handshake_returns_the_callback_authority() {
-    let verifier = BridgeBearerVerifier::new(b"bridge-secret").expect("verifier");
+    let verifier = BridgeBearerVerifier::new(BRIDGE_CREDENTIAL.as_bytes()).expect("verifier");
     let (client_io, server_io) = duplex(8 * 1024);
     let mut request = "ws://controller.test/v1/bridge"
         .into_client_request()
         .expect("client request");
     request.headers_mut().insert(
         AUTHORIZATION,
-        HeaderValue::from_static("Bearer bridge-secret"),
+        HeaderValue::from_static(BRIDGE_AUTHORIZATION),
     );
 
     let server = accept_authenticated_websocket(server_io, verifier, Duration::from_secs(1));
@@ -294,14 +305,14 @@ async fn authenticated_handshake_returns_the_callback_authority() {
 
 #[tokio::test]
 async fn handshake_rejects_bad_bearer_before_http_101() {
-    let verifier = BridgeBearerVerifier::new(b"bridge-secret").expect("verifier");
+    let verifier = BridgeBearerVerifier::new(BRIDGE_CREDENTIAL.as_bytes()).expect("verifier");
     let (client_io, server_io) = duplex(8 * 1024);
     let mut request = "ws://controller.test/v1/bridge"
         .into_client_request()
         .expect("client request");
     request.headers_mut().insert(
         AUTHORIZATION,
-        HeaderValue::from_static("Bearer wrong-secret"),
+        HeaderValue::from_static(WRONG_BRIDGE_AUTHORIZATION),
     );
 
     let server = accept_authenticated_websocket(server_io, verifier, Duration::from_secs(1));
@@ -325,7 +336,7 @@ async fn handshake_rejects_bad_bearer_before_http_101() {
 
 #[tokio::test(start_paused = true)]
 async fn handshake_has_one_fixed_deadline() {
-    let verifier = BridgeBearerVerifier::new(b"bridge-secret").expect("verifier");
+    let verifier = BridgeBearerVerifier::new(BRIDGE_CREDENTIAL.as_bytes()).expect("verifier");
     let (_client_io, server_io) = duplex(8 * 1024);
     let server = tokio::spawn(accept_authenticated_websocket(
         server_io,
@@ -342,7 +353,7 @@ async fn handshake_has_one_fixed_deadline() {
 
 #[tokio::test]
 async fn oversized_http_handshake_is_rejected_by_the_parser_bound() {
-    let verifier = BridgeBearerVerifier::new(b"bridge-secret").expect("verifier");
+    let verifier = BridgeBearerVerifier::new(BRIDGE_CREDENTIAL.as_bytes()).expect("verifier");
     let (mut client_io, server_io) = duplex(128 * 1024);
     let mut request = b"GET /v1/bridge HTTP/1.1\r\nHost: controller.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nAuthorization: Bearer ".to_vec();
     request.extend(std::iter::repeat_n(b'a', 66 * 1024));

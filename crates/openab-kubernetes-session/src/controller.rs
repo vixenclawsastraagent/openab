@@ -1,5 +1,6 @@
 mod activation;
 mod activity;
+#[cfg(any(feature = "controller-runtime", test))]
 mod bridge_websocket;
 mod cleanup;
 mod composition;
@@ -11,7 +12,13 @@ mod relay;
 mod release;
 mod rendezvous;
 mod service;
+#[cfg(feature = "controller-runtime")]
+mod tls;
+#[cfg(feature = "controller-runtime")]
 mod upgrade;
+#[cfg(any(feature = "controller-runtime", test))]
+mod websocket;
+#[cfg(any(feature = "controller-runtime", test))]
 mod worker_websocket;
 
 pub use activation::{
@@ -23,10 +30,8 @@ pub use activity::{
     ActivityCoordinator, ActivityError, ActivityEvent, ActivityOutcome, ActivityTurnId,
     ActivityTurnIdError,
 };
-pub use bridge_websocket::{
-    controller_bridge_websocket_config, serve_bridge_websocket, BridgeWebSocketOutcome,
-    ControllerBridgeWebSocketError,
-};
+#[cfg(feature = "controller-runtime")]
+pub use bridge_websocket::{BridgeWebSocketOutcome, ControllerBridgeWebSocketError};
 pub use cleanup::{
     CleanupProgress, LifecycleProvisioner, ReleaseCleanupProgress, ReleaseProvisioner,
 };
@@ -72,10 +77,14 @@ pub use service::{
     ControllerService, ControllerServiceConfigError, ControllerServiceError,
     LifecycleServiceOutcome,
 };
+#[cfg(feature = "controller-runtime")]
+pub use tls::{ControllerTlsAcceptor, ControllerTlsConfigError, ControllerTlsConnectionError};
+#[cfg(feature = "controller-runtime")]
 pub use upgrade::{
     ControllerAdmissionError, ControllerConnection, ControllerConnectionError,
     ControllerConnectionOutcome, ControllerEndpoint, ControllerEndpointBuildError,
     ControllerEndpointConfig, ControllerEndpointConfigError, BRIDGE_WEBSOCKET_PATH,
     WORKER_POD_UID_HEADER, WORKER_WEBSOCKET_PATH,
 };
-pub use worker_websocket::{serve_worker_websocket, worker_websocket_config, WorkerWebSocketError};
+#[cfg(feature = "controller-runtime")]
+pub use worker_websocket::WorkerWebSocketError;

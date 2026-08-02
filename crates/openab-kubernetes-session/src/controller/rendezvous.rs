@@ -349,6 +349,7 @@ impl<M> RelayOutboundItem<M> {
         self.message
     }
 
+    #[cfg(any(feature = "controller-runtime", test))]
     pub(crate) fn message(&self) -> &M {
         &self.message
     }

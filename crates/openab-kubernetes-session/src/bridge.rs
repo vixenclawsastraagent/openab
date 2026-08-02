@@ -19,8 +19,32 @@ pub mod websocket;
 /// layer reserves separate overhead for its typed outer relay envelope.
 pub const MAX_LOGICAL_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_WORKER_SESSION_ID_BYTES: usize = 4 * 1024;
+pub const MIN_CONTROLLER_BEARER_CREDENTIAL_BYTES: usize = 32;
+pub const MAX_CONTROLLER_BEARER_CREDENTIAL_BYTES: usize = 4 * 1024;
 
 const CONTROLLER_ERROR_CODE: i64 = -32000;
+
+/// Validate the bounded `b64token` grammar shared by the bridge and controller.
+///
+/// Deployments must still generate this credential from a cryptographically
+/// secure random source; the length floor prevents trivially weak accidental
+/// configuration but cannot measure entropy.
+pub fn is_valid_controller_bearer_credential(value: &[u8]) -> bool {
+    if !(MIN_CONTROLLER_BEARER_CREDENTIAL_BYTES..=MAX_CONTROLLER_BEARER_CREDENTIAL_BYTES)
+        .contains(&value.len())
+    {
+        return false;
+    }
+    let padding_start = value
+        .iter()
+        .position(|byte| *byte == b'=')
+        .unwrap_or(value.len());
+    padding_start > 0
+        && value[..padding_start].iter().copied().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
+        })
+        && value[padding_start..].iter().all(|byte| *byte == b'=')
+}
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum BridgeIdentityError {
@@ -1010,5 +1034,27 @@ mod tests {
                 .len(),
             14 * 1024 * 1024
         );
+    }
+
+    #[test]
+    fn controller_bearer_contract_is_bounded_and_uses_closed_token_grammar() {
+        assert!(is_valid_controller_bearer_credential(
+            &[b'a'; MIN_CONTROLLER_BEARER_CREDENTIAL_BYTES]
+        ));
+        assert!(is_valid_controller_bearer_credential(
+            b"abcdefghijklmnopqrstuvwxyz012345=="
+        ));
+        assert!(!is_valid_controller_bearer_credential(
+            &[b'a'; MIN_CONTROLLER_BEARER_CREDENTIAL_BYTES - 1]
+        ));
+        assert!(!is_valid_controller_bearer_credential(
+            &[b'a'; MAX_CONTROLLER_BEARER_CREDENTIAL_BYTES + 1]
+        ));
+        assert!(!is_valid_controller_bearer_credential(
+            b"abcdefghijklmnopqrstuvwxyz=012345"
+        ));
+        assert!(!is_valid_controller_bearer_credential(
+            &[b'='; MIN_CONTROLLER_BEARER_CREDENTIAL_BYTES]
+        ));
     }
 }

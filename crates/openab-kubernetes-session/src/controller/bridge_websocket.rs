@@ -24,11 +24,6 @@ use tokio_tungstenite::WebSocketStream;
 
 pub(super) const MIN_RELEASE_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Finite transport limits for an already-upgraded broker bridge socket.
-pub fn controller_bridge_websocket_config() -> WebSocketConfig {
-    super::upgrade::relay_websocket_config()
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BridgeWebSocketOutcome {
     MappingAbsent,
@@ -105,7 +100,7 @@ pub enum ControllerBridgeWebSocketError {
 /// [`RelayOrchestrator`] before this function sees any application frame. The
 /// driver owns activation-first framing, prompt activity ordering, ACP
 /// backpressure, exact lifecycle retries, write deadlines, and containment.
-pub async fn serve_bridge_websocket<S>(
+pub(crate) async fn serve_bridge_websocket<S>(
     relay: RelayOrchestrator,
     mut socket: WebSocketStream<S>,
     activation_timeout: Duration,

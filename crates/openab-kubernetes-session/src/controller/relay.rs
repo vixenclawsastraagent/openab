@@ -931,11 +931,12 @@ struct RegisteredWorkerParts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::controller::{
-        controller_bridge_websocket_config, serve_bridge_websocket, serve_worker_websocket,
-        worker_websocket_config, BridgeWebSocketOutcome, ControllerBridgeWebSocketError,
-        RendezvousRouteError, WorkerWebSocketError,
+    use crate::controller::bridge_websocket::{
+        serve_bridge_websocket, BridgeWebSocketOutcome, ControllerBridgeWebSocketError,
     };
+    use crate::controller::websocket::relay_websocket_config;
+    use crate::controller::worker_websocket::{serve_worker_websocket, WorkerWebSocketError};
+    use crate::controller::RendezvousRouteError;
     use crate::identity::ScopeId;
     use crate::state::Fence;
     use crate::wire::{
@@ -1308,13 +1309,13 @@ mod tests {
         let worker = WebSocketStream::from_raw_socket(
             worker_io,
             Role::Client,
-            Some(worker_websocket_config()),
+            Some(relay_websocket_config()),
         )
         .await;
         let controller = WebSocketStream::from_raw_socket(
             controller_io,
             Role::Server,
-            Some(worker_websocket_config()),
+            Some(relay_websocket_config()),
         )
         .await;
         (worker, controller)
@@ -1345,13 +1346,13 @@ mod tests {
         let bridge = WebSocketStream::from_raw_socket(
             bridge_io,
             Role::Client,
-            Some(controller_bridge_websocket_config()),
+            Some(relay_websocket_config()),
         )
         .await;
         let controller = WebSocketStream::from_raw_socket(
             controller_io,
             Role::Server,
-            Some(controller_bridge_websocket_config()),
+            Some(relay_websocket_config()),
         )
         .await;
         (bridge, controller)
@@ -3126,7 +3127,7 @@ mod tests {
 
     #[test]
     fn controller_bridge_websocket_limits_cover_the_wire_ceiling() {
-        let config = controller_bridge_websocket_config();
+        let config = relay_websocket_config();
         assert_eq!(config.max_message_size, Some(MAX_ACP_FRAME_BYTES));
         assert_eq!(config.max_frame_size, Some(MAX_ACP_FRAME_BYTES));
         assert!(!config.accept_unmasked_frames);
@@ -3601,7 +3602,7 @@ mod tests {
 
     #[test]
     fn worker_websocket_limits_cover_the_wire_ceiling() {
-        let config = worker_websocket_config();
+        let config = relay_websocket_config();
         assert_eq!(config.max_message_size, Some(MAX_ACP_FRAME_BYTES));
         assert_eq!(config.max_frame_size, Some(MAX_ACP_FRAME_BYTES));
         assert!(!config.accept_unmasked_frames);

@@ -18,16 +18,6 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::{self, protocol::WebSocketConfig};
 use tokio_tungstenite::WebSocketStream;
 
-/// Finite transport limits for an already-upgraded worker relay socket.
-///
-/// The HTTP/TLS endpoint must apply this configuration when it constructs the
-/// [`WebSocketStream`]. Authentication remains outside WebSocket application
-/// frames and is passed to [`serve_worker_websocket`] as trusted bootstrap
-/// material.
-pub fn worker_websocket_config() -> WebSocketConfig {
-    super::upgrade::relay_websocket_config()
-}
-
 #[derive(Debug, Error)]
 pub enum WorkerWebSocketError {
     #[error("worker WebSocket transport limits do not match the relay protocol")]
@@ -89,7 +79,7 @@ pub enum WorkerWebSocketError {
 /// application framing, exact ACP routing, backpressure, and containment. The
 /// registration deadline spans all pre-registration control frames, while the
 /// write deadline applies independently to each bounded transport write.
-pub async fn serve_worker_websocket<S>(
+pub(crate) async fn serve_worker_websocket<S>(
     relay: RelayOrchestrator,
     mut socket: WebSocketStream<S>,
     auth: WorkerBootstrapAuth,

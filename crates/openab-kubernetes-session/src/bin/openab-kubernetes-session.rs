@@ -2,6 +2,10 @@ use openab_kubernetes_session::bridge::runtime::{BridgeEnvironment, BridgeEnviro
 use openab_kubernetes_session::bridge::websocket::{
     bridge_websocket_config, run_bridge_websocket, BridgeWebSocketError,
 };
+use openab_kubernetes_session::bridge::{
+    is_valid_controller_bearer_credential, MAX_CONTROLLER_BEARER_CREDENTIAL_BYTES,
+    MIN_CONTROLLER_BEARER_CREDENTIAL_BYTES,
+};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::Read;
@@ -16,7 +20,6 @@ use tokio_tungstenite::tungstenite::handshake::client::Request;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::tungstenite::http::{HeaderValue, Uri};
 
-const MAX_BEARER_CREDENTIAL_BYTES: usize = 4 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -53,8 +56,8 @@ enum CommandError {
 enum CredentialError {
     #[error("controller bearer credential could not be read")]
     Read,
-    #[error("controller bearer credential must not be empty")]
-    Empty,
+    #[error("controller bearer credential is shorter than the required security floor")]
+    TooShort,
     #[error("controller bearer credential exceeds its size limit")]
     TooLarge,
     #[error("controller bearer credential contains a disallowed byte")]
@@ -166,7 +169,7 @@ where
 {
     let mut credential = Vec::new();
     if reader
-        .take((MAX_BEARER_CREDENTIAL_BYTES + 1) as u64)
+        .take((MAX_CONTROLLER_BEARER_CREDENTIAL_BYTES + 1) as u64)
         .read_to_end(&mut credential)
         .is_err()
     {
@@ -174,31 +177,19 @@ where
         return Err(CredentialError::Read);
     }
 
-    if credential.is_empty() {
-        return Err(CredentialError::Empty);
+    if credential.len() < MIN_CONTROLLER_BEARER_CREDENTIAL_BYTES {
+        credential.fill(0);
+        return Err(CredentialError::TooShort);
     }
-    if credential.len() > MAX_BEARER_CREDENTIAL_BYTES {
+    if credential.len() > MAX_CONTROLLER_BEARER_CREDENTIAL_BYTES {
         credential.fill(0);
         return Err(CredentialError::TooLarge);
     }
-    if !is_b64token(&credential) {
+    if !is_valid_controller_bearer_credential(&credential) {
         credential.fill(0);
         return Err(CredentialError::InvalidByte);
     }
     Ok(credential)
-}
-
-/// Validate the closed `b64token` credential grammar from RFC 6750 section 2.1.
-fn is_b64token(value: &[u8]) -> bool {
-    let padding_start = value
-        .iter()
-        .position(|byte| *byte == b'=')
-        .unwrap_or(value.len());
-    padding_start > 0
-        && value[..padding_start].iter().copied().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
-        })
-        && value[padding_start..].iter().all(|byte| *byte == b'=')
 }
 
 fn build_controller_request(
@@ -216,10 +207,7 @@ fn build_controller_request(
     {
         return Err(RequestError::InvalidControllerUrl);
     }
-    if credential.is_empty()
-        || credential.len() > MAX_BEARER_CREDENTIAL_BYTES
-        || !is_b64token(credential)
-    {
+    if !is_valid_controller_bearer_credential(credential) {
         return Err(RequestError::InvalidRequest);
     }
 
@@ -290,6 +278,9 @@ mod tests {
     use tokio_tungstenite::tungstenite::http::header::{
         AUTHORIZATION, CONNECTION, HOST, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION, UPGRADE,
     };
+
+    const TEST_CREDENTIAL: &[u8] = b"abc_DEF-123.~+/abc_DEF-123.~+/==";
+    const TEST_AUTHORIZATION: &str = "Bearer abc_DEF-123.~+/abc_DEF-123.~+/==";
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
@@ -377,40 +368,48 @@ mod tests {
 
     #[test]
     fn reads_an_exact_unmodified_bearer_credential() {
-        let mut input = Cursor::new(b"abc_DEF-123.~+/==".to_vec());
+        let mut input = Cursor::new(TEST_CREDENTIAL.to_vec());
 
         assert_eq!(
             read_bearer_credential(&mut input).expect("safe token"),
-            b"abc_DEF-123.~+/=="
+            TEST_CREDENTIAL
         );
     }
 
     #[test]
-    fn rejects_empty_oversized_or_non_token_credentials() {
+    fn rejects_short_oversized_or_non_token_credentials() {
         let mut empty = Cursor::new(Vec::<u8>::new());
         assert_eq!(
             read_bearer_credential(&mut empty),
-            Err(CredentialError::Empty)
+            Err(CredentialError::TooShort)
+        );
+        let mut short = Cursor::new(vec![b'a'; MIN_CONTROLLER_BEARER_CREDENTIAL_BYTES - 1]);
+        assert_eq!(
+            read_bearer_credential(&mut short),
+            Err(CredentialError::TooShort)
         );
 
-        let mut oversized = Cursor::new(vec![b'a'; MAX_BEARER_CREDENTIAL_BYTES + 1]);
+        let mut oversized = Cursor::new(vec![b'a'; MAX_CONTROLLER_BEARER_CREDENTIAL_BYTES + 1]);
         assert_eq!(
             read_bearer_credential(&mut oversized),
             Err(CredentialError::TooLarge)
         );
 
-        for unsafe_value in [
-            b"token\n".as_slice(),
-            b"token\r".as_slice(),
-            b" token".as_slice(),
-            b"=token".as_slice(),
-            b"token=value".as_slice(),
-            b"token!".as_slice(),
-        ] {
+        for invalid_byte in [b'\n', b'\r', b' ', b'!', b':'] {
+            let mut unsafe_value = vec![b'a'; MIN_CONTROLLER_BEARER_CREDENTIAL_BYTES];
+            unsafe_value[MIN_CONTROLLER_BEARER_CREDENTIAL_BYTES / 2] = invalid_byte;
             let mut input = Cursor::new(unsafe_value);
             let error = read_bearer_credential(&mut input).expect_err("unsafe token");
             assert_eq!(error, CredentialError::InvalidByte);
-            assert!(!error.to_string().contains("token"));
+        }
+        for padding_index in [0, MIN_CONTROLLER_BEARER_CREDENTIAL_BYTES / 2] {
+            let mut unsafe_value = vec![b'a'; MIN_CONTROLLER_BEARER_CREDENTIAL_BYTES];
+            unsafe_value[padding_index] = b'=';
+            let mut input = Cursor::new(unsafe_value);
+            assert_eq!(
+                read_bearer_credential(&mut input),
+                Err(CredentialError::InvalidByte)
+            );
         }
     }
 
@@ -454,11 +453,9 @@ mod tests {
 
     #[test]
     fn constructs_a_wss_upgrade_request_with_bearer_authorization() {
-        let request = build_controller_request(
-            "wss://controller.example.test/v1/bridge",
-            b"abc_DEF-123.~+/==",
-        )
-        .expect("valid request");
+        let request =
+            build_controller_request("wss://controller.example.test/v1/bridge", TEST_CREDENTIAL)
+                .expect("valid request");
 
         assert_eq!(request.method(), "GET");
         assert_eq!(request.uri(), "wss://controller.example.test/v1/bridge");
@@ -467,9 +464,9 @@ mod tests {
         assert_eq!(request.headers()[UPGRADE], "websocket");
         assert_eq!(request.headers()[SEC_WEBSOCKET_VERSION], "13");
         assert!(!request.headers()[SEC_WEBSOCKET_KEY].is_empty());
-        assert_eq!(request.headers()[AUTHORIZATION], "Bearer abc_DEF-123.~+/==");
+        assert_eq!(request.headers()[AUTHORIZATION], TEST_AUTHORIZATION);
         assert!(request.headers()[AUTHORIZATION].is_sensitive());
-        assert!(!format!("{request:?}").contains("abc_DEF-123.~+/=="));
+        assert!(!format!("{request:?}").contains(std::str::from_utf8(TEST_CREDENTIAL).unwrap()));
     }
 
     #[test]
