@@ -4290,4 +4290,391 @@ mod tests {
         assert!(report.failures().is_empty());
         assert!(registry.pending_containments().is_empty());
     }
+
+    #[cfg(feature = "controller-runtime")]
+    mod runtime_listener_tests {
+        use super::*;
+        use crate::controller::{
+            ControllerAdmissionError, ControllerEndpoint, ControllerEndpointConfig,
+            ControllerListener, ControllerTlsAcceptor,
+        };
+        use http::header::AUTHORIZATION;
+        use http::{HeaderValue, StatusCode};
+        use rcgen::{generate_simple_self_signed, CertifiedKey};
+        use std::future::ready;
+        use std::io::Cursor;
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio::sync::oneshot;
+        use tokio_rustls::client::TlsStream;
+        use tokio_rustls::rustls::client::ClientConfig;
+        use tokio_rustls::rustls::crypto::ring;
+        use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
+        use tokio_rustls::rustls::RootCertStore;
+        use tokio_rustls::TlsConnector;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        const BRIDGE_CREDENTIAL: &str = "bridge-secret-0123456789abcdef-0123456789abcdef";
+        const BRIDGE_AUTHORIZATION: &str = "Bearer bridge-secret-0123456789abcdef-0123456789abcdef";
+        const WRONG_BRIDGE_AUTHORIZATION: &str =
+            "Bearer wrong--secret-0123456789abcdef-0123456789abcdef";
+        const TEST_OPERATION_TIMEOUT: Duration = Duration::from_secs(2);
+        const TEST_SERVER_TIMEOUT: Duration = Duration::from_secs(5);
+
+        type ClientWebSocket = WebSocketStream<TlsStream<TcpStream>>;
+
+        fn tls_identity() -> (ControllerTlsAcceptor, ClientConfig) {
+            let CertifiedKey { cert, signing_key } =
+                generate_simple_self_signed(vec!["localhost".to_owned()])
+                    .expect("test TLS identity");
+            let acceptor = ControllerTlsAcceptor::from_pem(
+                Cursor::new(cert.pem().into_bytes()),
+                Cursor::new(signing_key.serialize_pem().into_bytes()),
+                TEST_SERVER_TIMEOUT,
+            )
+            .expect("controller TLS acceptor");
+            let mut roots = RootCertStore::empty();
+            roots
+                .add(CertificateDer::from(cert.der().to_vec()))
+                .expect("test certificate root");
+            let client = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .expect("safe TLS protocol versions")
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            (acceptor, client)
+        }
+
+        fn endpoint(controller: Arc<FakeController>, max_connections: usize) -> ControllerEndpoint {
+            endpoint_parts(controller, max_connections).0
+        }
+
+        fn endpoint_parts(
+            controller: Arc<FakeController>,
+            max_connections: usize,
+        ) -> (ControllerEndpoint, RendezvousRegistry) {
+            let (relay, registry) = orchestrator(controller);
+            let config = ControllerEndpointConfig::new(
+                NonZeroUsize::new(max_connections).expect("non-zero connection limit"),
+                TEST_SERVER_TIMEOUT,
+                TEST_SERVER_TIMEOUT,
+                TEST_SERVER_TIMEOUT,
+                TEST_SERVER_TIMEOUT,
+                Duration::from_millis(100),
+            )
+            .expect("controller endpoint config");
+            (
+                ControllerEndpoint::new(relay, BRIDGE_CREDENTIAL.as_bytes(), config)
+                    .expect("controller endpoint"),
+                registry,
+            )
+        }
+
+        fn bridge_request(authorization: &'static str) -> http::Request<()> {
+            let mut request = "wss://localhost/v1/bridge"
+                .into_client_request()
+                .expect("bridge request");
+            request
+                .headers_mut()
+                .insert(AUTHORIZATION, HeaderValue::from_static(authorization));
+            request
+        }
+
+        async fn connect_tcp(address: std::net::SocketAddr) -> TcpStream {
+            timeout(TEST_OPERATION_TIMEOUT, TcpStream::connect(address))
+                .await
+                .expect("controller TCP deadline")
+                .expect("controller TCP")
+        }
+
+        async fn connect_tls(
+            address: std::net::SocketAddr,
+            config: ClientConfig,
+        ) -> TlsStream<TcpStream> {
+            let stream = connect_tcp(address).await;
+            timeout(
+                TEST_OPERATION_TIMEOUT,
+                TlsConnector::from(Arc::new(config)).connect(
+                    ServerName::try_from("localhost").expect("test server name"),
+                    stream,
+                ),
+            )
+            .await
+            .expect("controller TLS deadline")
+            .expect("controller TLS")
+        }
+
+        async fn connect_bridge(
+            address: std::net::SocketAddr,
+            config: ClientConfig,
+            authorization: &'static str,
+        ) -> Result<ClientWebSocket, tokio_tungstenite::tungstenite::Error> {
+            let stream = connect_tls(address, config).await;
+            timeout(
+                TEST_OPERATION_TIMEOUT,
+                tokio_tungstenite::client_async(bridge_request(authorization), stream),
+            )
+            .await
+            .expect("WebSocket upgrade deadline")
+            .map(|(socket, _response)| socket)
+        }
+
+        async fn start_listener(
+            endpoint: ControllerEndpoint,
+            tls: ControllerTlsAcceptor,
+        ) -> (
+            std::net::SocketAddr,
+            oneshot::Sender<()>,
+            tokio::task::JoinHandle<Result<(), crate::controller::ControllerListenerError>>,
+        ) {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("test listener");
+            let address = listener.local_addr().expect("listener address");
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let runtime = ControllerListener::new(endpoint, tls);
+            let task = tokio::spawn(async move {
+                runtime
+                    .serve_until(listener, async move {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+            });
+            (address, shutdown_tx, task)
+        }
+
+        async fn stop_listener(
+            shutdown: oneshot::Sender<()>,
+            listener: tokio::task::JoinHandle<
+                Result<(), crate::controller::ControllerListenerError>,
+            >,
+        ) {
+            shutdown.send(()).expect("listener remains active");
+            timeout(TEST_OPERATION_TIMEOUT, listener)
+                .await
+                .expect("listener shutdown deadline")
+                .expect("listener task")
+                .expect("clean listener shutdown");
+        }
+
+        async fn assert_mapping_absent(socket: &mut ClientWebSocket) {
+            let request = activation_request(BrokerMappingExpectationV1::Present);
+            timeout(
+                TEST_OPERATION_TIMEOUT,
+                socket.send(websocket_text(&BridgeToControllerV1::Activation(
+                    request.clone(),
+                ))),
+            )
+            .await
+            .expect("activation write deadline")
+            .expect("activation request");
+            let frame = timeout(TEST_OPERATION_TIMEOUT, socket.next())
+                .await
+                .expect("activation response deadline")
+                .expect("activation response frame")
+                .expect("valid activation response frame");
+            let Message::Text(text) = frame else {
+                panic!("activation response must be a text frame")
+            };
+            let ControllerToBridgeV1::Activation(response) =
+                decode_frame(text.as_bytes()).expect("activation response")
+            else {
+                panic!("mapping absence must use the activation envelope")
+            };
+            assert_eq!(
+                response.into_validated_outcome(&request).unwrap(),
+                ValidatedActivationOutcomeV1::MappingAbsent
+            );
+        }
+
+        async fn wait_for_admission(endpoint: &ControllerEndpoint) {
+            timeout(TEST_OPERATION_TIMEOUT, async {
+                loop {
+                    match endpoint.try_admit() {
+                        Ok(connection) => {
+                            drop(connection);
+                            break;
+                        }
+                        Err(ControllerAdmissionError::AtCapacity) => {
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("connection permit must be returned");
+        }
+
+        async fn wait_for_capacity(endpoint: &ControllerEndpoint) {
+            timeout(TEST_OPERATION_TIMEOUT, async {
+                while let Ok(connection) = endpoint.try_admit() {
+                    drop(connection);
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("connection must consume admission");
+        }
+
+        #[tokio::test]
+        async fn listener_serves_the_public_tls_upgrade_bearer_and_relay_chain() {
+            let controller = Arc::new(FakeController::new(binding()));
+            controller.activation_mode.store(1, Ordering::SeqCst);
+            let endpoint = endpoint(controller, 1);
+            let (tls, client_config) = tls_identity();
+            let (address, shutdown, listener) = start_listener(endpoint.clone(), tls).await;
+
+            let mut socket = connect_bridge(address, client_config.clone(), BRIDGE_AUTHORIZATION)
+                .await
+                .expect("authenticated bridge");
+            assert_mapping_absent(&mut socket).await;
+            wait_for_admission(&endpoint).await;
+
+            let mut second = connect_bridge(address, client_config, BRIDGE_AUTHORIZATION)
+                .await
+                .expect("listener accepts after reaping a completed connection");
+            assert_mapping_absent(&mut second).await;
+
+            stop_listener(shutdown, listener).await;
+        }
+
+        #[tokio::test]
+        async fn wrong_bearer_is_rejected_before_http_101_and_returns_admission() {
+            let controller = Arc::new(FakeController::new(binding()));
+            let endpoint = endpoint(controller, 1);
+            let (tls, client_config) = tls_identity();
+            let (address, shutdown, listener) = start_listener(endpoint.clone(), tls).await;
+
+            let error = connect_bridge(address, client_config, WRONG_BRIDGE_AUTHORIZATION)
+                .await
+                .expect_err("wrong bearer must be rejected");
+            let tokio_tungstenite::tungstenite::Error::Http(response) = error else {
+                panic!("wrong bearer must receive an HTTP rejection")
+            };
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            wait_for_admission(&endpoint).await;
+
+            stop_listener(shutdown, listener).await;
+        }
+
+        #[tokio::test]
+        async fn capacity_rejection_closes_tcp_before_tls_and_listener_recovers() {
+            let controller = Arc::new(FakeController::new(binding()));
+            controller.activation_mode.store(1, Ordering::SeqCst);
+            let endpoint = endpoint(controller, 1);
+            let held = endpoint.try_admit().expect("held admission");
+            let (tls, client_config) = tls_identity();
+            let (address, shutdown, listener) = start_listener(endpoint.clone(), tls).await;
+
+            let stream = connect_tcp(address).await;
+            let result = timeout(
+                TEST_OPERATION_TIMEOUT,
+                TlsConnector::from(Arc::new(client_config.clone())).connect(
+                    ServerName::try_from("localhost").expect("test server name"),
+                    stream,
+                ),
+            )
+            .await
+            .expect("capacity rejection must not wait for TLS timeout");
+            assert!(result.is_err());
+
+            drop(held);
+            let mut socket = connect_bridge(address, client_config, BRIDGE_AUTHORIZATION)
+                .await
+                .expect("listener accepts after capacity returns");
+            assert_mapping_absent(&mut socket).await;
+
+            stop_listener(shutdown, listener).await;
+        }
+
+        #[tokio::test]
+        async fn slow_tls_connection_holds_admission_only_until_shutdown() {
+            let controller = Arc::new(FakeController::new(binding()));
+            let endpoint = endpoint(controller, 1);
+            let (tls, _client_config) = tls_identity();
+            let (address, shutdown, listener) = start_listener(endpoint.clone(), tls).await;
+
+            let _slow_peer = connect_tcp(address).await;
+            wait_for_capacity(&endpoint).await;
+
+            stop_listener(shutdown, listener).await;
+            wait_for_admission(&endpoint).await;
+        }
+
+        #[tokio::test]
+        async fn shutdown_before_accept_returns_without_waiting_for_a_peer() {
+            let controller = Arc::new(FakeController::new(binding()));
+            let endpoint = endpoint(controller, 1);
+            let (tls, _client_config) = tls_identity();
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("test listener");
+
+            timeout(
+                TEST_OPERATION_TIMEOUT,
+                ControllerListener::new(endpoint, tls).serve_until(listener, ready(())),
+            )
+            .await
+            .expect("shutdown must be observed before accept")
+            .expect("clean listener shutdown");
+        }
+
+        #[tokio::test]
+        async fn shutdown_aborts_and_drains_an_in_flight_connection() {
+            let controller = Arc::new(FakeController::new(binding()));
+            let endpoint = endpoint(controller, 1);
+            let (tls, client_config) = tls_identity();
+            let (address, shutdown, listener) = start_listener(endpoint.clone(), tls).await;
+            let mut socket = connect_bridge(address, client_config, BRIDGE_AUTHORIZATION)
+                .await
+                .expect("authenticated bridge");
+            assert!(matches!(
+                endpoint.try_admit(),
+                Err(ControllerAdmissionError::AtCapacity)
+            ));
+
+            stop_listener(shutdown, listener).await;
+            wait_for_admission(&endpoint).await;
+            let closed = timeout(TEST_OPERATION_TIMEOUT, socket.next())
+                .await
+                .expect("in-flight socket must be dropped");
+            assert!(matches!(
+                closed,
+                None | Some(Err(_)) | Some(Ok(Message::Close(_)))
+            ));
+        }
+
+        #[tokio::test]
+        async fn shutdown_quiesces_an_attached_lane_and_schedules_containment() {
+            let controller = Arc::new(FakeController::new(binding()));
+            let (endpoint, registry) = endpoint_parts(Arc::clone(&controller), 1);
+            let (tls, client_config) = tls_identity();
+            let (address, shutdown, listener) = start_listener(endpoint, tls).await;
+            let mut socket = connect_bridge(address, client_config, BRIDGE_AUTHORIZATION)
+                .await
+                .expect("authenticated bridge");
+            timeout(
+                TEST_OPERATION_TIMEOUT,
+                socket.send(websocket_text(&BridgeToControllerV1::Activation(
+                    activation_request(BrokerMappingExpectationV1::Absent),
+                ))),
+            )
+            .await
+            .expect("activation write deadline")
+            .expect("activation request");
+            timeout(TEST_OPERATION_TIMEOUT, async {
+                while registry.retry_pairing(session_id()) != RelayPairingOutcome::AwaitingPeer {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("bridge lane must attach");
+
+            stop_listener(shutdown, listener).await;
+            assert_eq!(
+                registry.retry_pairing(session_id()),
+                RelayPairingOutcome::Unavailable
+            );
+            wait_for_losses(&controller, 1).await;
+        }
+    }
 }

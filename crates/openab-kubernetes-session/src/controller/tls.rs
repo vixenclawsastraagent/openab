@@ -134,6 +134,12 @@ pub enum ControllerTlsConnectionError {
     Connection(#[source] Box<ControllerConnectionError>),
 }
 
+impl ControllerTlsConnectionError {
+    pub(super) fn is_process_fatal(&self) -> bool {
+        matches!(self, Self::Connection(source) if source.is_process_fatal())
+    }
+}
+
 fn read_certificates<R>(reader: R) -> Result<Vec<CertificateDer<'static>>, ControllerTlsConfigError>
 where
     R: BufRead,

@@ -320,6 +320,23 @@ pub enum ControllerConnectionError {
     Worker(#[source] Box<WorkerWebSocketError>),
 }
 
+impl ControllerConnectionError {
+    pub(super) fn is_process_fatal(&self) -> bool {
+        match self {
+            Self::MissingUpgradeAuthority => true,
+            Self::Bridge(source) => matches!(
+                source.as_ref(),
+                ControllerBridgeWebSocketError::UnsafeConfiguration
+                    | ControllerBridgeWebSocketError::InvalidLifecycleRetryInterval
+            ),
+            Self::Worker(source) => {
+                matches!(source.as_ref(), WorkerWebSocketError::UnsafeConfiguration)
+            }
+            Self::UpgradeTimedOut | Self::UpgradeHandshake(_) => false,
+        }
+    }
+}
+
 impl From<AuthenticatedUpgradeError> for ControllerConnectionError {
     fn from(error: AuthenticatedUpgradeError) -> Self {
         match error {

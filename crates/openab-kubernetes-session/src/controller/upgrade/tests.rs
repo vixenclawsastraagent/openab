@@ -68,6 +68,32 @@ fn endpoint_config_rejects_zero_timeouts_and_unsafe_release_retry() {
 }
 
 #[test]
+fn only_process_invariants_are_fatal_to_the_listener() {
+    for error in [
+        ControllerConnectionError::MissingUpgradeAuthority,
+        ControllerConnectionError::Bridge(Box::new(
+            ControllerBridgeWebSocketError::UnsafeConfiguration,
+        )),
+        ControllerConnectionError::Bridge(Box::new(
+            ControllerBridgeWebSocketError::InvalidLifecycleRetryInterval,
+        )),
+        ControllerConnectionError::Worker(Box::new(WorkerWebSocketError::UnsafeConfiguration)),
+    ] {
+        assert!(error.is_process_fatal());
+    }
+
+    for error in [
+        ControllerConnectionError::UpgradeTimedOut,
+        ControllerConnectionError::Bridge(Box::new(
+            ControllerBridgeWebSocketError::ActivationTimedOut,
+        )),
+        ControllerConnectionError::Worker(Box::new(WorkerWebSocketError::RegistrationTimedOut)),
+    ] {
+        assert!(!error.is_process_fatal());
+    }
+}
+
+#[test]
 fn global_connection_admission_is_bounded_and_raii() {
     let admission = ConnectionAdmission::new(NonZeroUsize::new(1).expect("non-zero"));
     let permit = admission.try_acquire().expect("first connection");

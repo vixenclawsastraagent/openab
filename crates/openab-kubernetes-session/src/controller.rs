@@ -6,6 +6,8 @@ mod cleanup;
 mod composition;
 mod generation;
 mod lifecycle;
+#[cfg(feature = "controller-runtime")]
+mod listener;
 mod locks;
 mod registration;
 mod relay;
@@ -49,6 +51,8 @@ pub use lifecycle::{
     LifecycleCoordinator, LifecycleError, LifecycleReconcileOutcome, OrphanAuthority,
     OrphanAuthorityError, OrphanContainmentOutcome,
 };
+#[cfg(feature = "controller-runtime")]
+pub use listener::{ControllerListener, ControllerListenerError};
 pub use locks::{SessionLockGuard, SessionLocks};
 pub use registration::{
     BootstrapPresence, ConsumedBootstrap, RegisteredWorker, RegistrationCoordinator,

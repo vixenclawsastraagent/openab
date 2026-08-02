@@ -299,6 +299,25 @@ Organization-managed skills may be baked into the image or mounted read-only
 at a pinned version. Any generated state, credentials, mutable configuration,
 or behavior-affecting cache remains session-private.
 
+### 4.4 Controller transport boundary
+
+The controller WebSocket endpoint is cluster-internal infrastructure, not a
+public application endpoint. The add-on must expose it only through a
+namespace-local Service and a default-deny ingress policy that admits the
+selected broker and generated worker Pods. It must not create an Ingress,
+public load balancer, NodePort, or plaintext fallback.
+
+Connection admission happens immediately after TCP accept and before TLS. This
+bounds slow TLS and HTTP handshakes together with active relay connections, but
+the permit is necessarily acquired before the peer is authenticated. A source
+that can reach the Service can therefore hold permits until the fixed TLS
+deadline. The MVP deployment must combine the bounded pool and fixed deadlines
+with restricted Service exposure; environments whose worker workloads are
+hostile to controller availability must additionally enforce per-source L4
+connection limits or use role-separated admission pools. This availability
+limit does not permit a worker to cross a session's filesystem or Kubernetes
+authority boundary.
+
 ## 5. State and fencing
 
 The initial durable source of truth is one namespaced ConfigMap lifecycle
