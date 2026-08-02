@@ -11,6 +11,7 @@ mod relay;
 mod release;
 mod rendezvous;
 mod service;
+mod upgrade;
 mod worker_websocket;
 
 pub use activation::{
@@ -70,5 +71,11 @@ pub(crate) use rendezvous::{
 pub use service::{
     ControllerService, ControllerServiceConfigError, ControllerServiceError,
     LifecycleServiceOutcome,
+};
+pub use upgrade::{
+    ControllerAdmissionError, ControllerConnection, ControllerConnectionError,
+    ControllerConnectionOutcome, ControllerEndpoint, ControllerEndpointBuildError,
+    ControllerEndpointConfig, ControllerEndpointConfigError, BRIDGE_WEBSOCKET_PATH,
+    WORKER_POD_UID_HEADER, WORKER_WEBSOCKET_PATH,
 };
 pub use worker_websocket::{serve_worker_websocket, worker_websocket_config, WorkerWebSocketError};

@@ -22,18 +22,11 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::WebSocketStream;
 
-const MIN_RELEASE_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+pub(super) const MIN_RELEASE_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Finite transport limits for an already-upgraded broker bridge socket.
 pub fn controller_bridge_websocket_config() -> WebSocketConfig {
-    WebSocketConfig {
-        write_buffer_size: 0,
-        max_write_buffer_size: MAX_ACP_FRAME_BYTES + MAX_CONTROL_FRAME_BYTES,
-        max_message_size: Some(MAX_ACP_FRAME_BYTES),
-        max_frame_size: Some(MAX_ACP_FRAME_BYTES),
-        accept_unmasked_frames: false,
-        ..WebSocketConfig::default()
-    }
+    super::upgrade::relay_websocket_config()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
