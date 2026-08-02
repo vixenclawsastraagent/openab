@@ -145,6 +145,10 @@ fn annotations(
     object.annotations.as_ref().unwrap()
 }
 
+fn metadata_name(object: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta) -> &str {
+    object.name.as_deref().unwrap()
+}
+
 fn mark_observed(
     metadata: &mut k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta,
     uid: &str,
@@ -428,6 +432,286 @@ fn default_generation_is_hardened_and_fully_bound() {
         assert!(resources.requests.as_ref().unwrap().contains_key(name));
         assert!(resources.limits.as_ref().unwrap().contains_key(name));
     }
+}
+
+#[test]
+fn two_session_generation_contract_is_private_by_construction() {
+    // This test proves the desired Kubernetes manifest contract. Actual mount
+    // namespace and filesystem enforcement remains a cluster smoke-test
+    // responsibility.
+    let shared_skills = ConfigMap {
+        immutable: Some(true),
+        metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+            name: Some("team-skills-2026-08-01".into()),
+            namespace: Some(NAMESPACE.into()),
+            uid: Some("team-skills-uid".into()),
+            resource_version: Some("team-skills-rv-42".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let skills_pin = PinnedSkillsConfigMap::from_observed(NAMESPACE, &shared_skills).unwrap();
+    let build_session = |logical_session_key: &str,
+                         attempt_id: u128,
+                         incarnation_id: u128,
+                         anchor_uid: &str,
+                         token| {
+        let now = Utc.with_ymd_and_hms(2026, 8, 1, 8, 0, 0).unwrap();
+        let anchor = SessionAnchorV1::new(
+            SessionId::derive("private-team-scope", logical_session_key),
+            ScopeId::derive("private-team-scope"),
+            ProfileRef::new(PROFILE_NAME, PROFILE_VERSION).unwrap(),
+            Uuid::from_u128(attempt_id),
+            Uuid::from_u128(incarnation_id),
+            now,
+            now + Duration::minutes(15),
+            now + Duration::hours(72),
+        )
+        .unwrap();
+        let names = ResourceNames::new(anchor.session_id());
+        let context =
+            GenerationContext::from_anchor(NAMESPACE, names.anchor(), anchor_uid, &anchor, names)
+                .unwrap();
+        DesiredGeneration::build(
+            context,
+            profile(
+                PvcAccessMode::ReadWriteOncePod,
+                None,
+                Some(skills_pin.clone()),
+            ),
+            token,
+        )
+        .unwrap()
+    };
+    let session_a = build_session(
+        "discord:private-thread-a",
+        0xa1,
+        0xa2,
+        "anchor-uid-session-a",
+        [0xa5; 32],
+    );
+    let session_b = build_session(
+        "discord:private-thread-b",
+        0xb1,
+        0xb2,
+        "anchor-uid-session-b",
+        [0xb5; 32],
+    );
+
+    assert_eq!(
+        session_a.context().scope_id(),
+        session_b.context().scope_id()
+    );
+    assert_ne!(
+        session_a.context().session_id(),
+        session_b.context().session_id()
+    );
+    let private_names_a = [
+        session_a.context().anchor_name(),
+        metadata_name(&session_a.persistent_volume_claim().metadata),
+        metadata_name(&session_a.registration_secret().metadata),
+        metadata_name(&session_a.service_account().metadata),
+        metadata_name(&session_a.pod().metadata),
+        metadata_name(&session_a.network_policy().metadata),
+    ];
+    let private_names_b = [
+        session_b.context().anchor_name(),
+        metadata_name(&session_b.persistent_volume_claim().metadata),
+        metadata_name(&session_b.registration_secret().metadata),
+        metadata_name(&session_b.service_account().metadata),
+        metadata_name(&session_b.pod().metadata),
+        metadata_name(&session_b.network_policy().metadata),
+    ];
+    for (private_a, private_b) in private_names_a.iter().zip(private_names_b.iter()) {
+        assert_ne!(private_a, private_b);
+    }
+
+    for (desired, other) in [(&session_a, &session_b), (&session_b, &session_a)] {
+        let pod_spec = desired.pod().spec.as_ref().unwrap();
+        let own_pvc_name = metadata_name(&desired.persistent_volume_claim().metadata);
+        let other_pvc_name = metadata_name(&other.persistent_volume_claim().metadata);
+        let own_registration_secret = metadata_name(&desired.registration_secret().metadata);
+        let other_registration_secret = metadata_name(&other.registration_secret().metadata);
+        let own_service_account = metadata_name(&desired.service_account().metadata);
+        let other_service_account = metadata_name(&other.service_account().metadata);
+        let volumes = pod_spec.volumes.as_ref().unwrap();
+        let mounts = pod_spec.containers[0].volume_mounts.as_ref().unwrap();
+
+        assert_eq!(
+            pod_spec.service_account_name.as_deref(),
+            Some(own_service_account)
+        );
+        assert_ne!(
+            pod_spec.service_account_name.as_deref(),
+            Some(other_service_account)
+        );
+        assert_eq!(pod_spec.service_account, pod_spec.service_account_name);
+        assert_eq!(pod_spec.automount_service_account_token, Some(false));
+        assert_eq!(
+            desired.service_account().automount_service_account_token,
+            Some(false)
+        );
+        assert!(desired.service_account().secrets.is_none());
+
+        let session_volume = volumes
+            .iter()
+            .find(|volume| volume.name == "session")
+            .unwrap();
+        assert_eq!(
+            session_volume
+                .persistent_volume_claim
+                .as_ref()
+                .unwrap()
+                .claim_name,
+            own_pvc_name
+        );
+        assert_ne!(
+            session_volume
+                .persistent_volume_claim
+                .as_ref()
+                .unwrap()
+                .claim_name,
+            other_pvc_name
+        );
+        assert_eq!(
+            volumes
+                .iter()
+                .filter(|volume| volume.persistent_volume_claim.is_some())
+                .count(),
+            1
+        );
+        let registration_volume = volumes
+            .iter()
+            .find(|volume| volume.name == "registration")
+            .unwrap();
+        assert_eq!(
+            registration_volume
+                .secret
+                .as_ref()
+                .unwrap()
+                .secret_name
+                .as_deref(),
+            Some(own_registration_secret)
+        );
+        assert_ne!(
+            registration_volume
+                .secret
+                .as_ref()
+                .unwrap()
+                .secret_name
+                .as_deref(),
+            Some(other_registration_secret)
+        );
+        assert_eq!(
+            volumes
+                .iter()
+                .filter(|volume| volume.secret.is_some())
+                .count(),
+            1
+        );
+        assert!(volumes.iter().all(|volume| {
+            volume.host_path.is_none() && volume.nfs.is_none() && volume.projected.is_none()
+        }));
+        assert_eq!(
+            mounts
+                .iter()
+                .filter(|mount| mount.read_only != Some(true))
+                .map(|mount| mount.name.as_str())
+                .collect::<Vec<_>>(),
+            ["session", "tmp", "var-tmp", "openab-run"]
+        );
+        assert!(mounts
+            .iter()
+            .filter(|mount| matches!(mount.name.as_str(), "registration" | "skills"))
+            .all(|mount| mount.read_only == Some(true)));
+        assert_eq!(
+            pod_spec.containers[0]
+                .security_context
+                .as_ref()
+                .unwrap()
+                .read_only_root_filesystem,
+            Some(true)
+        );
+        let env = pod_spec.containers[0].env.as_ref().unwrap();
+        assert_eq!(
+            env.iter()
+                .find(|entry| entry.name == "HOME")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("/session/home")
+        );
+        assert_eq!(
+            env.iter()
+                .find(|entry| entry.name == "OPENAB_WORKSPACE")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("/session/workspace")
+        );
+
+        let skills_volume = volumes
+            .iter()
+            .find(|volume| volume.name == "skills")
+            .unwrap();
+        assert_eq!(
+            skills_volume.config_map.as_ref().unwrap().name,
+            "team-skills-2026-08-01"
+        );
+        assert_eq!(
+            skills_volume.config_map.as_ref().unwrap().default_mode,
+            Some(0o444)
+        );
+        let skills_mount = mounts.iter().find(|mount| mount.name == "skills").unwrap();
+        assert_eq!(skills_mount.mount_path, "/opt/openab/skills");
+        assert_eq!(skills_mount.read_only, Some(true));
+        desired.validate_skills_config_map(&shared_skills).unwrap();
+
+        let policy = desired.network_policy().spec.as_ref().unwrap();
+        let other_policy = other.network_policy().spec.as_ref().unwrap();
+        assert!(policy.ingress.is_none());
+        assert_ne!(policy.pod_selector, other_policy.pod_selector);
+        assert_eq!(policy.egress, other_policy.egress);
+    }
+
+    assert_ne!(
+        session_a
+            .registration_secret()
+            .data
+            .as_ref()
+            .unwrap()
+            .get("token"),
+        session_b
+            .registration_secret()
+            .data
+            .as_ref()
+            .unwrap()
+            .get("token")
+    );
+
+    let mut observed_b_pvc = session_b.persistent_volume_claim().clone();
+    mark_observed(&mut observed_b_pvc.metadata, "session-b-pvc-uid");
+    assert!(session_a
+        .validate_persistent_volume_claim(&observed_b_pvc)
+        .is_err());
+    let mut observed_b_secret = session_b.registration_secret().clone();
+    mark_observed(&mut observed_b_secret.metadata, "session-b-secret-uid");
+    assert!(session_a
+        .validate_registration_secret(&observed_b_secret)
+        .is_err());
+    let mut observed_b_account = session_b.service_account().clone();
+    mark_observed(&mut observed_b_account.metadata, "session-b-account-uid");
+    assert!(session_a
+        .validate_service_account(&observed_b_account)
+        .is_err());
+    let mut observed_b_pod = session_b.pod().clone();
+    mark_observed(&mut observed_b_pod.metadata, "session-b-pod-uid");
+    assert!(session_a.validate_pod(&observed_b_pod).is_err());
+    let mut observed_b_policy = session_b.network_policy().clone();
+    mark_observed(&mut observed_b_policy.metadata, "session-b-policy-uid");
+    assert!(session_a
+        .validate_network_policy(&observed_b_policy)
+        .is_err());
 }
 
 #[test]
