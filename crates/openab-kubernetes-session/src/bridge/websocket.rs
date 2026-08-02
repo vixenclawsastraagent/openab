@@ -71,7 +71,7 @@ pub enum BridgeWebSocketError {
     #[error("bridge WebSocket closed after activation")]
     ClosedAfterActivation,
     #[error("bridge WebSocket transport failed")]
-    Transport(#[source] tungstenite::Error),
+    Transport(#[source] Box<tungstenite::Error>),
     #[error("bridge WebSocket writes timed out")]
     WebSocketWriteTimedOut,
     #[error("broker stdout writes timed out")]
@@ -260,7 +260,7 @@ where
             frame = stream.next() => {
                 let frame = frame
                     .ok_or(BridgeWebSocketError::ClosedAfterActivation)?
-                    .map_err(BridgeWebSocketError::Transport)?;
+                    .map_err(|source| BridgeWebSocketError::Transport(Box::new(source)))?;
                 match frame {
                     Message::Text(text) => {
                         let message = decode_frame::<ControllerToBridgeV1>(text.as_bytes())
@@ -331,7 +331,7 @@ where
             frame = socket.next() => {
                 let frame = frame
                     .ok_or(BridgeWebSocketError::ClosedBeforeActivation)?
-                    .map_err(BridgeWebSocketError::Transport)?;
+                    .map_err(|source| BridgeWebSocketError::Transport(Box::new(source)))?;
                 match frame {
                     Message::Text(text) => {
                         let message = decode_frame::<ControllerToBridgeV1>(text.as_bytes())
@@ -419,7 +419,7 @@ where
             frame = socket.next() => {
                 let frame = frame
                     .ok_or(BridgeWebSocketError::ClosedBeforeActivation)?
-                    .map_err(BridgeWebSocketError::Transport)?;
+                    .map_err(|source| BridgeWebSocketError::Transport(Box::new(source)))?;
                 match frame {
                     Message::Ping(_) => flush_websocket(socket, write_timeout).await?,
                     Message::Pong(_) => {}
@@ -583,7 +583,7 @@ where
     let text = String::from_utf8(bytes).map_err(BridgeWebSocketError::OutboundUtf8)?;
     match timeout(write_timeout, sink.send(Message::Text(text))).await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(source)) => Err(BridgeWebSocketError::Transport(source)),
+        Ok(Err(source)) => Err(BridgeWebSocketError::Transport(Box::new(source))),
         Err(_) => Err(BridgeWebSocketError::WebSocketWriteTimedOut),
     }
 }
@@ -597,7 +597,7 @@ where
 {
     match timeout(write_timeout, sink.flush()).await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(source)) => Err(BridgeWebSocketError::Transport(source)),
+        Ok(Err(source)) => Err(BridgeWebSocketError::Transport(Box::new(source))),
         Err(_) => Err(BridgeWebSocketError::WebSocketWriteTimedOut),
     }
 }

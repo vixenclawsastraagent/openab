@@ -57,7 +57,7 @@ pub enum ControllerBridgeWebSocketError {
     #[error("controller bridge sent another application frame while activation was pending")]
     MessageDuringActivation,
     #[error("controller bridge WebSocket transport failed")]
-    Transport(#[source] tungstenite::Error),
+    Transport(#[source] Box<tungstenite::Error>),
     #[error(
         "controller bridge WebSocket requires a text activation as its first application frame"
     )]
@@ -206,7 +206,7 @@ where
             .next()
             .await
             .ok_or(ControllerBridgeWebSocketError::ClosedBeforeActivation)?
-            .map_err(ControllerBridgeWebSocketError::Transport)?;
+            .map_err(|source| ControllerBridgeWebSocketError::Transport(Box::new(source)))?;
         match frame {
             Message::Text(text) => {
                 return match decode_frame(text.as_bytes())
@@ -249,7 +249,9 @@ where
             frame = socket.next() => {
                 let frame = frame
                     .ok_or(ControllerBridgeWebSocketError::ClosedDuringActivation)?
-                    .map_err(ControllerBridgeWebSocketError::Transport)?;
+                    .map_err(|source| {
+                        ControllerBridgeWebSocketError::Transport(Box::new(source))
+                    })?;
                 match frame {
                     Message::Ping(_) => flush_sink(socket, write_timeout).await?,
                     Message::Pong(_) => {}
@@ -398,7 +400,7 @@ where
     R: Stream<Item = Result<Message, tungstenite::Error>> + Unpin,
 {
     while let Some(frame) = stream.next().await {
-        match frame.map_err(ControllerBridgeWebSocketError::Transport)? {
+        match frame.map_err(|source| ControllerBridgeWebSocketError::Transport(Box::new(source)))? {
             Message::Text(text) => {
                 let message = decode_frame(text.as_bytes())
                     .map_err(ControllerBridgeWebSocketError::InvalidMessageFrame)?;
@@ -532,7 +534,7 @@ fn handle_lifecycle_control_frame(
 ) -> Result<(), ControllerBridgeWebSocketError> {
     let frame = frame
         .ok_or(ControllerBridgeWebSocketError::ClosedDuringLifecycle)?
-        .map_err(ControllerBridgeWebSocketError::Transport)?;
+        .map_err(|source| ControllerBridgeWebSocketError::Transport(Box::new(source)))?;
     match frame {
         Message::Ping(_) => request_flush(flush_requests),
         Message::Pong(_) => Ok(()),
@@ -591,7 +593,7 @@ where
                 match timeout(write_timeout, sink.send(Message::Text(text))).await {
                     Ok(Ok(())) => {}
                     Ok(Err(source)) => {
-                        return Err(ControllerBridgeWebSocketError::Transport(source))
+                        return Err(ControllerBridgeWebSocketError::Transport(Box::new(source)))
                     }
                     Err(_) => return Err(ControllerBridgeWebSocketError::WriteTimedOut),
                 }
@@ -729,7 +731,7 @@ where
     let text = String::from_utf8(bytes).map_err(ControllerBridgeWebSocketError::OutboundUtf8)?;
     match timeout(write_timeout, socket.send(Message::Text(text))).await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(source)) => Err(ControllerBridgeWebSocketError::Transport(source)),
+        Ok(Err(source)) => Err(ControllerBridgeWebSocketError::Transport(Box::new(source))),
         Err(_) => Err(ControllerBridgeWebSocketError::WriteTimedOut),
     }
 }
@@ -743,7 +745,7 @@ where
 {
     match timeout(write_timeout, socket.close(None)).await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(source)) => Err(ControllerBridgeWebSocketError::Transport(source)),
+        Ok(Err(source)) => Err(ControllerBridgeWebSocketError::Transport(Box::new(source))),
         Err(_) => Err(ControllerBridgeWebSocketError::CloseTimedOut),
     }
 }
@@ -757,7 +759,7 @@ where
 {
     match timeout(write_timeout, sink.flush()).await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(source)) => Err(ControllerBridgeWebSocketError::Transport(source)),
+        Ok(Err(source)) => Err(ControllerBridgeWebSocketError::Transport(Box::new(source))),
         Err(_) => Err(ControllerBridgeWebSocketError::WriteTimedOut),
     }
 }

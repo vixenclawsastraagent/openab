@@ -14,6 +14,10 @@ bridge-runtime = [
     "dep:futures-util",
     "dep:tokio",
     "dep:tokio-tungstenite",
+    "tokio/io-std",
+    "tokio/net",
+    "tokio-tungstenite/connect",
+    "tokio-tungstenite/rustls-tls-native-roots",
 ]
 controller = [
     "dep:futures-util",
@@ -53,3 +57,8 @@ uuid = { version = "1", features = ["serde", "v4"] }
 http = "1"
 tokio = { version = "1", features = ["io-util", "macros", "rt", "test-util", "time"] }
 tower-test = "0.4"
+
+[[bin]]
+name = "openab-kubernetes-session"
+path = "src/bin/openab-kubernetes-session.rs"
+required-features = ["bridge-runtime"]
