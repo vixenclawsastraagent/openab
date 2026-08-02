@@ -1,4 +1,5 @@
 use super::OrphanAuthority;
+use crate::bridge::SessionBinding;
 use crate::identity::{ScopeId, SessionId};
 use crate::resources::SESSION_WORKSPACE_V1;
 use crate::state::ProfileRef;
@@ -346,6 +347,10 @@ impl<M> RelayOutboundItem<M> {
 
     fn into_message(self) -> M {
         self.message
+    }
+
+    pub(crate) fn message(&self) -> &M {
+        &self.message
     }
 }
 
@@ -759,6 +764,28 @@ pub struct RendezvousRegistry {
 }
 
 impl RendezvousRegistry {
+    pub(crate) fn active_bridge_binding(
+        &self,
+        connection: &RelayConnection,
+    ) -> Result<SessionBinding, RendezvousRouteError> {
+        if connection.lane != RelayLane::Bridge {
+            return Err(RendezvousRouteError::StaleConnection);
+        }
+        let state = self.lock_state();
+        let Some(session) = state.sessions.get(&connection.session_id) else {
+            return Err(RendezvousRouteError::StaleConnection);
+        };
+        if !session.state.contains(connection) {
+            return Err(RendezvousRouteError::StaleConnection);
+        }
+        match &session.state {
+            RelaySessionState::Active { .. } => Ok(session.authority.binding().clone()),
+            RelaySessionState::Pairing { .. } => Err(RendezvousRouteError::AwaitingPeer),
+            RelaySessionState::Lifecycle(_) => Err(RendezvousRouteError::LifecyclePending),
+            RelaySessionState::Quiescing { .. } => Err(RendezvousRouteError::Quiescing),
+        }
+    }
+
     pub fn with_byte_budget(scope_id: ScopeId, byte_budget: RelayByteBudget) -> Self {
         let (health, _) = watch::channel(RendezvousHealth::Healthy);
         Self {

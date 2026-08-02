@@ -1,5 +1,6 @@
 mod activation;
 mod activity;
+mod bridge_websocket;
 mod cleanup;
 mod composition;
 mod generation;
@@ -20,6 +21,10 @@ pub use activation::{
 pub use activity::{
     ActivityCoordinator, ActivityError, ActivityEvent, ActivityOutcome, ActivityTurnId,
     ActivityTurnIdError,
+};
+pub use bridge_websocket::{
+    controller_bridge_websocket_config, serve_bridge_websocket, BridgeWebSocketOutcome,
+    ControllerBridgeWebSocketError,
 };
 pub use cleanup::{
     CleanupProgress, LifecycleProvisioner, ReleaseCleanupProgress, ReleaseProvisioner,
@@ -46,9 +51,9 @@ pub use registration::{
     WorkerBootstrapAuthError,
 };
 pub use relay::{
-    BridgeOpenOutcome, RelayAcpDeliveryOutcome, RelayAttachment, RelayContainmentFailure,
-    RelayContainmentReport, RelayDeliveryError, RelayLifecycleError, RelayLifecycleOutcome,
-    RelayLossOutcome, RelayOpenError, RelayOrchestrator,
+    BridgeOpenOutcome, RelayAcpDeliveryOutcome, RelayActivityError, RelayAttachment,
+    RelayContainmentFailure, RelayContainmentReport, RelayDeliveryError, RelayLifecycleError,
+    RelayLifecycleOutcome, RelayLossOutcome, RelayOpenError, RelayOrchestrator,
 };
 pub use release::{ReleaseCoordinator, ReleaseError, ReleaseOutcome};
 pub use rendezvous::{

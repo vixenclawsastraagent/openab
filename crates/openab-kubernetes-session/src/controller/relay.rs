@@ -1,11 +1,12 @@
 use super::{
-    AcpRouteOutcome, ActivationPreparation, ControllerService, ControllerServiceError,
-    LifecycleAcquireOutcome, LifecycleAdmission, LifecycleDeliveryOutcome, LifecycleServiceOutcome,
-    OrphanAuthority, OrphanAuthorityError, OrphanContainmentOutcome, PendingActivation,
-    RegisteredWorker, RelayBackpressure, RelayByteBudget, RelayConnection, RelayConnectionLoss,
-    RelayContainmentCompletion, RelayContainmentTicket, RelayLifecycleTerminal, RelayOutboundItem,
-    RelayPairingOutcome, RendezvousHealth, RendezvousInstallError, RendezvousLifecycleError,
-    RendezvousRegistry, RendezvousRouteError, WorkerBootstrapAuth,
+    AcpRouteOutcome, ActivationPreparation, ActivityEvent, ActivityOutcome, ActivityTurnId,
+    ControllerService, ControllerServiceError, LifecycleAcquireOutcome, LifecycleAdmission,
+    LifecycleDeliveryOutcome, LifecycleServiceOutcome, OrphanAuthority, OrphanAuthorityError,
+    OrphanContainmentOutcome, PendingActivation, RegisteredWorker, RelayBackpressure,
+    RelayByteBudget, RelayConnection, RelayConnectionLoss, RelayContainmentCompletion,
+    RelayContainmentTicket, RelayLifecycleTerminal, RelayOutboundItem, RelayPairingOutcome,
+    RendezvousHealth, RendezvousInstallError, RendezvousLifecycleError, RendezvousRegistry,
+    RendezvousRouteError, WorkerBootstrapAuth,
 };
 use crate::bridge::SessionBinding;
 use crate::identity::{ScopeId, SessionId};
@@ -49,6 +50,13 @@ trait RelayController: Send + Sync {
         &self,
         request: &LifecycleRequestV1,
     ) -> Result<LifecycleServiceOutcome, ControllerServiceError>;
+
+    async fn record_activity(
+        &self,
+        binding: &SessionBinding,
+        turn_id: ActivityTurnId,
+        event: ActivityEvent,
+    ) -> Result<ActivityOutcome, ControllerServiceError>;
 }
 
 #[async_trait]
@@ -84,6 +92,15 @@ impl RelayController for ControllerService {
         request: &LifecycleRequestV1,
     ) -> Result<LifecycleServiceOutcome, ControllerServiceError> {
         ControllerService::lifecycle(self, request).await
+    }
+
+    async fn record_activity(
+        &self,
+        binding: &SessionBinding,
+        turn_id: ActivityTurnId,
+        event: ActivityEvent,
+    ) -> Result<ActivityOutcome, ControllerServiceError> {
+        ControllerService::record_activity(self, binding, turn_id, event).await
     }
 }
 
@@ -137,6 +154,14 @@ pub enum RelayDeliveryError {
     #[error("relay routing rejected the connection")]
     Rendezvous(#[source] RendezvousRouteError),
     #[error("controller containment failed")]
+    Controller(#[source] ControllerServiceError),
+}
+
+#[derive(Debug, Error)]
+pub enum RelayActivityError {
+    #[error("relay activity rejected the connection")]
+    Rendezvous(#[source] RendezvousRouteError),
+    #[error("controller activity persistence failed")]
     Controller(#[source] ControllerServiceError),
 }
 
@@ -399,6 +424,24 @@ impl RelayOrchestrator {
             .wait_for_route_capacity(connection, message)
             .await
             .map_err(RelayDeliveryError::Rendezvous)
+    }
+
+    /// Persist one controller-generated prompt activity event for the exact
+    /// active bridge lane before the transport advances that prompt.
+    pub async fn record_activity(
+        &self,
+        connection: &RelayConnection,
+        turn_id: ActivityTurnId,
+        event: ActivityEvent,
+    ) -> Result<ActivityOutcome, RelayActivityError> {
+        let binding = self
+            .registry
+            .active_bridge_binding(connection)
+            .map_err(RelayActivityError::Rendezvous)?;
+        self.controller
+            .record_activity(&binding, turn_id, event)
+            .await
+            .map_err(RelayActivityError::Controller)
     }
 
     /// Fence ACP and run one exact bridge lifecycle request in a
@@ -889,15 +932,17 @@ struct RegisteredWorkerParts {
 mod tests {
     use super::*;
     use crate::controller::{
-        serve_worker_websocket, worker_websocket_config, RendezvousRouteError, WorkerWebSocketError,
+        controller_bridge_websocket_config, serve_bridge_websocket, serve_worker_websocket,
+        worker_websocket_config, BridgeWebSocketOutcome, ControllerBridgeWebSocketError,
+        RendezvousRouteError, WorkerWebSocketError,
     };
     use crate::identity::ScopeId;
     use crate::state::Fence;
     use crate::wire::{
-        decode_frame, encode_frame, ActivationResponseV1, BrokerMappingExpectationV1,
-        ControllerToWorkerV1, HandshakeOutcomeV1, SessionBindingV1, ValidatedActivationOutcomeV1,
-        WireMessage, WorkerToControllerV1, MAX_ACP_FRAME_BYTES, MAX_CONTROL_FRAME_BYTES,
-        MAX_PROFILE_VERSION_BYTES,
+        decode_frame, encode_frame, ActivationResponseV1, BridgeToControllerV1,
+        BrokerMappingExpectationV1, ControllerToWorkerV1, HandshakeOutcomeV1, SessionBindingV1,
+        ValidatedActivationOutcomeV1, WireMessage, WorkerToControllerV1, MAX_ACP_FRAME_BYTES,
+        MAX_CONTROL_FRAME_BYTES, MAX_PROFILE_VERSION_BYTES,
     };
     use futures_util::{SinkExt, StreamExt};
     use serde_json::json;
@@ -950,9 +995,12 @@ mod tests {
         activation_gate: Mutex<Option<Gate>>,
         registration_gate: Mutex<Option<Gate>>,
         lifecycle_gate: Mutex<Option<Gate>>,
+        activity_gate: Mutex<Option<Gate>>,
         loss_gate: Mutex<Option<Gate>>,
         lifecycle_outcome: AtomicU8,
         lifecycle_calls: AtomicUsize,
+        lifecycle_requests: Mutex<Vec<LifecycleRequestV1>>,
+        activity_events: Mutex<Vec<(SessionBinding, ActivityTurnId, ActivityEvent)>>,
         loss_failures: AtomicUsize,
         loss_outcome: AtomicU8,
         losses: AtomicUsize,
@@ -970,9 +1018,12 @@ mod tests {
                 activation_gate: Mutex::new(None),
                 registration_gate: Mutex::new(None),
                 lifecycle_gate: Mutex::new(None),
+                activity_gate: Mutex::new(None),
                 loss_gate: Mutex::new(None),
                 lifecycle_outcome: AtomicU8::new(0),
                 lifecycle_calls: AtomicUsize::new(0),
+                lifecycle_requests: Mutex::new(Vec::new()),
+                activity_events: Mutex::new(Vec::new()),
                 loss_failures: AtomicUsize::new(0),
                 loss_outcome: AtomicU8::new(0),
                 losses: AtomicUsize::new(0),
@@ -991,6 +1042,10 @@ mod tests {
             *self.lifecycle_gate.lock().unwrap() = Some(gate);
         }
 
+        fn set_activity_gate(&self, gate: Gate) {
+            *self.activity_gate.lock().unwrap() = Some(gate);
+        }
+
         fn set_lifecycle_outcome(&self, outcome: LifecycleServiceOutcome) {
             self.lifecycle_outcome.store(
                 match outcome {
@@ -1000,6 +1055,14 @@ mod tests {
                 },
                 Ordering::SeqCst,
             );
+        }
+
+        fn lifecycle_requests(&self) -> Vec<LifecycleRequestV1> {
+            self.lifecycle_requests.lock().unwrap().clone()
+        }
+
+        fn activity_events(&self) -> Vec<(SessionBinding, ActivityTurnId, ActivityEvent)> {
+            self.activity_events.lock().unwrap().clone()
         }
 
         fn fail_lifecycle(&self) {
@@ -1112,12 +1175,16 @@ mod tests {
 
         async fn lifecycle(
             &self,
-            _request: &LifecycleRequestV1,
+            request: &LifecycleRequestV1,
         ) -> Result<LifecycleServiceOutcome, ControllerServiceError> {
             let gate = self.lifecycle_gate.lock().unwrap().clone();
             if let Some(gate) = gate {
                 gate.wait().await;
             }
+            self.lifecycle_requests
+                .lock()
+                .unwrap()
+                .push(request.clone());
             self.lifecycle_calls.fetch_add(1, Ordering::SeqCst);
             Ok(match self.lifecycle_outcome.load(Ordering::SeqCst) {
                 0 => LifecycleServiceOutcome::SuspendAccepted,
@@ -1125,6 +1192,23 @@ mod tests {
                 2 => LifecycleServiceOutcome::Released,
                 _ => return Err(ControllerServiceError::ScopeMismatch),
             })
+        }
+
+        async fn record_activity(
+            &self,
+            binding: &SessionBinding,
+            turn_id: ActivityTurnId,
+            event: ActivityEvent,
+        ) -> Result<ActivityOutcome, ControllerServiceError> {
+            let gate = self.activity_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.wait().await;
+            }
+            self.activity_events
+                .lock()
+                .unwrap()
+                .push((binding.clone(), turn_id, event));
+            Ok(ActivityOutcome::Recorded)
         }
     }
 
@@ -1246,6 +1330,88 @@ mod tests {
             panic!("the relay wire protocol must use text frames")
         };
         decode_frame(text.as_bytes()).unwrap()
+    }
+
+    type TestBridgeWebSocket = WebSocketStream<DuplexStream>;
+
+    async fn bridge_websocket_pair() -> (TestBridgeWebSocket, TestBridgeWebSocket) {
+        bridge_websocket_pair_with_capacity(256 * 1024).await
+    }
+
+    async fn bridge_websocket_pair_with_capacity(
+        capacity: usize,
+    ) -> (TestBridgeWebSocket, TestBridgeWebSocket) {
+        let (bridge_io, controller_io) = duplex(capacity);
+        let bridge = WebSocketStream::from_raw_socket(
+            bridge_io,
+            Role::Client,
+            Some(controller_bridge_websocket_config()),
+        )
+        .await;
+        let controller = WebSocketStream::from_raw_socket(
+            controller_io,
+            Role::Server,
+            Some(controller_bridge_websocket_config()),
+        )
+        .await;
+        (bridge, controller)
+    }
+
+    struct ActiveControllerBridge {
+        relay: RelayOrchestrator,
+        socket: TestBridgeWebSocket,
+        worker: RelayAttachment<ControllerToWorkerV1>,
+        driver:
+            tokio::task::JoinHandle<Result<BridgeWebSocketOutcome, ControllerBridgeWebSocketError>>,
+    }
+
+    async fn active_controller_bridge(
+        controller: Arc<FakeController>,
+        socket_capacity: usize,
+        write_timeout: Duration,
+        release_retry_interval: Duration,
+    ) -> ActiveControllerBridge {
+        let (relay, _registry) = orchestrator(controller);
+        let (mut socket, controller_socket) =
+            bridge_websocket_pair_with_capacity(socket_capacity).await;
+        let driver = tokio::spawn(serve_bridge_websocket(
+            relay.clone(),
+            controller_socket,
+            Duration::from_secs(1),
+            write_timeout,
+            release_retry_interval,
+        ));
+        let request = activation_request(BrokerMappingExpectationV1::Absent);
+        socket
+            .send(websocket_text(&BridgeToControllerV1::Activation(
+                request.clone(),
+            )))
+            .await
+            .unwrap();
+        let mut worker = relay.register_worker(registration(), auth()).await.unwrap();
+        let ControllerToWorkerV1::ProtocolResult(result) =
+            decode_outbound(worker.outbound().recv().await.unwrap())
+        else {
+            panic!("worker pairing must begin with its protocol result")
+        };
+        assert_eq!(
+            result.into_handshake_outcome().unwrap(),
+            HandshakeOutcomeV1::Ack
+        );
+        let ControllerToBridgeV1::Activation(response) = receive_websocket_text(&mut socket).await
+        else {
+            panic!("bridge pairing must begin with its activation response")
+        };
+        assert!(matches!(
+            response.into_validated_outcome(&request).unwrap(),
+            ValidatedActivationOutcomeV1::Activated { .. }
+        ));
+        ActiveControllerBridge {
+            relay,
+            socket,
+            worker,
+            driver,
+        }
     }
 
     fn orchestrator(controller: Arc<FakeController>) -> (RelayOrchestrator, RendezvousRegistry) {
@@ -2910,6 +3076,527 @@ mod tests {
         ));
         let queued = worker.outbound().recv().await.unwrap();
         assert_eq!(decode_outbound(queued), ControllerToWorkerV1::Acp(message));
+    }
+
+    #[tokio::test]
+    async fn relay_activity_requires_the_exact_active_bridge_lane() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let (relay, _registry) = orchestrator(Arc::clone(&controller));
+        let BridgeOpenOutcome::Attached(mut bridge) = relay
+            .activate_bridge(activation_request(BrokerMappingExpectationV1::Absent))
+            .await
+            .unwrap()
+        else {
+            panic!("durable generation must attach")
+        };
+        let turn_id = ActivityTurnId::from_uuid(Uuid::from_u128(0xa11)).unwrap();
+
+        assert!(matches!(
+            relay
+                .record_activity(bridge.connection(), turn_id, ActivityEvent::PromptStarted)
+                .await,
+            Err(RelayActivityError::Rendezvous(
+                RendezvousRouteError::AwaitingPeer
+            ))
+        ));
+
+        let mut worker = relay.register_worker(registration(), auth()).await.unwrap();
+        drop(bridge.outbound().recv().await.unwrap());
+        drop(worker.outbound().recv().await.unwrap());
+        assert_eq!(
+            relay
+                .record_activity(bridge.connection(), turn_id, ActivityEvent::PromptStarted)
+                .await
+                .unwrap(),
+            ActivityOutcome::Recorded
+        );
+        assert_eq!(
+            controller.activity_events(),
+            vec![(binding(), turn_id, ActivityEvent::PromptStarted)]
+        );
+        assert!(matches!(
+            relay
+                .record_activity(worker.connection(), turn_id, ActivityEvent::PromptFinished)
+                .await,
+            Err(RelayActivityError::Rendezvous(
+                RendezvousRouteError::StaleConnection
+            ))
+        ));
+    }
+
+    #[test]
+    fn controller_bridge_websocket_limits_cover_the_wire_ceiling() {
+        let config = controller_bridge_websocket_config();
+        assert_eq!(config.max_message_size, Some(MAX_ACP_FRAME_BYTES));
+        assert_eq!(config.max_frame_size, Some(MAX_ACP_FRAME_BYTES));
+        assert!(!config.accept_unmasked_frames);
+        assert_eq!(config.write_buffer_size, 0);
+        assert_eq!(
+            config.max_write_buffer_size,
+            MAX_ACP_FRAME_BYTES + MAX_CONTROL_FRAME_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn controller_bridge_websocket_requires_activation_first() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let (relay, _registry) = orchestrator(Arc::clone(&controller));
+        let (mut bridge_socket, controller_socket) = bridge_websocket_pair().await;
+        let driver = tokio::spawn(serve_bridge_websocket(
+            relay,
+            controller_socket,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+        ));
+        let acp = AcpMessageV1::new(json!({"jsonrpc": "2.0", "method": "initialize"})).unwrap();
+
+        bridge_socket
+            .send(websocket_text(&BridgeToControllerV1::Acp(acp)))
+            .await
+            .unwrap();
+        let ControllerToBridgeV1::ProtocolResult(result) =
+            receive_websocket_text(&mut bridge_socket).await
+        else {
+            panic!("an invalid first frame must receive a sanitized result")
+        };
+        assert_eq!(
+            result.into_handshake_outcome().unwrap(),
+            HandshakeOutcomeV1::Fatal(FatalCode::InvalidMessage)
+        );
+        assert!(matches!(
+            driver.await.unwrap(),
+            Err(ControllerBridgeWebSocketError::ExpectedActivation)
+        ));
+        assert_eq!(controller.losses.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn controller_bridge_websocket_returns_correlated_mapping_absence() {
+        let controller = Arc::new(FakeController::new(binding()));
+        controller.activation_mode.store(1, Ordering::SeqCst);
+        let (relay, registry) = orchestrator(Arc::clone(&controller));
+        let (mut bridge_socket, controller_socket) = bridge_websocket_pair().await;
+        let driver = tokio::spawn(serve_bridge_websocket(
+            relay,
+            controller_socket,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+        ));
+        let request = activation_request(BrokerMappingExpectationV1::Present);
+
+        bridge_socket
+            .send(websocket_text(&BridgeToControllerV1::Activation(
+                request.clone(),
+            )))
+            .await
+            .unwrap();
+        let ControllerToBridgeV1::Activation(response) =
+            receive_websocket_text(&mut bridge_socket).await
+        else {
+            panic!("mapping absence must use the activation response envelope")
+        };
+        assert_eq!(
+            response.into_validated_outcome(&request).unwrap(),
+            ValidatedActivationOutcomeV1::MappingAbsent
+        );
+        assert_eq!(
+            driver.await.unwrap().unwrap(),
+            BridgeWebSocketOutcome::MappingAbsent
+        );
+        assert_eq!(
+            registry.retry_pairing(session_id()),
+            RelayPairingOutcome::Unavailable
+        );
+        assert_eq!(controller.losses.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn controller_bridge_websocket_routes_acp_both_directions() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let mut active = active_controller_bridge(
+            Arc::clone(&controller),
+            256 * 1024,
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+        )
+        .await;
+        let from_bridge = AcpMessageV1::new(json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"direction": "bridge-to-worker"}
+        }))
+        .unwrap();
+        active
+            .socket
+            .send(websocket_text(&BridgeToControllerV1::Acp(
+                from_bridge.clone(),
+            )))
+            .await
+            .unwrap();
+        assert_eq!(
+            decode_outbound(
+                timeout(Duration::from_secs(1), active.worker.outbound().recv())
+                    .await
+                    .expect("bridge ACP must reach the exact worker lane")
+                    .unwrap()
+            ),
+            ControllerToWorkerV1::Acp(from_bridge)
+        );
+
+        let from_worker = AcpMessageV1::new(json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"direction": "worker-to-bridge"}
+        }))
+        .unwrap();
+        assert_eq!(
+            active
+                .relay
+                .route_acp(active.worker.connection(), from_worker.clone())
+                .await
+                .unwrap(),
+            RelayAcpDeliveryOutcome::Delivered
+        );
+        assert_eq!(
+            receive_websocket_text::<ControllerToBridgeV1>(&mut active.socket).await,
+            ControllerToBridgeV1::Acp(from_worker)
+        );
+
+        active.socket.close(None).await.unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(1), active.driver)
+                .await
+                .expect("bridge close must complete containment")
+                .unwrap()
+                .unwrap(),
+            BridgeWebSocketOutcome::ConnectionLost(RelayLossOutcome::Contained(
+                OrphanContainmentOutcome::ContainmentAccepted
+            ))
+        ));
+        assert_eq!(controller.losses.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn controller_bridge_persists_prompt_activity_before_crossing_each_lane() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let activity_gate = Gate::new();
+        controller.set_activity_gate(activity_gate.clone());
+        let mut active = active_controller_bridge(
+            Arc::clone(&controller),
+            256 * 1024,
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+        )
+        .await;
+        let prompt = AcpMessageV1::new(json!({
+            "jsonrpc": "2.0",
+            "id": 41,
+            "method": "session/prompt",
+            "params": {"prompt": [{"type": "text", "text": "isolate this turn"}]}
+        }))
+        .unwrap();
+
+        active
+            .socket
+            .send(websocket_text(&BridgeToControllerV1::Acp(prompt.clone())))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), activity_gate.started.acquire())
+            .await
+            .expect("prompt start persistence must begin")
+            .unwrap()
+            .forget();
+        assert!(matches!(
+            active.worker.outbound().try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        activity_gate.release.add_permits(1);
+        assert_eq!(
+            decode_outbound(
+                timeout(Duration::from_secs(1), active.worker.outbound().recv())
+                    .await
+                    .expect("durable prompt start must unblock worker delivery")
+                    .unwrap()
+            ),
+            ControllerToWorkerV1::Acp(prompt)
+        );
+        let started = controller.activity_events();
+        let [(recorded_binding, turn_id, ActivityEvent::PromptStarted)] = started.as_slice() else {
+            panic!("one durable prompt-start event must precede worker delivery")
+        };
+        assert_eq!(recorded_binding, &binding());
+        let turn_id = *turn_id;
+
+        let response = AcpMessageV1::new(json!({
+            "jsonrpc": "2.0",
+            "id": 41,
+            "result": {"stopReason": "end_turn"}
+        }))
+        .unwrap();
+        assert_eq!(
+            active
+                .relay
+                .route_acp(active.worker.connection(), response.clone())
+                .await
+                .unwrap(),
+            RelayAcpDeliveryOutcome::Delivered
+        );
+        timeout(Duration::from_secs(1), activity_gate.started.acquire())
+            .await
+            .expect("prompt finish persistence must begin")
+            .unwrap()
+            .forget();
+        assert!(
+            timeout(Duration::from_millis(20), active.socket.next())
+                .await
+                .is_err(),
+            "the bridge must not observe a response before PromptFinished is durable"
+        );
+        activity_gate.release.add_permits(1);
+        assert_eq!(
+            receive_websocket_text::<ControllerToBridgeV1>(&mut active.socket).await,
+            ControllerToBridgeV1::Acp(response)
+        );
+        assert_eq!(
+            controller.activity_events(),
+            vec![
+                (binding(), turn_id, ActivityEvent::PromptStarted),
+                (binding(), turn_id, ActivityEvent::PromptFinished),
+            ]
+        );
+
+        active.socket.close(None).await.unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(1), active.driver)
+                .await
+                .expect("bridge close must complete containment")
+                .unwrap()
+                .unwrap(),
+            BridgeWebSocketOutcome::ConnectionLost(RelayLossOutcome::Contained(
+                OrphanContainmentOutcome::ContainmentAccepted
+            ))
+        ));
+        assert_eq!(controller.losses.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_prompt_is_contained_without_recording_another_turn() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let mut active = active_controller_bridge(
+            Arc::clone(&controller),
+            256 * 1024,
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+        )
+        .await;
+        let first = AcpMessageV1::new(json!({
+            "jsonrpc": "2.0",
+            "id": "prompt-1",
+            "method": "session/prompt",
+            "params": {"prompt": []}
+        }))
+        .unwrap();
+        active
+            .socket
+            .send(websocket_text(&BridgeToControllerV1::Acp(first.clone())))
+            .await
+            .unwrap();
+        assert_eq!(
+            decode_outbound(
+                timeout(Duration::from_secs(1), active.worker.outbound().recv())
+                    .await
+                    .expect("the first persisted prompt must reach the worker")
+                    .unwrap()
+            ),
+            ControllerToWorkerV1::Acp(first)
+        );
+        let started = controller.activity_events();
+        let [(recorded_binding, turn_id, ActivityEvent::PromptStarted)] = started.as_slice() else {
+            panic!("the first prompt must record one active turn")
+        };
+        assert_eq!(recorded_binding, &binding());
+        let expected_activity = vec![(binding(), *turn_id, ActivityEvent::PromptStarted)];
+
+        let second = AcpMessageV1::new(json!({
+            "jsonrpc": "2.0",
+            "id": "prompt-2",
+            "method": "session/prompt",
+            "params": {"prompt": []}
+        }))
+        .unwrap();
+        active
+            .socket
+            .send(websocket_text(&BridgeToControllerV1::Acp(second)))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            timeout(Duration::from_secs(1), active.driver)
+                .await
+                .expect("a concurrent prompt must terminate the bridge lane")
+                .unwrap(),
+            Err(ControllerBridgeWebSocketError::ConcurrentPrompt)
+        ));
+        assert_eq!(controller.activity_events(), expected_activity);
+        assert_eq!(controller.losses.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            active.worker.outbound().try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_during_a_prompt_is_contained_before_controller_io() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let mut active = active_controller_bridge(
+            Arc::clone(&controller),
+            256 * 1024,
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+        )
+        .await;
+        let prompt = AcpMessageV1::new(json!({
+            "jsonrpc": "2.0",
+            "id": "prompt-before-lifecycle",
+            "method": "session/prompt",
+            "params": {"prompt": []}
+        }))
+        .unwrap();
+        active
+            .socket
+            .send(websocket_text(&BridgeToControllerV1::Acp(prompt.clone())))
+            .await
+            .unwrap();
+        assert_eq!(
+            decode_outbound(
+                timeout(Duration::from_secs(1), active.worker.outbound().recv())
+                    .await
+                    .expect("the active prompt must reach the worker")
+                    .unwrap()
+            ),
+            ControllerToWorkerV1::Acp(prompt)
+        );
+        let recorded_activity = controller.activity_events();
+
+        active
+            .socket
+            .send(websocket_text(&BridgeToControllerV1::Lifecycle(
+                lifecycle_request("suspend", 0xb057),
+            )))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            timeout(Duration::from_secs(1), active.driver)
+                .await
+                .expect("busy lifecycle must terminate the bridge lane")
+                .unwrap(),
+            Err(ControllerBridgeWebSocketError::BusyLifecycle)
+        ));
+        assert_eq!(controller.lifecycle_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(controller.activity_events(), recorded_activity);
+        assert_eq!(controller.losses.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            active.worker.outbound().try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[tokio::test]
+    async fn controller_bridge_websocket_retries_the_exact_pending_release_request() {
+        let controller = Arc::new(FakeController::new(binding()));
+        controller.set_lifecycle_outcome(LifecycleServiceOutcome::ReleasePending);
+        let mut active = active_controller_bridge(
+            Arc::clone(&controller),
+            256 * 1024,
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+        )
+        .await;
+        let request = lifecycle_request("release", 0x514);
+
+        active
+            .socket
+            .send(websocket_text(&BridgeToControllerV1::Lifecycle(
+                request.clone(),
+            )))
+            .await
+            .unwrap();
+        wait_for_lifecycle_calls(&controller, 1).await;
+        assert_eq!(controller.lifecycle_requests(), vec![request.clone()]);
+        controller.set_lifecycle_outcome(LifecycleServiceOutcome::Released);
+
+        let ControllerToBridgeV1::ProtocolResult(result) =
+            receive_websocket_text(&mut active.socket).await
+        else {
+            panic!("the completed release must emit its correlated result")
+        };
+        assert_eq!(result.into_lifecycle_outcome(&request).unwrap(), None);
+        let outcome = timeout(Duration::from_secs(1), active.driver)
+            .await
+            .expect("the released bridge lane must stop promptly")
+            .expect("the bridge driver task must not panic")
+            .expect("the release completion must be clean");
+        assert!(matches!(
+            outcome,
+            BridgeWebSocketOutcome::ConnectionLost(RelayLossOutcome::StaleConnection)
+        ));
+        assert_eq!(
+            controller.lifecycle_requests(),
+            vec![request.clone(), request]
+        );
+        assert_eq!(controller.losses.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn duplicate_bridge_activation_after_pairing_is_contained() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let mut active = active_controller_bridge(
+            Arc::clone(&controller),
+            256 * 1024,
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+        )
+        .await;
+
+        active
+            .socket
+            .send(websocket_text(&BridgeToControllerV1::Activation(
+                activation_request(BrokerMappingExpectationV1::Absent),
+            )))
+            .await
+            .unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(1), active.driver)
+                .await
+                .expect("a duplicate activation must terminate the bridge lane")
+                .unwrap(),
+            Err(ControllerBridgeWebSocketError::DuplicateActivation)
+        ));
+        assert_eq!(controller.losses.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            active.worker.outbound().try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelling_controller_bridge_websocket_fails_closed() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let active = active_controller_bridge(
+            Arc::clone(&controller),
+            256 * 1024,
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+        )
+        .await;
+
+        active.driver.abort();
+        assert!(active.driver.await.unwrap_err().is_cancelled());
+        wait_for_losses(&controller, 1).await;
+        assert_eq!(controller.losses.load(Ordering::SeqCst), 1);
     }
 
     #[test]

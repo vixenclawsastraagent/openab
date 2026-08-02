@@ -232,6 +232,26 @@ separate controller is required because a short-lived bridge cannot reliably
 reconcile TTL expiry, abandoned resources, or broker restarts. Combining the
 controller and relay avoids an unnecessary extra service.
 
+The controller-side bridge adapter accepts only an already-upgraded socket
+whose transport authentication has selected one scope-specific relay. Its
+first application frame must be `Activation`; the payload can never select a
+different scope. While activation is pending, peer closure or a second
+application frame cancels the caller, and the controller-owned activation task
+contains any attachment that is produced after that cancellation. Every
+post-activation exit passes through the exact attachment's common containment
+path, while task cancellation retains the attachment's drop-based fallback.
+
+The adapter derives prompt activity from validated ACP on the authenticated
+bridge lane rather than accepting peer-supplied activity control fields. It
+persists a controller-generated `PromptStarted` turn before routing one
+`session/prompt` request to the worker, and persists the matching
+`PromptFinished` before writing that worker result or error to the bridge. A
+second prompt or lifecycle request while the turn is active fails closed. A
+pending destructive release retains and retries the exact lifecycle request;
+it never creates a new request identifier or emits an early acknowledgement.
+The retry interval has a non-zero safety floor and remains trusted controller
+configuration, not peer input.
+
 The controller:
 
 - authenticates every bridge and worker connection to one configured scope;
