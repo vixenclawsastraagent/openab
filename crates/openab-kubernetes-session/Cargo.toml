@@ -31,6 +31,9 @@ controller = [
 ]
 controller-runtime = [
     "controller",
+    "dep:axum",
+    "dep:hyper",
+    "dep:hyper-util",
     "dep:rustls-pemfile",
     "dep:tokio-rustls",
     "dep:tracing",
@@ -41,6 +44,7 @@ controller-runtime = [
 
 [dependencies]
 async-trait = "0.1"
+axum = { version = "0.8", default-features = false, optional = true }
 chrono = { version = "0.4", features = ["serde"] }
 futures-util = {
     version = "0.3",
@@ -50,6 +54,8 @@ futures-util = {
 }
 getrandom = { version = "0.4", optional = true }
 hex = "0.4"
+hyper = { version = "1", default-features = false, features = ["http1", "server"], optional = true }
+hyper-util = { version = "0.1", default-features = false, features = ["service", "tokio"], optional = true }
 k8s-openapi = { version = "=0.28.0", features = ["v1_32"], optional = true }
 kube = { version = "=4.2.0", default-features = false, features = ["client", "ring", "rustls-tls"], optional = true }
 rustls-pemfile = { version = "=2.2.0", optional = true }
@@ -70,6 +76,7 @@ zeroize = { version = "1", optional = true }
 http = "1"
 rcgen = "=0.14.8"
 tokio = { version = "1", features = ["io-util", "macros", "rt", "test-util", "time"] }
+tower = { version = "0.5", features = ["util"] }
 tower-test = "0.4"
 
 [[bin]]

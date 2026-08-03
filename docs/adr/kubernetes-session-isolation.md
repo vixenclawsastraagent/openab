@@ -602,6 +602,20 @@ task receives an abort request before the supervisor returns. The executable
 then terminates the process; the replacement startup scan is the sole recovery
 authority.
 
+The controller exposes this state on a separate plaintext probe listener.
+Only `GET /livez` and `GET /readyz` exist: liveness reports that probe
+orchestration and its supervisor publisher are live, while readiness maps the
+publisher state to `200 OK` or fail-closed `503 Service Unavailable`.
+Publisher loss makes both endpoints unhealthy. Unknown paths return `404`,
+non-GET methods return `405`, and all application responses are fixed,
+non-cacheable text without diagnostics. The probe accept loop has a fixed
+connection ceiling, a short HTTP-header deadline, bounded headers and buffers,
+no keep-alive, and cancellation-owned connection futures so shutdown cannot
+wait on a hostile partial request. The probe port is for direct kubelet access
+and is not part of the relay Service. Service omission is not an access
+control: deployment policy must also prevent untrusted workers from reaching
+the controller Pod's probe port.
+
 Steady-state maintenance is one non-overlapping sequential loop. Each delayed
 tick retries pending relay containment, scans lifecycle deadlines, and then
 reconciles already-durable intents. Missed ticks are skipped rather than run as

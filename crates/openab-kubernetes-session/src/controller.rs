@@ -9,6 +9,8 @@ mod lifecycle;
 #[cfg(feature = "controller-runtime")]
 mod listener;
 mod locks;
+#[cfg(feature = "controller-runtime")]
+mod probe;
 mod registration;
 mod relay;
 mod release;
@@ -58,6 +60,8 @@ pub use lifecycle::{
 #[cfg(feature = "controller-runtime")]
 pub use listener::{ControllerListener, ControllerListenerError};
 pub use locks::{SessionLockGuard, SessionLocks};
+#[cfg(feature = "controller-runtime")]
+pub use probe::{ControllerProbeServeError, ControllerProbeServer};
 pub use registration::{
     BootstrapPresence, ConsumedBootstrap, RegisteredWorker, RegistrationCoordinator,
     RegistrationError, RegistrationOperation, RegistrationProvisioner,

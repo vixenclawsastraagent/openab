@@ -76,11 +76,16 @@ pub struct ControllerReadiness {
 impl ControllerReadiness {
     /// Return the current probe state; publisher loss is fail-closed.
     pub fn state(&self) -> ControllerReadinessState {
-        if self.receiver.has_changed().is_err() {
-            ControllerReadinessState::NotReady
-        } else {
-            *self.receiver.borrow()
-        }
+        self.observed_state()
+            .unwrap_or(ControllerReadinessState::NotReady)
+    }
+
+    /// Distinguish a live not-ready supervisor from terminal publisher loss.
+    pub(crate) fn observed_state(&self) -> Option<ControllerReadinessState> {
+        self.receiver
+            .has_changed()
+            .ok()
+            .map(|_| *self.receiver.borrow())
     }
 
     /// Wait for the next state transition.
@@ -600,8 +605,13 @@ mod tests {
     fn a_closed_readiness_publisher_is_never_ready() {
         let (sender, receiver) = watch::channel(ControllerReadinessState::Ready);
         let readiness = ControllerReadiness { receiver };
+        assert_eq!(
+            readiness.observed_state(),
+            Some(ControllerReadinessState::Ready)
+        );
         assert_eq!(readiness.state(), ControllerReadinessState::Ready);
         drop(sender);
+        assert_eq!(readiness.observed_state(), None);
         assert_eq!(readiness.state(), ControllerReadinessState::NotReady);
     }
 
