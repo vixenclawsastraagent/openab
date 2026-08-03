@@ -279,6 +279,17 @@ activation or registration authority. A worker or transport cannot choose its
 durable profile revision. Scope mismatches are rejected before profile lookup
 or Kubernetes access.
 
+Removing a historical revision that is still pinned by a non-deleting anchor
+degrades only those sessions. The startup report marks the affected opaque
+session IDs without exposing the untrusted revision text; activation and worker
+registration then fail closed rather than falling back to the current revision.
+This diagnostic does not block global readiness after orphan containment.
+Keeping the controller available lets unaffected sessions continue and lets
+profile-independent `Suspending`, `Blocked`, and `Deleting` cleanup make
+progress while an operator restores the exact revision or explicitly releases
+the session. A `Deleting` anchor is not a profile-coverage gap because its
+terminal cleanup must remain reclaimable after profile retirement.
+
 ### 4.3 Worker
 
 Each worker Pod runs a small supervisor and one selected ACP/CLI process. The
@@ -616,6 +627,8 @@ are durably contained or freshly proven to have moved to a safe phase, normal
 reconciliation may clean `Blocked` and `Suspending` compute and continue any
 previously authorized `Deleting` intent. Readiness need not wait for Pod
 deletion, because the old generation is already durably barred from routing.
+Per-session historical-profile diagnostics follow the degraded-state contract
+in Section 4.2 and are not part of `containment_complete`.
 
 The MVP deliberately provides no transparent same-generation reconnect. After
 compute absence is proven, a newly spawned bridge uses a fresh attempt ID to

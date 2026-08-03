@@ -37,10 +37,12 @@ impl ControllerStartup {
     /// Wire one fixed-scope Kubernetes controller from already resolved worker
     /// profiles without performing Kubernetes I/O.
     ///
-    /// All historical profile revisions required by durable anchors belong in
-    /// `profiles`; `current_profiles` independently selects the revision used
-    /// for new sessions. Cluster-reference resolution remains a caller-owned
-    /// startup step and cannot be influenced by a relay peer.
+    /// Historical profile revisions in `profiles` allow retained sessions to
+    /// resume; a missing revision fails that session closed without blocking
+    /// profile-independent containment and cleanup. `current_profiles`
+    /// independently selects the revision used for new sessions.
+    /// Cluster-reference resolution remains a caller-owned startup step and
+    /// cannot be influenced by a relay peer.
     #[allow(clippy::too_many_arguments)]
     pub fn from_resolved_profiles(
         client: Client,

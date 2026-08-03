@@ -45,7 +45,7 @@ pub use composition::{
     ControllerCoordinatorConfigError, ControllerCoordinators, DurableIntentError,
     DurableIntentOutcome, DurableIntentReport, DurableIntentResult, LifecycleDeadlineOutcome,
     LifecycleDeadlineReport, LifecycleDeadlineResult, StartupOrphanOutcome, StartupOrphanReport,
-    StartupOrphanResult,
+    StartupOrphanResult, StartupProfileRevisionStatus,
 };
 pub use generation::{
     AllChildrenAbsentProof, ComputeAbsentProof, KubernetesGenerationProvisioner,

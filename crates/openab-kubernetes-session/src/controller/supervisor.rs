@@ -146,8 +146,16 @@ impl ControllerSupervisor {
             relay,
             mut health,
             listener,
-            startup_orphans: _startup_orphans,
+            startup_orphans,
         } = prepared;
+        let observed_unavailable_profile_sessions =
+            startup_orphans.unavailable_profile_session_count();
+        if observed_unavailable_profile_sessions > 0 {
+            tracing::warn!(
+                observed_unavailable_profile_sessions,
+                "startup inventory observed sessions with unavailable worker profile revisions"
+            );
+        }
         require_live_healthy(&health)?;
 
         let (listener_stop_tx, listener_stop_rx) = oneshot::channel();

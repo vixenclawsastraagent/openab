@@ -13,8 +13,8 @@ use openab_kubernetes_session::controller::{
     GenerationProvisionerError, LifecycleDeadlineOutcome, LifecycleDeadlineReport, LifecycleError,
     LifecycleProvisioner, LifecycleReconcileOutcome, ObservedWorker, RegistrationProvisioner,
     RegistrationProvisionerError, ReleaseCleanupProgress, ReleaseOutcome, ReleaseProvisioner,
-    ReleasedChildrenAbsentProof, StartupOrphanOutcome, StartupOrphanReport, VerifiedBootstrap,
-    WorkerBootstrapAuth,
+    ReleasedChildrenAbsentProof, StartupOrphanOutcome, StartupOrphanReport,
+    StartupProfileRevisionStatus, VerifiedBootstrap, WorkerBootstrapAuth,
 };
 use openab_kubernetes_session::identity::{ResourceNames, ScopeId, SessionId};
 use openab_kubernetes_session::profile_config::ControllerPolicy;
@@ -520,6 +520,81 @@ async fn startup_contains_every_unrecoverable_live_generation_without_touching_r
             phase => panic!("unexpected scheduled phase: {phase:?}"),
         }
     }
+    assert_eq!(fake.calls(), (0, 0, 0, 0));
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn startup_contains_retired_active_profile_and_marks_deleting_profile_independent() {
+    let active = anchor_in_phase(
+        session_id("discord:startup-retired-active"),
+        SessionPhase::Ready,
+        "2026-07-31",
+    );
+    let deleting = anchor_in_phase(
+        session_id("discord:startup-retired-deleting"),
+        SessionPhase::Deleting,
+        "2026-07-31",
+    );
+    let anchors = vec![active.clone(), deleting];
+    let (store, handle) = store_and_handle();
+    let fake = Arc::new(FakeProvisioner::default());
+    let root = coordinators(store, [profile("2026-08-01")], fake.clone()).unwrap();
+    let task = tokio::spawn(async move { root.quiesce_startup_orphans().await });
+    let mut handle = std::pin::pin!(handle);
+
+    let (list, send) = handle.next_request().await.unwrap();
+    assert_eq!(list.method(), Method::GET);
+    send.send_response(json_response(StatusCode::OK, config_map_list(&anchors)));
+
+    let (get, send) = handle.next_request().await.unwrap();
+    assert_eq!(get.method(), Method::GET);
+    send.send_response(json_response(
+        StatusCode::OK,
+        config_map(&active, "rv-fresh"),
+    ));
+    let (replace, send) = handle.next_request().await.unwrap();
+    assert_eq!(replace.method(), Method::PUT);
+    let mut body = request_body(replace).await;
+    let blocked: SessionAnchorV1 =
+        serde_json::from_str(body["data"]["anchor.json"].as_str().unwrap()).unwrap();
+    assert_eq!(blocked.phase(), SessionPhase::Blocked);
+    body["metadata"]["resourceVersion"] = json!("rv-blocked");
+    send.send_response(json_response(StatusCode::OK, body));
+
+    let report = tokio::time::timeout(StdDuration::from_secs(1), task)
+        .await
+        .expect("startup scan should finish without another Kubernetes request")
+        .unwrap()
+        .unwrap();
+    assert!(report.containment_complete());
+    assert_eq!(report.unavailable_profile_session_count(), 1);
+    let active_result = report
+        .results()
+        .iter()
+        .find(|result| result.session_id() == active.session_id())
+        .unwrap();
+    assert_eq!(
+        active_result.scheduled_profile_revision_status(),
+        StartupProfileRevisionStatus::Unavailable
+    );
+    assert!(matches!(
+        active_result.outcome(),
+        Some(StartupOrphanOutcome::ContainmentAccepted)
+    ));
+    let deleting_result = report
+        .results()
+        .iter()
+        .find(|result| result.scheduled_phase() == SessionPhase::Deleting)
+        .unwrap();
+    assert_eq!(
+        deleting_result.scheduled_profile_revision_status(),
+        StartupProfileRevisionStatus::NotRequiredForTerminalCleanup
+    );
+    assert!(matches!(
+        deleting_result.outcome(),
+        Some(StartupOrphanOutcome::Noop)
+    ));
     assert_eq!(fake.calls(), (0, 0, 0, 0));
     assert_no_request(&mut handle).await;
 }

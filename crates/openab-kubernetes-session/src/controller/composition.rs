@@ -175,11 +175,23 @@ pub enum StartupOrphanOutcome {
     StaleObservation,
 }
 
+/// Profile status observed for one anchor in the startup inventory snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartupProfileRevisionStatus {
+    /// The exact `(name, version)` coordinator is loaded.
+    Loaded,
+    /// Activation and registration fail closed until restore or release.
+    Unavailable,
+    /// Terminal deletion is profile-independent and remains reclaimable.
+    NotRequiredForTerminalCleanup,
+}
+
 /// One deterministic per-session entry in a startup orphan report.
 #[derive(Debug)]
 pub struct StartupOrphanResult {
     session_id: SessionId,
     scheduled_phase: SessionPhase,
+    scheduled_profile_revision_status: StartupProfileRevisionStatus,
     result: Result<StartupOrphanOutcome, LifecycleError>,
 }
 
@@ -190,6 +202,14 @@ impl StartupOrphanResult {
 
     pub fn scheduled_phase(&self) -> SessionPhase {
         self.scheduled_phase
+    }
+
+    /// Return profile status from the same LIST snapshot that scheduled this entry.
+    ///
+    /// `NotRequiredForTerminalCleanup` means deletion remains reclaimable
+    /// without restoring a retired profile revision.
+    pub fn scheduled_profile_revision_status(&self) -> StartupProfileRevisionStatus {
+        self.scheduled_profile_revision_status
     }
 
     pub fn outcome(&self) -> Option<&StartupOrphanOutcome> {
@@ -216,6 +236,20 @@ impl StartupOrphanReport {
     /// or proven stale by a fresh locked observation.
     pub fn containment_complete(&self) -> bool {
         self.results.iter().all(|result| result.result.is_ok())
+    }
+
+    /// Count non-deleting sessions observed with an unavailable exact revision.
+    ///
+    /// This advisory count must not become a readiness gate: cleanup must
+    /// continue while an operator restores a revision or releases the session.
+    pub fn unavailable_profile_session_count(&self) -> usize {
+        self.results
+            .iter()
+            .filter(|result| {
+                result.scheduled_profile_revision_status
+                    == StartupProfileRevisionStatus::Unavailable
+            })
+            .count()
     }
 }
 
@@ -501,6 +535,16 @@ impl ControllerCoordinators {
         for scheduled in inventory {
             let session_id = scheduled.state().session_id();
             let scheduled_phase = scheduled.state().phase();
+            let scheduled_profile_revision_status = if scheduled_phase == SessionPhase::Deleting {
+                StartupProfileRevisionStatus::NotRequiredForTerminalCleanup
+            } else if self
+                .profiles
+                .contains_key(&ProfileKey::from(scheduled.state().profile()))
+            {
+                StartupProfileRevisionStatus::Loaded
+            } else {
+                StartupProfileRevisionStatus::Unavailable
+            };
             let result = if matches!(
                 scheduled_phase,
                 SessionPhase::Provisioning | SessionPhase::Ready | SessionPhase::Busy
@@ -521,6 +565,7 @@ impl ControllerCoordinators {
             results.push(StartupOrphanResult {
                 session_id,
                 scheduled_phase,
+                scheduled_profile_revision_status,
                 result,
             });
         }

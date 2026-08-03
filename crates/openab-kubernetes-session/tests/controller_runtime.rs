@@ -2,13 +2,14 @@
 
 use chrono::{Duration as ChronoDuration, Utc};
 use futures_util::FutureExt;
-use http::{Request, Response, StatusCode};
+use http::{Method, Request, Response, StatusCode};
 use kube::client::Body;
 use kube::Client;
 use openab_kubernetes_session::controller::{
     ControllerEndpointConfig, ControllerReadinessState, ControllerRuntimeBuildError,
     ControllerStartup, ControllerStartupError, ControllerSupervisorConfig,
-    ControllerSupervisorConfigError, ControllerTlsAcceptor, RelayByteBudget,
+    ControllerSupervisorConfigError, ControllerTlsAcceptor, RelayByteBudget, StartupOrphanOutcome,
+    StartupProfileRevisionStatus,
 };
 use openab_kubernetes_session::identity::{ResourceNames, ScopeId, SessionId};
 use openab_kubernetes_session::profile_config::ControllerPolicy;
@@ -46,9 +47,9 @@ fn profile_ref(version: &str) -> ProfileRef {
     ProfileRef::new(PROFILE_NAME, version).unwrap()
 }
 
-fn profile() -> MvpWorkerProfile {
+fn profile_for(version: &str) -> MvpWorkerProfile {
     MvpWorkerProfile::new(
-        profile_ref(PROFILE_VERSION),
+        profile_ref(version),
         IMAGE,
         ["/usr/local/bin/openab-session-supervisor"],
         ["serve"],
@@ -66,12 +67,16 @@ fn profile() -> MvpWorkerProfile {
     .unwrap()
 }
 
-fn ready_anchor() -> SessionAnchorV1 {
+fn profile() -> MvpWorkerProfile {
+    profile_for(PROFILE_VERSION)
+}
+
+fn ready_anchor_for(version: &str) -> SessionAnchorV1 {
     let now = Utc::now();
     let mut anchor = SessionAnchorV1::new(
         session_id(),
         scope_id(),
-        profile_ref(PROFILE_VERSION),
+        profile_ref(version),
         Uuid::from_u128(0x100),
         Uuid::from_u128(0x200),
         now,
@@ -82,6 +87,21 @@ fn ready_anchor() -> SessionAnchorV1 {
     let fence = anchor.fence().clone();
     anchor.observe_pod(&fence, "worker-pod-uid").unwrap();
     anchor.transition(&fence, SessionPhase::Ready).unwrap();
+    anchor
+}
+
+fn ready_anchor() -> SessionAnchorV1 {
+    ready_anchor_for(PROFILE_VERSION)
+}
+
+fn suspended_anchor(version: &str) -> SessionAnchorV1 {
+    let mut anchor = ready_anchor_for(version);
+    let fence = anchor.fence().clone();
+    anchor.transition(&fence, SessionPhase::Suspending).unwrap();
+    anchor
+        .confirm_pod_deleted(&fence, "worker-pod-uid")
+        .unwrap();
+    anchor.transition(&fence, SessionPhase::Suspended).unwrap();
     anchor
 }
 
@@ -122,6 +142,11 @@ fn json_response(status: StatusCode, body: Value) -> Response<Body> {
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap()
+}
+
+async fn request_body(request: Request<Body>) -> Value {
+    let bytes = request.into_body().collect_bytes().await.unwrap();
+    serde_json::from_slice(&bytes).unwrap()
 }
 
 fn api_failure() -> Response<Body> {
@@ -253,6 +278,115 @@ async fn inventory_failure_never_produces_a_prepared_controller() {
         task.await.unwrap(),
         Err(ControllerStartupError::StartupContainment(_))
     ));
+}
+
+#[tokio::test]
+async fn missing_retained_profile_is_reported_without_blocking_global_recovery() {
+    let retained = ready_anchor_for("2026-07-31");
+    let (client, handle) = client_and_handle();
+    let task = tokio::spawn(configured(client).prepare());
+    let mut handle = std::pin::pin!(handle);
+    let (_list, send) = handle.next_request().await.unwrap();
+    send.send_response(json_response(
+        StatusCode::OK,
+        config_map_list(std::slice::from_ref(&retained)),
+    ));
+
+    let (get, send) = handle.next_request().await.unwrap();
+    assert_eq!(get.method(), Method::GET);
+    send.send_response(json_response(
+        StatusCode::OK,
+        config_map(&retained, "rv-fresh"),
+    ));
+    let (replace, send) = handle.next_request().await.unwrap();
+    assert_eq!(replace.method(), Method::PUT);
+    let mut body = request_body(replace).await;
+    let blocked: SessionAnchorV1 =
+        serde_json::from_str(body["data"]["anchor.json"].as_str().unwrap()).unwrap();
+    assert_eq!(blocked.phase(), SessionPhase::Blocked);
+    body["metadata"]["resourceVersion"] = json!("rv-blocked");
+    send.send_response(json_response(StatusCode::OK, body));
+
+    let prepared = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("startup should finish without another Kubernetes request")
+        .unwrap()
+        .unwrap();
+    let report = prepared.startup_orphans();
+    assert!(report.containment_complete());
+    assert_eq!(report.unavailable_profile_session_count(), 1);
+    assert_eq!(report.results()[0].scheduled_phase(), SessionPhase::Ready);
+    assert_eq!(
+        report.results()[0].scheduled_profile_revision_status(),
+        StartupProfileRevisionStatus::Unavailable
+    );
+    assert!(matches!(
+        report.results()[0].outcome(),
+        Some(StartupOrphanOutcome::ContainmentAccepted)
+    ));
+    let unexpected = tokio::time::timeout(Duration::from_millis(20), handle.next_request()).await;
+    assert!(!matches!(unexpected, Ok(Some(_))));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let supervisor = prepared.into_supervisor(supervisor_config());
+    let mut readiness = supervisor.readiness();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(supervisor.serve_until(listener, async move {
+        let _ = shutdown_rx.await;
+    }));
+    assert_eq!(
+        readiness.wait_for_change().await,
+        Some(ControllerReadinessState::Ready)
+    );
+    shutdown_tx.send(()).unwrap();
+    assert_eq!(
+        readiness.wait_for_change().await,
+        Some(ControllerReadinessState::NotReady)
+    );
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn loaded_historical_profile_revision_allows_retained_session_startup() {
+    let retained = suspended_anchor("2026-07-31");
+    let (client, handle) = client_and_handle();
+    let startup = configured_with(
+        client,
+        [profile_for("2026-07-31"), profile()],
+        [profile_ref(PROFILE_VERSION)],
+        BRIDGE_CREDENTIAL.as_bytes(),
+    )
+    .unwrap();
+    let task = tokio::spawn(startup.prepare());
+    let mut handle = std::pin::pin!(handle);
+    let (_list, send) = handle.next_request().await.unwrap();
+    send.send_response(json_response(
+        StatusCode::OK,
+        config_map_list(std::slice::from_ref(&retained)),
+    ));
+
+    let prepared = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("startup should finish without another Kubernetes request")
+        .unwrap()
+        .unwrap();
+    let report = prepared.startup_orphans();
+    assert_eq!(report.results().len(), 1);
+    assert_eq!(report.unavailable_profile_session_count(), 0);
+    assert_eq!(
+        report.results()[0].scheduled_phase(),
+        SessionPhase::Suspended
+    );
+    assert_eq!(
+        report.results()[0].scheduled_profile_revision_status(),
+        StartupProfileRevisionStatus::Loaded
+    );
+    assert!(matches!(
+        report.results()[0].outcome(),
+        Some(StartupOrphanOutcome::Noop)
+    ));
+    let unexpected = tokio::time::timeout(Duration::from_millis(20), handle.next_request()).await;
+    assert!(!matches!(unexpected, Ok(Some(_))));
 }
 
 #[tokio::test]

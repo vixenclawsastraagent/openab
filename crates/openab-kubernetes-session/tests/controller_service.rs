@@ -557,6 +557,37 @@ async fn activation_routes_existing_durable_profile_revision() {
 }
 
 #[tokio::test]
+async fn activation_rejects_unavailable_durable_revision_without_mutation() {
+    let durable = provisioning_anchor("discord:missing-historical-activation", "2026-07-31");
+    let request = activation_request(PROFILE_NAME, "discord:missing-historical-activation");
+    let (store, handle) = store_and_handle();
+    let root = coordinators(
+        store,
+        [profile("2026-08-02")],
+        Arc::new(FakeProvisioner::default()),
+    );
+    let service = ControllerService::new(root, [profile_ref("2026-08-02")]).unwrap();
+    let task = tokio::spawn(async move { service.activate(&request).await });
+    let mut handle = std::pin::pin!(handle);
+
+    let (get, send) = handle.next_request().await.unwrap();
+    assert_eq!(get.method(), Method::GET);
+    send.send_response(json_response(
+        StatusCode::OK,
+        config_map(&durable, "anchor-rv-1"),
+    ));
+
+    let error = tokio::time::timeout(StdDuration::from_secs(1), task)
+        .await
+        .expect("activation should fail without another Kubernetes request")
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(error, ControllerServiceError::ProfileUnavailable));
+    assert_eq!(error.fatal_code(), FatalCode::Unavailable);
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
 async fn registration_routes_using_durable_profile_revision() {
     let durable = provisioning_anchor("discord:registration", "2026-08-01");
     let expected_binding = binding(&durable);
@@ -595,6 +626,36 @@ async fn registration_routes_using_durable_profile_revision() {
     assert_eq!(registered.binding(), &expected_binding);
     assert_eq!(registered.profile(), &profile_ref("2026-08-01"));
     assert_eq!(fake.registration_profiles(), [profile_ref("2026-08-01")]);
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn registration_rejects_unavailable_durable_revision_without_mutation() {
+    let durable = provisioning_anchor("discord:missing-historical-registration", "2026-07-31");
+    let registration = WorkerRegistrationV1::new(&binding(&durable));
+    let auth = WorkerBootstrapAuth::new(POD_UID, &TOKEN).unwrap();
+    let (store, handle) = store_and_handle();
+    let fake = Arc::new(FakeProvisioner::default());
+    let root = coordinators(store, [profile("2026-08-02")], fake.clone());
+    let service = ControllerService::new(root, [profile_ref("2026-08-02")]).unwrap();
+    let task = tokio::spawn(async move { service.register(registration, auth).await });
+    let mut handle = std::pin::pin!(handle);
+
+    let (get, send) = handle.next_request().await.unwrap();
+    assert_eq!(get.method(), Method::GET);
+    send.send_response(json_response(
+        StatusCode::OK,
+        config_map(&durable, "anchor-rv-1"),
+    ));
+
+    let error = tokio::time::timeout(StdDuration::from_secs(1), task)
+        .await
+        .expect("registration should fail without another Kubernetes request")
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(error, ControllerServiceError::ProfileUnavailable));
+    assert_eq!(error.fatal_code(), FatalCode::Unavailable);
+    assert!(fake.registration_profiles().is_empty());
     assert_no_request(&mut handle).await;
 }
 
