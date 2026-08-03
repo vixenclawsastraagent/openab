@@ -27,7 +27,7 @@ pub struct ControllerListener {
 }
 
 impl ControllerListener {
-    pub fn new(endpoint: ControllerEndpoint, tls: ControllerTlsAcceptor) -> Self {
+    pub(super) fn new(endpoint: ControllerEndpoint, tls: ControllerTlsAcceptor) -> Self {
         Self { endpoint, tls }
     }
 

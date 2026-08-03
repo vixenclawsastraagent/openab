@@ -13,6 +13,8 @@ mod registration;
 mod relay;
 mod release;
 mod rendezvous;
+#[cfg(feature = "controller-runtime")]
+mod runtime;
 mod service;
 #[cfg(feature = "controller-runtime")]
 mod tls;
@@ -76,6 +78,11 @@ pub use rendezvous::{
 };
 pub(crate) use rendezvous::{
     LifecycleAcquireOutcome, LifecycleAdmission, LifecycleDeliveryOutcome, RelayLifecycleTerminal,
+};
+#[cfg(feature = "controller-runtime")]
+pub use runtime::{
+    ControllerRuntimeBuildError, ControllerRuntimeServeError, ControllerStartup,
+    ControllerStartupError, PreparedController,
 };
 pub use service::{
     ControllerService, ControllerServiceConfigError, ControllerServiceError,

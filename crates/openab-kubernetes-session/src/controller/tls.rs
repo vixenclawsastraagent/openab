@@ -62,7 +62,7 @@ impl ControllerTlsAcceptor {
     }
 
     /// Terminate TLS before serving one already-admitted controller connection.
-    pub async fn serve<S>(
+    pub(super) async fn serve<S>(
         &self,
         connection: ControllerConnection,
         stream: S,

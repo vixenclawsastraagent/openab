@@ -215,7 +215,7 @@ impl ControllerEndpoint {
         })
     }
 
-    pub fn try_admit(&self) -> Result<ControllerConnection, ControllerAdmissionError> {
+    pub(super) fn try_admit(&self) -> Result<ControllerConnection, ControllerAdmissionError> {
         let permit = self.admission.try_acquire()?;
         Ok(ControllerConnection {
             relay: self.relay.clone(),
