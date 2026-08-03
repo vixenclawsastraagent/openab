@@ -29,49 +29,69 @@ storage_retention_seconds = 259200
 max_active_workers = 20
 
 [profiles.codex-strict]
-version = "2026-08-01"
+current_version = "2026-08-01"
+
+[profiles.codex-strict.revisions."2026-08-01"]
 image = "ghcr.io/example/openab-worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
-[profiles.codex-strict.supervisor]
+[profiles.codex-strict.revisions."2026-08-01".supervisor]
 executable = "/usr/local/bin/openab-session-supervisor"
 args = ["serve"]
 
-[profiles.codex-strict.workspace]
+[profiles.codex-strict.revisions."2026-08-01".workspace]
 size = "20Gi"
 storage_class = "encrypted-rwo"
 access_mode = "read_write_once_pod"
 
-[profiles.codex-strict.resources.requests]
+[profiles.codex-strict.revisions."2026-08-01".resources.requests]
 cpu = "250m"
 memory = "256Mi"
 ephemeral_storage = "1Gi"
 
-[profiles.codex-strict.resources.limits]
+[profiles.codex-strict.revisions."2026-08-01".resources.limits]
 cpu = "1"
 memory = "2Gi"
 ephemeral_storage = "8Gi"
 
-[profiles.codex-strict.run_as]
+[profiles.codex-strict.revisions."2026-08-01".run_as]
 uid = 10001
 gid = 10001
 
-[[profiles.codex-strict.egress]]
+[[profiles.codex-strict.revisions."2026-08-01".egress]]
 target = "cidr"
 cidr = "10.96.0.10/32"
 
-[[profiles.codex-strict.egress.ports]]
+[[profiles.codex-strict.revisions."2026-08-01".egress.ports]]
 protocol = "udp"
 port = 53
 
-[[profiles.codex-strict.egress]]
+[[profiles.codex-strict.revisions."2026-08-01".egress]]
 target = "selectors"
 namespace_labels = { "kubernetes.io/metadata.name" = "openab-system" }
 pod_labels = { "app.kubernetes.io/name" = "openab-session-controller" }
 
-[[profiles.codex-strict.egress.ports]]
+[[profiles.codex-strict.revisions."2026-08-01".egress.ports]]
 protocol = "tcp"
 port = 8443
 "#;
+
+fn with_second_revision(current_version: &str) -> String {
+    let revision_start = VALID_CONFIG
+        .find("[profiles.codex-strict.revisions")
+        .unwrap();
+    let second = VALID_CONFIG[revision_start..]
+        .replace("2026-08-01", "2026-08-02")
+        .replace(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+    let first = VALID_CONFIG.replacen(
+        "current_version = \"2026-08-01\"",
+        &format!("current_version = \"{current_version}\""),
+        1,
+    );
+    format!("{first}\n{second}")
+}
 
 fn anchor(profile: ProfileRef) -> SessionAnchorV1 {
     let now = Utc.with_ymd_and_hms(2026, 8, 1, 8, 0, 0).unwrap();
@@ -166,6 +186,65 @@ fn controller_config_builds_policy_and_existing_worker_domain_types() {
 }
 
 #[test]
+fn controller_config_keeps_historical_revisions_but_selects_one_current_revision() {
+    let config = TrustedControllerConfigV1::from_toml(&with_second_revision("2026-08-02"))
+        .expect("two valid revisions");
+
+    let revisions = config.profiles().get("codex-strict").unwrap();
+    assert_eq!(revisions.revisions().len(), 2);
+    assert_eq!(
+        config
+            .profile("codex-strict")
+            .unwrap()
+            .profile_ref()
+            .version(),
+        "2026-08-02"
+    );
+    assert_eq!(
+        config
+            .profile_revision("codex-strict", "2026-08-01")
+            .unwrap()
+            .profile_ref()
+            .version(),
+        "2026-08-01"
+    );
+    assert_eq!(
+        config
+            .all_revisions()
+            .map(|profile| profile.profile_ref().version())
+            .collect::<Vec<_>>(),
+        ["2026-08-01", "2026-08-02"]
+    );
+    assert_eq!(
+        config
+            .current_profile_refs()
+            .map(ProfileRef::version)
+            .collect::<Vec<_>>(),
+        ["2026-08-02"]
+    );
+}
+
+#[test]
+fn controller_config_rejects_a_missing_current_or_empty_revision_set() {
+    assert!(TrustedControllerConfigV1::from_toml(&with_second_revision("2026-08-03")).is_err());
+
+    let empty = r#"
+schema_version = 1
+
+[policy]
+compute_idle_seconds = 900
+storage_retention_seconds = 259200
+max_active_workers = 20
+
+[profiles.codex-strict]
+current_version = "2026-08-01"
+
+[profiles.codex-strict.revisions]
+"#;
+    assert!(TrustedControllerConfigV1::from_toml(empty).is_err());
+}
+
+#[test]
 fn every_dto_level_rejects_unknown_fields_including_transport_and_secrets() {
     let cases = [
         format!("relay_url = \"wss://forbidden.example\"\n{VALID_CONFIG}"),
@@ -175,8 +254,13 @@ fn every_dto_level_rejects_unknown_fields_including_transport_and_secrets() {
             1,
         ),
         VALID_CONFIG.replacen(
-            "version = \"2026-08-01\"",
-            "version = \"2026-08-01\"\ncredential_file = \"/secret\"",
+            "current_version = \"2026-08-01\"",
+            "current_version = \"2026-08-01\"\nunknown = true",
+            1,
+        ),
+        VALID_CONFIG.replacen(
+            "image = \"ghcr.io/example/openab-worker",
+            "credential_file = \"/secret\"\nimage = \"ghcr.io/example/openab-worker",
             1,
         ),
         VALID_CONFIG.replacen(
@@ -233,17 +317,16 @@ fn invalid_profile_keys_do_not_inject_into_errors() {
 }
 
 #[test]
-fn duplicate_profile_name_or_version_fails_closed() {
+fn duplicate_profile_name_or_revision_fails_closed() {
     let duplicate_name =
-        format!("{VALID_CONFIG}\n[profiles.codex-strict]\nversion = \"another-version\"\n");
+        format!("{VALID_CONFIG}\n[profiles.codex-strict]\ncurrent_version = \"another-version\"\n");
     assert!(TrustedControllerConfigV1::from_toml(&duplicate_name).is_err());
 
-    let duplicate_version = VALID_CONFIG.replacen(
-        "version = \"2026-08-01\"",
-        "version = \"2026-08-01\"\nversion = \"duplicate\"",
-        1,
-    );
-    assert!(TrustedControllerConfigV1::from_toml(&duplicate_version).is_err());
+    let revision_start = VALID_CONFIG
+        .find("[profiles.codex-strict.revisions")
+        .unwrap();
+    let duplicate_revision = format!("{VALID_CONFIG}\n{}", &VALID_CONFIG[revision_start..]);
+    assert!(TrustedControllerConfigV1::from_toml(&duplicate_revision).is_err());
 }
 
 #[test]
@@ -332,17 +415,9 @@ fn existing_profile_validators_reject_invalid_config_values() {
             "/usr/local/bin/openab-session-supervisor",
             "relative-supervisor",
         ),
-        VALID_CONFIG.replacen("version = \"2026-08-01\"", "version = \"\"", 1),
-        VALID_CONFIG.replacen(
-            "version = \"2026-08-01\"",
-            "version = \"unsafe version\"",
-            1,
-        ),
-        VALID_CONFIG.replacen(
-            "version = \"2026-08-01\"",
-            &format!("version = \"{}\"", "v".repeat(257)),
-            1,
-        ),
+        VALID_CONFIG.replace("2026-08-01", ""),
+        VALID_CONFIG.replace("2026-08-01", "unsafe version"),
+        VALID_CONFIG.replace("2026-08-01", &"v".repeat(257)),
         VALID_CONFIG.replacen("size = \"20Gi\"", "size = \"20GB\"", 1),
         VALID_CONFIG.replacen("cpu = \"1\"", "cpu = \"100m\"", 1),
         VALID_CONFIG.replacen("uid = 10001", "uid = 0", 1),
@@ -418,11 +493,11 @@ fn skills_pin_requires_an_exact_immutable_live_observation() {
 fn cluster_references_remain_intents_until_exact_observations_are_resolved() {
     let config = format!(
         r#"{VALID_CONFIG}
-[profiles.codex-strict.runtime_class]
+[profiles.codex-strict.revisions."2026-08-01".runtime_class]
 name = "kata"
 expected_handler = "kata-qemu"
 
-[profiles.codex-strict.skills]
+[profiles.codex-strict.revisions."2026-08-01".skills]
 config_map_name = "team-skills-v1"
 "#
     );
@@ -502,7 +577,7 @@ config_map_name = "team-skills-v1"
 fn config_cannot_forge_cluster_observation_metadata() {
     let forged = format!(
         r#"{VALID_CONFIG}
-[profiles.codex-strict.skills]
+[profiles.codex-strict.revisions."2026-08-01".skills]
 config_map_name = "team-skills-v1"
 uid = "forged-uid"
 resource_version = "forged-rv"
@@ -512,7 +587,7 @@ resource_version = "forged-rv"
 
     let ambiguous_name = format!(
         r#"{VALID_CONFIG}
-[profiles.codex-strict.skills]
+[profiles.codex-strict.revisions."2026-08-01".skills]
 name = "team-skills-v1"
 "#
     );

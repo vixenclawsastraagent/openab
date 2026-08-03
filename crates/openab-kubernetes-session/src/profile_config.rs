@@ -3,7 +3,7 @@ use crate::resources::{
     PinnedSkillsConfigMap, PvcAccessMode, ResourceBuildError, RunAsIdentity, RuntimeClassSelection,
     TrustedEgressRule, WorkerResources,
 };
-use crate::state::{ProfileRef, StateError};
+use crate::state::{validate_profile_name, ProfileRef, StateError};
 use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::api::node::v1::RuntimeClass;
 use serde::Deserialize;
@@ -25,6 +25,10 @@ pub enum ProfileConfigError {
     UnsupportedSchemaVersion(u32),
     #[error("worker configuration must define at least one profile")]
     EmptyProfiles,
+    #[error("worker profile {profile} must define at least one revision")]
+    EmptyProfileRevisions { profile: String },
+    #[error("worker profile {profile} does not contain its selected current revision")]
+    CurrentProfileRevisionUnavailable { profile: String },
     #[error("invalid controller policy field {field}: {reason}")]
     InvalidPolicy {
         field: &'static str,
@@ -179,6 +183,32 @@ pub struct LoadedWorkerProfile {
     skills: Option<SkillsConfigMapIntent>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadedProfileRevisions {
+    current: ProfileRef,
+    revisions: BTreeMap<String, LoadedWorkerProfile>,
+}
+
+impl LoadedProfileRevisions {
+    pub fn current(&self) -> &LoadedWorkerProfile {
+        self.revisions
+            .get(self.current.version())
+            .expect("validated profile revisions retain their current entry")
+    }
+
+    pub fn current_profile_ref(&self) -> &ProfileRef {
+        &self.current
+    }
+
+    pub fn revisions(&self) -> &BTreeMap<String, LoadedWorkerProfile> {
+        &self.revisions
+    }
+
+    pub fn revision(&self, version: &str) -> Option<&LoadedWorkerProfile> {
+        self.revisions.get(version)
+    }
+}
+
 impl LoadedWorkerProfile {
     pub fn profile_ref(&self) -> &ProfileRef {
         self.profile.profile()
@@ -270,7 +300,7 @@ impl ResolvedWorkerProfile {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrustedControllerConfigV1 {
     policy: ControllerPolicy,
-    profiles: BTreeMap<String, LoadedWorkerProfile>,
+    profiles: BTreeMap<String, LoadedProfileRevisions>,
 }
 
 impl TrustedControllerConfigV1 {
@@ -293,8 +323,24 @@ impl TrustedControllerConfigV1 {
         )?;
         let mut profiles = BTreeMap::new();
         for (name, profile) in decoded.profiles {
-            let loaded = build_profile(name.clone(), profile)?;
-            profiles.insert(name, loaded);
+            validate_profile_name(&name)
+                .map_err(|source| ProfileConfigError::InvalidProfileIdentity { source })?;
+            if profile.revisions.is_empty() {
+                return Err(ProfileConfigError::EmptyProfileRevisions { profile: name });
+            }
+
+            let mut revisions = BTreeMap::new();
+            for (version, revision) in profile.revisions {
+                let loaded = build_profile(name.clone(), version.clone(), revision)?;
+                revisions.insert(version, loaded);
+            }
+            let current = revisions
+                .get(&profile.current_version)
+                .map(|loaded| loaded.profile_ref().clone())
+                .ok_or_else(|| ProfileConfigError::CurrentProfileRevisionUnavailable {
+                    profile: name.clone(),
+                })?;
+            profiles.insert(name, LoadedProfileRevisions { current, revisions });
         }
         Ok(Self { policy, profiles })
     }
@@ -303,20 +349,39 @@ impl TrustedControllerConfigV1 {
         &self.policy
     }
 
-    pub fn profiles(&self) -> &BTreeMap<String, LoadedWorkerProfile> {
+    pub fn profiles(&self) -> &BTreeMap<String, LoadedProfileRevisions> {
         &self.profiles
     }
 
     pub fn profile(&self, name: &str) -> Option<&LoadedWorkerProfile> {
-        self.profiles.get(name)
+        self.profiles.get(name).map(LoadedProfileRevisions::current)
+    }
+
+    pub fn profile_revision(&self, name: &str, version: &str) -> Option<&LoadedWorkerProfile> {
+        self.profiles
+            .get(name)
+            .and_then(|profile| profile.revision(version))
+    }
+
+    pub fn all_revisions(&self) -> impl Iterator<Item = &LoadedWorkerProfile> {
+        self.profiles
+            .values()
+            .flat_map(|profile| profile.revisions().values())
+    }
+
+    pub fn current_profile_refs(&self) -> impl Iterator<Item = &ProfileRef> {
+        self.profiles
+            .values()
+            .map(LoadedProfileRevisions::current_profile_ref)
     }
 }
 
 fn build_profile(
     name: String,
+    version: String,
     decoded: WorkerProfileDto,
 ) -> Result<LoadedWorkerProfile, ProfileConfigError> {
-    let profile = ProfileRef::new(name.clone(), decoded.version)
+    let profile = ProfileRef::new(name.clone(), version)
         .map_err(|source| ProfileConfigError::InvalidProfileIdentity { source })?;
     let workspace = PersistentWorkspace::new(
         decoded.workspace.size,
@@ -407,7 +472,14 @@ fn invalid_profile(profile: &str, source: ResourceBuildError) -> ProfileConfigEr
 struct ControllerConfigDto {
     schema_version: u32,
     policy: ControllerPolicyDto,
-    profiles: BTreeMap<String, WorkerProfileDto>,
+    profiles: BTreeMap<String, ProfileRevisionsDto>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProfileRevisionsDto {
+    current_version: String,
+    revisions: BTreeMap<String, WorkerProfileDto>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -421,7 +493,6 @@ struct ControllerPolicyDto {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkerProfileDto {
-    version: String,
     image: String,
     supervisor: SupervisorDto,
     workspace: WorkspaceDto,
