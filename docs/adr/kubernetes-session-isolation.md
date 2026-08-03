@@ -290,6 +290,17 @@ progress while an operator restores the exact revision or explicitly releases
 the session. A `Deleting` anchor is not a profile-coverage gap because its
 terminal cleanup must remain reclaimable after profile retirement.
 
+At startup, the controller resolves every current profile revision's
+RuntimeClass and immutable skills ConfigMap before attempting any historical
+revision. A missing, unreadable, mutable, deleting, or otherwise mismatched
+current reference fails startup closed. Once all current revisions resolve,
+the same failure on a historical revision omits and counts only that revision,
+preserving the degraded-session behavior above. Named Kubernetes observations,
+including failures, are cached for the startup pass; a shared reference is read
+once while each RuntimeClass intent still validates its exact expected handler.
+Skills ConfigMap data is discarded immediately after the controller records
+only its validated name, UID, and resourceVersion pin.
+
 ### 4.3 Worker
 
 Each worker Pod runs a small supervisor and one selected ACP/CLI process. The

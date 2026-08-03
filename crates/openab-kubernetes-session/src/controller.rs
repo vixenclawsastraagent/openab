@@ -11,6 +11,8 @@ mod listener;
 mod locks;
 #[cfg(feature = "controller-runtime")]
 mod probe;
+#[cfg(feature = "controller-runtime")]
+mod profile_resolution;
 mod registration;
 mod relay;
 mod release;
@@ -62,6 +64,10 @@ pub use listener::{ControllerListener, ControllerListenerError};
 pub use locks::{SessionLockGuard, SessionLocks};
 #[cfg(feature = "controller-runtime")]
 pub use probe::{ControllerProbeServeError, ControllerProbeServer};
+#[cfg(feature = "controller-runtime")]
+pub use profile_resolution::{
+    resolve_profile_revisions, ProfileResolutionError, ResolvedProfileRevisions,
+};
 pub use registration::{
     BootstrapPresence, ConsumedBootstrap, RegisteredWorker, RegistrationCoordinator,
     RegistrationError, RegistrationOperation, RegistrationProvisioner,
