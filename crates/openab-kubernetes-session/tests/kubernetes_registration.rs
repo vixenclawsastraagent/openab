@@ -2,6 +2,8 @@
 
 use chrono::{Duration, TimeZone, Utc};
 use http::{Method, Request, Response, StatusCode};
+use k8s_openapi::api::core::v1::ConfigMap;
+use k8s_openapi::api::node::v1::RuntimeClass;
 use kube::client::Body;
 use kube::Client;
 use openab_kubernetes_session::bridge::SessionBinding;
@@ -12,8 +14,9 @@ use openab_kubernetes_session::controller::{
 };
 use openab_kubernetes_session::identity::{ResourceNames, ScopeId, SessionId};
 use openab_kubernetes_session::resources::{
-    DesiredGeneration, EgressPort, EgressProtocol, GenerationContext, MvpWorkerProfile,
-    PersistentWorkspace, PvcAccessMode, RunAsIdentity, TrustedEgressRule, WorkerResources,
+    AllowedRuntimeClass, DesiredGeneration, EgressPort, EgressProtocol, GenerationContext,
+    MvpWorkerProfile, PersistentWorkspace, PinnedSkillsConfigMap, PvcAccessMode, RunAsIdentity,
+    RuntimeClassSelection, TrustedEgressRule, WorkerResources,
 };
 use openab_kubernetes_session::state::{ProfileRef, SessionAnchorV1, SessionPhase};
 use openab_kubernetes_session::store::{ConfigMapAnchorStore, StoredAnchor};
@@ -32,6 +35,13 @@ const ANCHOR_UID: &str = "anchor-uid-a";
 const POD_UID: &str = "pod-uid-a";
 const TOKEN: [u8; 32] = [0x5a; 32];
 const IMAGE: &str = "ghcr.io/example/openab-worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const SKILLS_NAME: &str = "team-skills-v1";
+const SKILLS_UID: &str = "skills-uid-a";
+const SKILLS_RESOURCE_VERSION: &str = "skills-rv-a";
+const RUNTIME_CLASS_NAME: &str = "kata";
+const RUNTIME_CLASS_HANDLER: &str = "kata-qemu";
+const RUNTIME_CLASS_UID: &str = "runtime-class-uid-a";
+const RUNTIME_CLASS_RESOURCE_VERSION: &str = "runtime-class-rv-a";
 
 fn scope_id() -> ScopeId {
     ScopeId::derive(RAW_SCOPE)
@@ -69,7 +79,10 @@ fn binding() -> SessionBinding {
     binding_for(&anchor("discord:registration-consume"))
 }
 
-fn profile() -> MvpWorkerProfile {
+fn profile_with_pins(
+    runtime_class: Option<RuntimeClassSelection>,
+    skills: Option<PinnedSkillsConfigMap>,
+) -> MvpWorkerProfile {
     MvpWorkerProfile::new(
         ProfileRef::new("codex-strict", "2026-08-01").unwrap(),
         IMAGE,
@@ -83,10 +96,64 @@ fn profile() -> MvpWorkerProfile {
         )
         .unwrap()],
         RunAsIdentity::new(10001, 10001).unwrap(),
-        None,
-        None,
+        runtime_class,
+        skills,
     )
     .unwrap()
+}
+
+fn profile() -> MvpWorkerProfile {
+    profile_with_pins(None, None)
+}
+
+fn observed_skills_config_map() -> Value {
+    json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": SKILLS_NAME,
+            "namespace": NAMESPACE,
+            "uid": SKILLS_UID,
+            "resourceVersion": SKILLS_RESOURCE_VERSION
+        },
+        "immutable": true,
+        "data": {"SKILL.md": "trusted versioned skills"}
+    })
+}
+
+fn observed_runtime_class() -> Value {
+    json!({
+        "apiVersion": "node.k8s.io/v1",
+        "kind": "RuntimeClass",
+        "metadata": {
+            "name": RUNTIME_CLASS_NAME,
+            "uid": RUNTIME_CLASS_UID,
+            "resourceVersion": RUNTIME_CLASS_RESOURCE_VERSION
+        },
+        "handler": RUNTIME_CLASS_HANDLER
+    })
+}
+
+fn profile_with_external_pins() -> MvpWorkerProfile {
+    let observed_skills: ConfigMap = serde_json::from_value(observed_skills_config_map()).unwrap();
+    let skills = PinnedSkillsConfigMap::from_observed(NAMESPACE, &observed_skills).unwrap();
+    let observed_runtime: RuntimeClass = serde_json::from_value(observed_runtime_class()).unwrap();
+    let runtime_class = RuntimeClassSelection::from_observed(
+        &observed_runtime,
+        [AllowedRuntimeClass::new(RUNTIME_CLASS_NAME, RUNTIME_CLASS_HANDLER).unwrap()],
+    )
+    .unwrap();
+    profile_with_pins(Some(runtime_class), Some(skills))
+}
+
+#[derive(Clone, Copy)]
+enum ExternalPinDrift {
+    SkillsUid,
+    SkillsResourceVersion,
+    SkillsMutable,
+    SkillsDeleting,
+    RuntimeClassResourceVersion,
+    RuntimeClassHandler,
 }
 
 fn proof() -> VerifiedBootstrap {
@@ -220,6 +287,25 @@ async fn run_verification_scenario(
     final_secret_uid: &str,
     final_secret_resource_version: &str,
 ) -> Result<VerifiedBootstrap, RegistrationProvisionerError> {
+    run_verification_scenario_with_profile(
+        presented_token,
+        observed_pod_uid,
+        final_secret_uid,
+        final_secret_resource_version,
+        profile(),
+        None,
+    )
+    .await
+}
+
+async fn run_verification_scenario_with_profile(
+    presented_token: [u8; 32],
+    observed_pod_uid: &str,
+    final_secret_uid: &str,
+    final_secret_resource_version: &str,
+    worker_profile: MvpWorkerProfile,
+    external_pin_drift: Option<ExternalPinDrift>,
+) -> Result<VerifiedBootstrap, RegistrationProvisionerError> {
     let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
     let client = Client::new(service, "default");
     let anchor = anchor("discord:registration-verify");
@@ -228,7 +314,7 @@ async fn run_verification_scenario(
     let context =
         GenerationContext::from_anchor(NAMESPACE, names.anchor(), ANCHOR_UID, &anchor, names)
             .unwrap();
-    let desired = DesiredGeneration::build(context, profile(), TOKEN).unwrap();
+    let desired = DesiredGeneration::build(context, worker_profile.clone(), TOKEN).unwrap();
     let pvc = observed_value(desired.persistent_volume_claim(), "pvc-uid-a");
     let policy = observed_value(desired.network_policy(), "policy-uid-a");
     let account = observed_value(desired.service_account(), "account-uid-a");
@@ -244,7 +330,7 @@ async fn run_verification_scenario(
         provisioner
             .verify_bootstrap(
                 &stored,
-                &profile(),
+                &worker_profile,
                 &expected_binding,
                 &WorkerBootstrapAuth::new(POD_UID, &presented_token).unwrap(),
             )
@@ -317,6 +403,60 @@ async fn run_verification_scenario(
     )
     .await;
     respond_list(&mut handle, &pod_path, "v1", "PodList", pod).await;
+
+    if let Some(drift) = external_pin_drift {
+        let mut skills = observed_skills_config_map();
+        let mut runtime_class = observed_runtime_class();
+        match drift {
+            ExternalPinDrift::SkillsUid => {
+                skills["metadata"]["uid"] = json!("replacement-skills-uid");
+            }
+            ExternalPinDrift::SkillsResourceVersion => {
+                skills["metadata"]["resourceVersion"] =
+                    json!("replacement-skills-resource-version");
+            }
+            ExternalPinDrift::SkillsMutable => skills["immutable"] = json!(false),
+            ExternalPinDrift::SkillsDeleting => {
+                skills["metadata"]["deletionTimestamp"] = json!("2026-08-01T08:01:00Z");
+            }
+            ExternalPinDrift::RuntimeClassResourceVersion => {
+                runtime_class["metadata"]["resourceVersion"] =
+                    json!("replacement-runtime-class-resource-version");
+            }
+            ExternalPinDrift::RuntimeClassHandler => {
+                runtime_class["handler"] = json!("replacement-handler");
+            }
+        }
+
+        respond_get(
+            &mut handle,
+            &format!("/api/v1/namespaces/{NAMESPACE}/configmaps/{SKILLS_NAME}"),
+            skills,
+        )
+        .await;
+        if matches!(
+            drift,
+            ExternalPinDrift::SkillsUid
+                | ExternalPinDrift::SkillsResourceVersion
+                | ExternalPinDrift::SkillsMutable
+                | ExternalPinDrift::SkillsDeleting
+        ) {
+            let result = task.await.unwrap();
+            assert_no_request(&mut handle).await;
+            return result;
+        }
+
+        respond_get(
+            &mut handle,
+            &format!("/apis/node.k8s.io/v1/runtimeclasses/{RUNTIME_CLASS_NAME}"),
+            runtime_class,
+        )
+        .await;
+        let result = task.await.unwrap();
+        assert_no_request(&mut handle).await;
+        return result;
+    }
+
     respond_get(&mut handle, &exact_secret_path, final_secret).await;
 
     let result = task.await.unwrap();
@@ -376,6 +516,32 @@ async fn final_secret_uid_or_resource_version_drift_fails_closed() {
             run_verification_scenario(TOKEN, POD_UID, uid, &resource_version)
                 .await
                 .unwrap_err(),
+            RegistrationProvisionerError::ResourceRejected
+        );
+    }
+}
+
+#[tokio::test]
+async fn external_pin_drift_fails_registration_before_bootstrap_secret_deletion() {
+    for drift in [
+        ExternalPinDrift::SkillsUid,
+        ExternalPinDrift::SkillsResourceVersion,
+        ExternalPinDrift::SkillsMutable,
+        ExternalPinDrift::SkillsDeleting,
+        ExternalPinDrift::RuntimeClassResourceVersion,
+        ExternalPinDrift::RuntimeClassHandler,
+    ] {
+        assert_eq!(
+            run_verification_scenario_with_profile(
+                TOKEN,
+                POD_UID,
+                SECRET_UID,
+                &format!("rv-{SECRET_UID}"),
+                profile_with_external_pins(),
+                Some(drift),
+            )
+            .await
+            .unwrap_err(),
             RegistrationProvisionerError::ResourceRejected
         );
     }
