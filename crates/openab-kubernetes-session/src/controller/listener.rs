@@ -5,6 +5,7 @@ use super::{
     ControllerTlsAcceptor, ControllerTlsConnectionError,
 };
 use std::future::Future;
+use std::io;
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
@@ -64,6 +65,7 @@ impl ControllerListener {
                 accepted = listener.accept() => {
                     let (stream, _peer) = match accepted {
                         Ok(accepted) => accepted,
+                        Err(source) if is_transient_accept_error(&source) => continue,
                         Err(source) => break Some(ControllerListenerError::Accept(source)),
                     };
                     match self.endpoint.try_admit() {
@@ -100,6 +102,16 @@ impl ControllerListener {
     }
 }
 
+fn is_transient_accept_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::Interrupted
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionRefused
+    )
+}
+
 fn observe_connection(
     completed: Result<ConnectionResult, tokio::task::JoinError>,
 ) -> Result<(), ControllerListenerError> {
@@ -131,6 +143,26 @@ pub enum ControllerListenerError {
 mod tests {
     use super::*;
     use crate::controller::ControllerConnectionError;
+
+    #[test]
+    fn transient_accept_errors_are_retried_but_listener_failures_are_fatal() {
+        for kind in [
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionRefused,
+        ] {
+            assert!(is_transient_accept_error(&std::io::Error::from(kind)));
+        }
+
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::OutOfMemory,
+            std::io::ErrorKind::WouldBlock,
+        ] {
+            assert!(!is_transient_accept_error(&std::io::Error::from(kind)));
+        }
+    }
 
     #[test]
     fn peer_errors_remain_local_but_internal_invariants_fail_closed() {

@@ -602,6 +602,10 @@ task receives an abort request before the supervisor returns. The executable
 then terminates the process; the replacement startup scan is the sole recovery
 authority.
 
+The relay listener retries only a closed allowlist of peer-local transient
+accept errors. Permission, resource-exhaustion, and unknown listener errors
+remain process-fatal so they cannot be hidden by an unbounded retry loop.
+
 The controller exposes this state on a separate plaintext probe listener.
 Only `GET /livez` and `GET /readyz` exist: liveness reports that probe
 orchestration and its supervisor publisher are live, while readiness maps the
