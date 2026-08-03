@@ -22,6 +22,9 @@ pub struct KubernetesSessionConfig {
     /// Projected credential read by the trusted bridge, never by workers.
     #[serde(default = "default_credential_file")]
     pub credential_file: String,
+    /// Optional PEM CA bundle used by the trusted bridge for the controller.
+    #[serde(default)]
+    pub controller_ca_file: Option<String>,
 }
 
 fn default_credential_file() -> String {
@@ -71,23 +74,39 @@ impl KubernetesSessionConfig {
             is_absolute_credential_path(&self.credential_file),
             "kubernetes_session.credential_file must be an absolute path"
         );
+        if let Some(controller_ca_file) = &self.controller_ca_file {
+            ensure!(
+                !controller_ca_file.trim().is_empty(),
+                "kubernetes_session.controller_ca_file must not be empty"
+            );
+            ensure!(
+                controller_ca_file.starts_with('/'),
+                "kubernetes_session.controller_ca_file must be an absolute Linux path"
+            );
+        }
         Ok(())
     }
 
     fn bridge_agent(&self, agent: &AgentConfig) -> AgentConfig {
+        let mut args = vec![
+            "bridge".to_string(),
+            "--controller-url".to_string(),
+            self.controller_url.clone(),
+            "--profile".to_string(),
+            self.profile.clone(),
+            "--scope".to_string(),
+            self.scope.clone(),
+            "--credential-file".to_string(),
+            self.credential_file.clone(),
+        ];
+        if let Some(controller_ca_file) = &self.controller_ca_file {
+            args.push("--controller-ca-file".to_string());
+            args.push(controller_ca_file.clone());
+        }
+
         AgentConfig {
             command: "openab-kubernetes-session".to_string(),
-            args: vec![
-                "bridge".to_string(),
-                "--controller-url".to_string(),
-                self.controller_url.clone(),
-                "--profile".to_string(),
-                self.profile.clone(),
-                "--scope".to_string(),
-                self.scope.clone(),
-                "--credential-file".to_string(),
-                self.credential_file.clone(),
-            ],
+            args,
             working_dir: agent.working_dir.clone(),
             env: agent.env.clone(),
             inherit_env: agent.inherit_env.clone(),
@@ -216,6 +235,7 @@ inherit_env = ["HTTPS_PROXY"]
         let runtime = cfg.kubernetes_session.as_ref().unwrap();
         assert_eq!(runtime.scope, SCOPE);
         assert_eq!(runtime.credential_file, DEFAULT_CREDENTIAL_FILE);
+        assert_eq!(runtime.controller_ca_file, None);
         assert_eq!(cfg.agent.command, "openab-kubernetes-session");
         assert_eq!(
             cfg.agent.args,
@@ -232,6 +252,48 @@ inherit_env = ["HTTPS_PROXY"]
             ]
         );
         assert_eq!(cfg.agent.inherit_env, vec!["HTTPS_PROXY"]);
+    }
+
+    #[test]
+    fn kubernetes_session_appends_controller_ca_file_to_bridge_args() {
+        const CONTROLLER_CA_FILE: &str = "/var/run/secrets/openab-session/ca.crt";
+        let cfg = parse_config_str(
+            &session_config(
+                CONTROLLER_URL,
+                PROFILE,
+                SCOPE,
+                None,
+                &format!("controller_ca_file = \"{CONTROLLER_CA_FILE}\"\n"),
+                "",
+            ),
+            "test",
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.kubernetes_session
+                .as_ref()
+                .unwrap()
+                .controller_ca_file
+                .as_deref(),
+            Some(CONTROLLER_CA_FILE)
+        );
+        assert_eq!(
+            cfg.agent.args,
+            vec![
+                "bridge",
+                "--controller-url",
+                CONTROLLER_URL,
+                "--profile",
+                PROFILE,
+                "--scope",
+                SCOPE,
+                "--credential-file",
+                DEFAULT_CREDENTIAL_FILE,
+                "--controller-ca-file",
+                CONTROLLER_CA_FILE,
+            ]
+        );
     }
 
     #[test]
@@ -447,6 +509,38 @@ command = "codex-acp"
         let config = session_config(CONTROLLER_URL, PROFILE, SCOPE, Some(""), "", "");
         let err = parse_config_str(&config, "test").unwrap_err();
         assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn kubernetes_session_rejects_empty_controller_ca_file() {
+        let config = session_config(
+            CONTROLLER_URL,
+            PROFILE,
+            SCOPE,
+            None,
+            "controller_ca_file = \"\"\n",
+            "",
+        );
+        let err = parse_config_str(&config, "test").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("controller_ca_file must not be empty"));
+    }
+
+    #[test]
+    fn kubernetes_session_rejects_non_linux_controller_ca_path() {
+        let config = session_config(
+            CONTROLLER_URL,
+            PROFILE,
+            SCOPE,
+            None,
+            "controller_ca_file = \"secrets/controller-ca.crt\"\n",
+            "",
+        );
+        let err = parse_config_str(&config, "test").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("controller_ca_file must be an absolute Linux path"));
     }
 
     #[test]

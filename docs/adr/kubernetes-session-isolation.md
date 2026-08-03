@@ -165,6 +165,14 @@ The bridge remains an ACP stdio subprocess from OpenAB's perspective. It does
 not receive Kubernetes RBAC. It authenticates to the controller/relay and
 passes ACP traffic between OpenAB and the assigned worker.
 
+By default the bridge verifies the controller with the platform native root
+store, preserving the existing WebSocket connector behavior. An operator may
+additionally provide an absolute path to a mounted, certificate-only private CA
+bundle. Those anchors are added to the native roots and use rustls's standard
+hostname and SNI verification; there is no insecure-verifier mode, inline PEM,
+or private-key input. Each bridge reads the bounded bundle once at process
+startup, so trust rotation uses a versioned read-only mount and broker rollout.
+
 The bridge is envelope-aware but is not a second ACP agent implementation. It
 intercepts only the lifecycle and security-sensitive setup needed to:
 

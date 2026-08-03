@@ -326,13 +326,23 @@ agent process.
 | `profile` | string | required | Cluster-owned worker profile name as a lowercase Kubernetes DNS label. |
 | `scope` | string | required | Non-empty stable team/agent state-ownership scope without edge whitespace, up to 253 bytes. It is hashed before use in Kubernetes resource identity. |
 | `credential_file` | string | `/var/run/secrets/openab-session/token` | Absolute path to the projected broker-to-controller credential. The credential value is not stored in TOML. |
+| `controller_ca_file` | string | unset | Optional absolute Linux path to a PEM CA bundle mounted in the trusted broker Pod. Its certificate-only trust anchors are added to the native root store; standard hostname verification remains required. |
 
 ```toml
 [kubernetes_session]
 controller_url = "wss://openab-session-controller.openab-system.svc/relay"
 profile = "codex-strict"
 scope = "team-a-openab-codex"
+# Optional when the controller uses a private CA:
+# controller_ca_file = "/var/run/secrets/openab-session/ca.crt"
 ```
+
+When `controller_ca_file` is absent, the bridge uses its existing native-root
+TLS connector unchanged. When present, each new bridge process reads at most
+256 KiB, accepts only valid `CERTIFICATE` PEM blocks, and adds those anchors to
+the native roots. It does not accept inline PEM, private keys, a hostname
+verification bypass, or hot reload. Use a versioned read-only ConfigMap mount
+and restart the broker when rotating the trust bundle.
 
 `[kubernetes_session]` is mutually exclusive with `[agentcore]` and an
 explicit `[agent].command`. The internal `OPENAB_SESSION_KEY` and

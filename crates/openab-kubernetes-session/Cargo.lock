@@ -1170,6 +1170,8 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "rcgen",
+ "rustls 0.22.4",
+ "rustls-native-certs 0.7.3",
  "rustls-pemfile",
  "serde",
  "serde_json",
