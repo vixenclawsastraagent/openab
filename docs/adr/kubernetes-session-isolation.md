@@ -698,6 +698,35 @@ local agent command. Raw `[[ws:/broker/path]]` directives are rejected in this
 mode. Repository selection and worker paths are administrator-owned profile
 inputs, not chat-controlled mounts from the broker Pod.
 
+### 7.1 Controller process configuration
+
+The add-on controller is a separate executable with a separate, versioned
+local TOML file. It does not read OpenAB's broker configuration, environment
+variable overrides, or a remote configuration service. The version-one schema
+rejects unknown and missing fields and separates:
+
+- the fixed scope, worker namespace, and mounted worker-profile file;
+- distinct relay and plaintext probe listener addresses;
+- mounted TLS identity and bridge-credential file paths;
+- bounded connection, queue, and process-wide relay byte-budget policy.
+
+Every mounted-file path is absolute. Credentials and private keys are file
+contents, never TOML values. The raw scope is validated with the same contract
+as OpenAB's broker configuration and immediately reduced to its opaque
+`ScopeId`; the long-lived configuration retains no raw scope. The relay byte
+budget must fit the largest valid ACP frame, preventing a valid frame from
+entering permanent backpressure. The TOML source, mounted paths, listener
+ports, and resource limits have parser safety ceilings in addition to
+Kubernetes quotas. Transport, retry, maintenance, and shutdown timings use
+conservative implementation defaults rather than becoming a premature
+version-one operator contract.
+
+The profile file remains an independent schema because worker policy and its
+retained revisions have a different lifecycle from process transport. The MVP
+does not add an `enabled` flag or selectable state backend: running the
+separate controller and selecting `[kubernetes_session]` are the two opt-in
+actions, and namespaced ConfigMap anchors remain the only initial backend.
+
 ## 8. Threats and controls
 
 | Threat | Required control |
