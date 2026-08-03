@@ -761,6 +761,26 @@ backend. Running the separate controller and selecting `[kubernetes_session]`
 are the two opt-in actions, and namespaced ConfigMap anchors remain the only
 initial backend.
 
+The standalone `openab-kubernetes-session-controller` executable accepts only
+`--config-file <absolute-path>`. It installs latched `SIGINT` and `SIGTERM`
+handling before reading mounted configuration, resolves the Kubernetes client
+and every current cluster reference, and completes startup orphan containment
+before binding any socket. It then binds the authenticated relay and plaintext
+probe listeners as one startup unit: a failure or shutdown while binding the
+second listener drops the first, and neither listener is served unless both
+bind successfully. The deployment therefore uses a startup probe rather than
+assuming the probe port exists during containment.
+
+At normal shutdown the executable first stops the controller supervisor. Its
+readiness publisher changes to not-ready while the probe listener remains
+available, so Kubernetes observes `503` throughout bounded relay, maintenance,
+and durable-containment drain. The probe stops only after that drain completes.
+Unexpected completion, failure, or panic of either server stops and settles the
+other server without a detached task, and preserves the first failing
+component's fixed error category. Process errors, logs, and the panic hook do
+not print configuration paths, Kubernetes response details, credential bytes,
+or panic payloads.
+
 ## 8. Threats and controls
 
 | Threat | Required control |

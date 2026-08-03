@@ -37,8 +37,10 @@ controller-runtime = [
     "dep:rustls-pemfile",
     "dep:tokio-rustls",
     "dep:tracing",
+    "dep:tracing-subscriber",
     "dep:zeroize",
     "tokio/net",
+    "tokio/signal",
     "tokio-tungstenite/handshake",
 ]
 
@@ -69,6 +71,7 @@ tokio-tungstenite = { version = "0.21", default-features = false, optional = tru
 tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12"], optional = true }
 toml = { version = "0.8", optional = true }
 tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"], optional = true }
 uuid = { version = "1", features = ["serde", "v4"] }
 zeroize = { version = "1", optional = true }
 
@@ -83,3 +86,8 @@ tower-test = "0.4"
 name = "openab-kubernetes-session"
 path = "src/bin/openab-kubernetes-session.rs"
 required-features = ["bridge-runtime"]
+
+[[bin]]
+name = "openab-kubernetes-session-controller"
+path = "src/bin/openab-kubernetes-session-controller.rs"
+required-features = ["controller-runtime"]
