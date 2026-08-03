@@ -712,6 +712,8 @@ struct RendezvousState {
 pub enum RendezvousFatalError {
     #[error("the rendezvous state mutex was poisoned")]
     StatePoisoned,
+    #[error("a controller-owned relay task panicked")]
+    OwnedTaskPanicked,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -742,10 +744,20 @@ impl DerefMut for RendezvousGuard<'_> {
 impl Drop for RendezvousGuard<'_> {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            self.health
-                .send_replace(RendezvousHealth::Fatal(RendezvousFatalError::StatePoisoned));
+            latch_fatal_health(&self.health, RendezvousFatalError::StatePoisoned);
         }
     }
+}
+
+fn latch_fatal_health(health: &watch::Sender<RendezvousHealth>, source: RendezvousFatalError) {
+    health.send_if_modified(|health| {
+        if matches!(health, RendezvousHealth::Healthy) {
+            *health = RendezvousHealth::Fatal(source);
+            true
+        } else {
+            false
+        }
+    });
 }
 
 /// In-memory rendezvous, handshake pairing, and close fencing for one process.
@@ -813,6 +825,10 @@ impl RendezvousRegistry {
     /// guard latches fatal health while the original task is unwinding.
     pub fn health(&self) -> watch::Receiver<RendezvousHealth> {
         self.health.subscribe()
+    }
+
+    pub(crate) fn latch_fatal(&self, source: RendezvousFatalError) {
+        latch_fatal_health(&self.health, source);
     }
 
     /// Install an authenticated broker lane and retain its correlated

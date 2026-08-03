@@ -571,6 +571,10 @@ installation or result delivery. If handoff to the caller fails, dropping the
 exact attachment synchronously quiesces the entry and schedules containment; a
 retained ticket provides the retry path. Process failure anywhere in this
 interval remains covered by the startup orphan scan before readiness.
+The relay counts these tasks transitively, including containment work spawned
+while a parent task unwinds. A controller-owned task panic latches the same
+process-fatal health signal, and a normal shutdown cannot report clean task
+settlement until the count returns to zero.
 
 Controller restart discards every process-local authenticated lane. Before it
 admits relay traffic or reports readiness, the controller therefore lists all

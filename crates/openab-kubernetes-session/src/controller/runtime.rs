@@ -171,6 +171,9 @@ impl PreparedController {
             let _ = stop_rx.await;
         });
         let result = supervise_serving(health, serving, stop_tx, shutdown).await;
+        if result.is_ok() && relay.wait_for_owned_tasks().await.is_err() {
+            return Err(ControllerRuntimeServeError::OwnedTaskFailed);
+        }
         drop(relay);
         result
     }
@@ -295,6 +298,9 @@ pub enum ControllerRuntimeServeError {
     /// The listener returned without shutdown or a fatal health signal.
     #[error("controller listener stopped without a terminal signal")]
     ListenerStopped,
+    /// A controller-owned relay task panicked before clean settlement.
+    #[error("a controller-owned relay task failed")]
+    OwnedTaskFailed,
 }
 
 #[cfg(test)]
