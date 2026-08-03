@@ -17,6 +17,8 @@ mod rendezvous;
 mod runtime;
 mod service;
 #[cfg(feature = "controller-runtime")]
+mod supervisor;
+#[cfg(feature = "controller-runtime")]
 mod tls;
 #[cfg(feature = "controller-runtime")]
 mod upgrade;
@@ -81,12 +83,16 @@ pub(crate) use rendezvous::{
 };
 #[cfg(feature = "controller-runtime")]
 pub use runtime::{
-    ControllerRuntimeBuildError, ControllerRuntimeServeError, ControllerStartup,
-    ControllerStartupError, PreparedController,
+    ControllerRuntimeBuildError, ControllerStartup, ControllerStartupError, PreparedController,
 };
 pub use service::{
     ControllerService, ControllerServiceConfigError, ControllerServiceError,
     LifecycleServiceOutcome,
+};
+#[cfg(feature = "controller-runtime")]
+pub use supervisor::{
+    ControllerReadiness, ControllerReadinessState, ControllerRuntimeServeError,
+    ControllerSupervisor, ControllerSupervisorConfig, ControllerSupervisorConfigError,
 };
 #[cfg(feature = "controller-runtime")]
 pub use tls::{ControllerTlsAcceptor, ControllerTlsConfigError, ControllerTlsConnectionError};

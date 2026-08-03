@@ -1,12 +1,14 @@
 #![cfg(feature = "controller-runtime")]
 
 use chrono::{Duration as ChronoDuration, Utc};
+use futures_util::FutureExt;
 use http::{Request, Response, StatusCode};
 use kube::client::Body;
 use kube::Client;
 use openab_kubernetes_session::controller::{
-    ControllerEndpointConfig, ControllerRuntimeBuildError, ControllerStartup,
-    ControllerStartupError, ControllerTlsAcceptor, RelayByteBudget,
+    ControllerEndpointConfig, ControllerReadinessState, ControllerRuntimeBuildError,
+    ControllerStartup, ControllerStartupError, ControllerSupervisorConfig,
+    ControllerSupervisorConfigError, ControllerTlsAcceptor, RelayByteBudget,
 };
 use openab_kubernetes_session::identity::{ResourceNames, ScopeId, SessionId};
 use openab_kubernetes_session::profile_config::ControllerPolicy;
@@ -18,7 +20,6 @@ use openab_kubernetes_session::state::{ProfileRef, SessionAnchorV1, SessionPhase
 use rcgen::{generate_simple_self_signed, CertifiedKey};
 use serde_json::{json, Value};
 use std::error::Error as _;
-use std::future::ready;
 use std::io::Cursor;
 use std::num::NonZeroUsize;
 use std::time::Duration;
@@ -297,11 +298,149 @@ async fn cancelling_prepare_cannot_yield_a_serving_capability() {
     }
 }
 
+fn supervisor_config() -> ControllerSupervisorConfig {
+    ControllerSupervisorConfig::new(Duration::from_secs(60), Duration::from_secs(1)).unwrap()
+}
+
+#[test]
+fn supervisor_rejects_zero_maintenance_interval_and_shutdown_grace() {
+    assert_eq!(
+        ControllerSupervisorConfig::new(Duration::ZERO, Duration::from_secs(1)),
+        Err(ControllerSupervisorConfigError::ZeroMaintenanceInterval)
+    );
+    assert_eq!(
+        ControllerSupervisorConfig::new(Duration::from_secs(1), Duration::ZERO),
+        Err(ControllerSupervisorConfigError::ZeroShutdownGrace)
+    );
+}
+
 #[tokio::test]
-async fn empty_inventory_prepares_and_external_shutdown_stops_listener() {
+async fn empty_inventory_supervisor_publishes_the_full_readiness_lifecycle() {
     let prepared = prepared_empty().await;
     assert!(prepared.startup_orphans().results().is_empty());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let supervisor = prepared.into_supervisor(supervisor_config());
+    let mut readiness = supervisor.readiness();
+    assert_eq!(readiness.state(), ControllerReadinessState::NotReady);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(supervisor.serve_until(listener, async move {
+        let _ = shutdown_rx.await;
+    }));
 
-    prepared.serve_until(listener, ready(())).await.unwrap();
+    assert_eq!(
+        readiness.wait_for_change().await,
+        Some(ControllerReadinessState::Ready)
+    );
+    shutdown_tx.send(()).unwrap();
+    assert_eq!(
+        readiness.wait_for_change().await,
+        Some(ControllerReadinessState::NotReady)
+    );
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn aborting_the_supervisor_cannot_leave_readiness_true() {
+    let prepared = prepared_empty().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let supervisor = prepared.into_supervisor(supervisor_config());
+    let mut readiness = supervisor.readiness();
+    let task = tokio::spawn(supervisor.serve_until(listener, std::future::pending()));
+
+    assert_eq!(
+        readiness.wait_for_change().await,
+        Some(ControllerReadinessState::Ready)
+    );
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+
+    assert_eq!(
+        readiness.wait_for_change().await,
+        Some(ControllerReadinessState::NotReady)
+    );
+    assert_eq!(readiness.state(), ControllerReadinessState::NotReady);
+    assert_eq!(readiness.wait_for_change().await, None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn maintenance_is_sequential_skips_backlog_and_does_not_overlap() {
+    let (client, handle) = client_and_handle();
+    let prepare = tokio::spawn(configured(client).prepare());
+    let mut handle = Box::pin(handle);
+    let (_startup_list, send) = handle.next_request().await.unwrap();
+    send.send_response(json_response(StatusCode::OK, config_map_list(&[])));
+    let prepared = prepare.await.unwrap().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let supervisor = prepared.into_supervisor(supervisor_config());
+    let mut readiness = supervisor.readiness();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(supervisor.serve_until(listener, async move {
+        let _ = shutdown_rx.await;
+    }));
+    assert_eq!(
+        readiness.wait_for_change().await,
+        Some(ControllerReadinessState::Ready)
+    );
+
+    tokio::time::advance(Duration::from_secs(60)).await;
+    let (_deadline_list, deadline_send) = handle.next_request().await.unwrap();
+    tokio::time::advance(Duration::from_secs(5 * 60)).await;
+    tokio::task::yield_now().await;
+    assert!(handle.next_request().now_or_never().is_none());
+
+    deadline_send.send_response(json_response(StatusCode::OK, config_map_list(&[])));
+    let (_durable_list, durable_send) = handle.next_request().await.unwrap();
+    durable_send.send_response(json_response(StatusCode::OK, config_map_list(&[])));
+    let (_one_skipped_tick_pass, skipped_tick_send) = handle.next_request().await.unwrap();
+    tokio::task::yield_now().await;
+    assert!(handle.next_request().now_or_never().is_none());
+    skipped_tick_send.send_response(json_response(StatusCode::OK, config_map_list(&[])));
+    let (_skipped_tick_durable_list, skipped_tick_durable_send) =
+        handle.next_request().await.unwrap();
+    skipped_tick_durable_send.send_response(json_response(StatusCode::OK, config_map_list(&[])));
+    tokio::task::yield_now().await;
+    assert!(handle.next_request().now_or_never().is_none());
+
+    shutdown_tx.send(()).unwrap();
+    assert_eq!(
+        readiness.wait_for_change().await,
+        Some(ControllerReadinessState::NotReady)
+    );
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_withdraws_readiness_before_an_active_maintenance_pass_drains() {
+    let (client, handle) = client_and_handle();
+    let prepare = tokio::spawn(configured(client).prepare());
+    let mut handle = Box::pin(handle);
+    let (_startup_list, send) = handle.next_request().await.unwrap();
+    send.send_response(json_response(StatusCode::OK, config_map_list(&[])));
+    let prepared = prepare.await.unwrap().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let supervisor = prepared.into_supervisor(supervisor_config());
+    let mut readiness = supervisor.readiness();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(supervisor.serve_until(listener, async move {
+        let _ = shutdown_rx.await;
+    }));
+    assert_eq!(
+        readiness.wait_for_change().await,
+        Some(ControllerReadinessState::Ready)
+    );
+
+    tokio::time::advance(Duration::from_secs(60)).await;
+    let (_deadline_list, deadline_send) = handle.next_request().await.unwrap();
+    shutdown_tx.send(()).unwrap();
+    assert_eq!(
+        readiness.wait_for_change().await,
+        Some(ControllerReadinessState::NotReady)
+    );
+    tokio::task::yield_now().await;
+    assert!(!task.is_finished());
+
+    deadline_send.send_response(json_response(StatusCode::OK, config_map_list(&[])));
+    let (_durable_list, durable_send) = handle.next_request().await.unwrap();
+    durable_send.send_response(json_response(StatusCode::OK, config_map_list(&[])));
+    task.await.unwrap().unwrap();
 }

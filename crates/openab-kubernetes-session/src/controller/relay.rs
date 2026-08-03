@@ -17,6 +17,7 @@ use crate::wire::{
 };
 use async_trait::async_trait;
 use futures_util::FutureExt;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::panic::AssertUnwindSafe;
@@ -291,16 +292,22 @@ struct ContainmentHandle {
 
 impl ContainmentHandle {
     fn begin_and_schedule(&self, connection: RelayConnection) {
-        let RelayConnectionLoss::ContainmentRequired(ticket) =
-            self.registry.begin_connection_loss(&connection)
-        else {
+        // Fatal process health delegates every remaining generation to the
+        // replacement's startup orphan scan. Attachment destruction during
+        // emergency listener cancellation shares the owned-task admission
+        // fence with supervisor abort, so no fresh Kubernetes work can escape.
+        let Some((ticket, permit)) = self.owned_tasks.reserve_containment(&connection) else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
         let controller = Arc::clone(&self.controller);
         let registry = self.registry.clone();
-        self.owned_tasks.spawn(async move {
-            persist_containment(controller.as_ref(), &registry, &ticket).await;
-        });
+        self.owned_tasks
+            .spawn_reserved(runtime, permit, async move {
+                persist_containment(controller.as_ref(), &registry, &ticket).await;
+            });
     }
 }
 
@@ -311,9 +318,16 @@ struct RelayOwnedTasks {
 }
 
 struct RelayOwnedTaskState {
-    active: Mutex<usize>,
+    book: Mutex<RelayOwnedTaskBook>,
     panicked: AtomicBool,
     idle_generation: watch::Sender<u64>,
+}
+
+struct RelayOwnedTaskBook {
+    active: usize,
+    next_id: u64,
+    sealed: bool,
+    abort_handles: BTreeMap<u64, tokio::task::AbortHandle>,
 }
 
 impl RelayOwnedTasks {
@@ -321,7 +335,12 @@ impl RelayOwnedTasks {
         let (idle_generation, _) = watch::channel(0);
         Self {
             state: Arc::new(RelayOwnedTaskState {
-                active: Mutex::new(0),
+                book: Mutex::new(RelayOwnedTaskBook {
+                    active: 0,
+                    next_id: 0,
+                    sealed: false,
+                    abort_handles: BTreeMap::new(),
+                }),
                 panicked: AtomicBool::new(false),
                 idle_generation,
             }),
@@ -336,51 +355,163 @@ impl RelayOwnedTasks {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        if !self.begin() {
+        let Some(permit) = self.reserve() else {
             return;
-        }
-        let permit = RelayOwnedTaskPermit {
-            tasks: self.clone(),
         };
-        runtime.spawn(async move {
+        self.spawn_reserved(runtime, permit, future);
+    }
+
+    fn reserve(&self) -> Option<RelayOwnedTaskPermit> {
+        let reservation = {
+            let mut book = self
+                .state
+                .book
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if book.sealed || !self.registry.is_healthy() {
+                return None;
+            }
+            reserve_owned_task(&mut book)
+        };
+        match reservation {
+            Ok(id) => Some(RelayOwnedTaskPermit {
+                tasks: self.clone(),
+                id,
+            }),
+            Err(()) => {
+                self.mark_panicked();
+                None
+            }
+        }
+    }
+
+    fn reserve_containment(
+        &self,
+        connection: &RelayConnection,
+    ) -> Option<(RelayContainmentTicket, RelayOwnedTaskPermit)> {
+        let reservation = {
+            let mut book = self
+                .state
+                .book
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if book.sealed || !self.registry.is_healthy() {
+                return None;
+            }
+            let loss = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                self.registry.begin_connection_loss(connection)
+            }));
+            let ticket = match loss {
+                Ok(RelayConnectionLoss::ContainmentRequired(ticket)) => *ticket,
+                Ok(_) => return None,
+                Err(_) => {
+                    drop(book);
+                    self.mark_panicked();
+                    return None;
+                }
+            };
+            reserve_owned_task(&mut book).map(|id| (ticket, id))
+        };
+        match reservation {
+            Ok((ticket, id)) => Some((
+                ticket,
+                RelayOwnedTaskPermit {
+                    tasks: self.clone(),
+                    id,
+                },
+            )),
+            Err(()) => {
+                self.mark_panicked();
+                None
+            }
+        }
+    }
+
+    fn spawn_reserved<F>(
+        &self,
+        runtime: tokio::runtime::Handle,
+        permit: RelayOwnedTaskPermit,
+        future: F,
+    ) where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let id = permit.id;
+        let (start_tx, start_rx) = oneshot::channel();
+        let task = runtime.spawn(async move {
+            if start_rx.await.is_err() {
+                return;
+            }
             let outcome = AssertUnwindSafe(future).catch_unwind().await;
             if outcome.is_err() {
                 permit.tasks.mark_panicked();
             }
             drop(permit);
         });
-    }
+        let abort_handle = task.abort_handle();
+        drop(task);
 
-    fn begin(&self) -> bool {
-        let mut active = self
-            .state
-            .active
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(next) = active.checked_add(1) else {
-            drop(active);
-            self.mark_panicked();
-            return false;
-        };
-        *active = next;
-        true
-    }
-
-    fn finish(&self) {
-        let became_idle = {
-            let mut active = self
+        let abort = {
+            let mut book = self
                 .state
-                .active
+                .book
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let Some(next) = active.checked_sub(1) else {
-                drop(active);
+            if book.sealed {
+                true
+            } else if book
+                .abort_handles
+                .insert(id, abort_handle.clone())
+                .is_some()
+            {
+                drop(book);
                 self.mark_panicked();
-                return;
-            };
-            *active = next;
-            *active == 0
+                true
+            } else {
+                false
+            }
         };
+        if abort {
+            abort_handle.abort();
+        }
+        let _ = start_tx.send(());
+    }
+
+    #[cfg(any(feature = "controller-runtime", test))]
+    fn abort_all(&self) {
+        let abort_handles = {
+            let mut book = self
+                .state
+                .book
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            book.sealed = true;
+            std::mem::take(&mut book.abort_handles)
+        };
+        for abort_handle in abort_handles.into_values() {
+            abort_handle.abort();
+        }
+    }
+
+    fn finish(&self, id: u64) {
+        let (became_idle, invalid) = {
+            let mut book = self
+                .state
+                .book
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            book.abort_handles.remove(&id);
+            match book.active.checked_sub(1) {
+                Some(next) => {
+                    book.active = next;
+                    (next == 0, false)
+                }
+                None => (false, true),
+            }
+        };
+        if invalid {
+            self.mark_panicked();
+            return;
+        }
         if became_idle {
             self.state
                 .idle_generation
@@ -398,11 +529,12 @@ impl RelayOwnedTasks {
     async fn wait_for_idle(&self) -> Result<(), RelayOwnedTaskError> {
         let mut idle_generation = self.state.idle_generation.subscribe();
         loop {
-            let active = *self
+            let active = self
                 .state
-                .active
+                .book
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .active;
             if active == 0 {
                 return if self.state.panicked.load(Ordering::Acquire) {
                     Err(RelayOwnedTaskError::Panicked)
@@ -418,13 +550,23 @@ impl RelayOwnedTasks {
     }
 }
 
+fn reserve_owned_task(book: &mut RelayOwnedTaskBook) -> Result<u64, ()> {
+    let id = book.next_id;
+    let next_id = id.checked_add(1).ok_or(())?;
+    let active = book.active.checked_add(1).ok_or(())?;
+    book.next_id = next_id;
+    book.active = active;
+    Ok(id)
+}
+
 struct RelayOwnedTaskPermit {
     tasks: RelayOwnedTasks,
+    id: u64,
 }
 
 impl Drop for RelayOwnedTaskPermit {
     fn drop(&mut self) {
-        self.tasks.finish();
+        self.tasks.finish(self.id);
     }
 }
 
@@ -523,6 +665,11 @@ impl RelayOrchestrator {
     /// task; otherwise a new relay-owned task could start after this returns.
     pub(crate) async fn wait_for_owned_tasks(&self) -> Result<(), RelayOwnedTaskError> {
         self.owned_tasks.wait_for_idle().await
+    }
+
+    #[cfg(any(feature = "controller-runtime", test))]
+    pub(crate) fn abort_owned_tasks(&self) {
+        self.owned_tasks.abort_all();
     }
 
     /// Deliver one ACP message through the exact active peer lane.
@@ -1081,6 +1228,8 @@ mod tests {
     use crate::controller::bridge_websocket::{
         serve_bridge_websocket, BridgeWebSocketOutcome, ControllerBridgeWebSocketError,
     };
+    #[cfg(feature = "controller-runtime")]
+    use crate::controller::supervisor::{finish_normal_shutdown_for_test, terminal_guard_for_test};
     use crate::controller::websocket::relay_websocket_config;
     use crate::controller::worker_websocket::{serve_worker_websocket, WorkerWebSocketError};
     use crate::controller::RendezvousRouteError;
@@ -2893,6 +3042,177 @@ mod tests {
             relay.wait_for_owned_tasks().await,
             Err(RelayOwnedTaskError::Panicked)
         );
+    }
+
+    #[tokio::test]
+    async fn attachment_drop_after_fatal_health_starts_no_containment() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let (relay, registry) = orchestrator(Arc::clone(&controller));
+        let BridgeOpenOutcome::Attached(bridge) = relay
+            .activate_bridge(activation_request(BrokerMappingExpectationV1::Absent))
+            .await
+            .unwrap()
+        else {
+            panic!("durable generation must attach")
+        };
+        let mut health = relay.health();
+
+        registry.latch_fatal(RendezvousFatalError::StatePoisoned);
+        health.changed().await.unwrap();
+        drop(bridge);
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            *health.borrow_and_update(),
+            RendezvousHealth::Fatal(RendezvousFatalError::StatePoisoned)
+        );
+        assert_eq!(controller.losses.load(Ordering::SeqCst), 0);
+        assert!(registry.pending_containments().is_empty());
+    }
+
+    #[tokio::test]
+    async fn aborting_owned_tasks_seals_admission_and_settles_the_tracker() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let (relay, _registry) = orchestrator(controller);
+        let (started_tx, started_rx) = oneshot::channel();
+        relay.owned_tasks.spawn(async move {
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+
+        relay.abort_owned_tasks();
+        timeout(Duration::from_secs(1), relay.wait_for_owned_tasks())
+            .await
+            .expect("aborted tasks must release their tracker permits")
+            .unwrap();
+
+        let later_polls = Arc::new(AtomicUsize::new(0));
+        let later_task_polls = Arc::clone(&later_polls);
+        relay.owned_tasks.spawn(async move {
+            later_task_polls.fetch_add(1, Ordering::SeqCst);
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(later_polls.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(feature = "controller-runtime")]
+    #[tokio::test]
+    async fn cancelled_terminal_scope_fences_tasks_before_attachment_drop() {
+        let controller = Arc::new(FakeController::new(binding()));
+        let (relay, registry) = orchestrator(Arc::clone(&controller));
+        let request = activation_request(BrokerMappingExpectationV1::Absent);
+        let BridgeOpenOutcome::Attached(mut bridge) = relay.activate_bridge(request).await.unwrap()
+        else {
+            panic!("durable generation must attach")
+        };
+        let mut worker = relay.register_worker(registration(), auth()).await.unwrap();
+        drain_installed_handshake(bridge.outbound(), worker.outbound());
+        let bridge_connection = bridge.connection().clone();
+        let worker_connection_id = worker.connection().connection_id();
+
+        let (owned_started_tx, owned_started_rx) = oneshot::channel();
+        relay.owned_tasks.spawn(async move {
+            let _ = owned_started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        owned_started_rx.await.unwrap();
+
+        let (readiness_tx, mut readiness_rx) =
+            watch::channel(crate::controller::ControllerReadinessState::Ready);
+        let (scope_started_tx, scope_started_rx) = oneshot::channel();
+        let terminal_scope = tokio::spawn({
+            let relay = relay.clone();
+            async move {
+                // This mirrors supervisor declaration order: connection-owning
+                // values precede the terminal fence, so cancellation drops the
+                // fence before the attachment can schedule containment.
+                let _bridge = bridge;
+                let _terminal = terminal_guard_for_test(readiness_tx, relay);
+                let _ = scope_started_tx.send(());
+                std::future::pending::<()>().await;
+            }
+        });
+        scope_started_rx.await.unwrap();
+
+        terminal_scope.abort();
+        assert!(terminal_scope.await.unwrap_err().is_cancelled());
+        readiness_rx.changed().await.unwrap();
+        assert_eq!(
+            *readiness_rx.borrow_and_update(),
+            crate::controller::ControllerReadinessState::NotReady
+        );
+        timeout(Duration::from_secs(1), relay.wait_for_owned_tasks())
+            .await
+            .expect("terminal cancellation must abort active owned tasks")
+            .unwrap();
+        tokio::task::yield_now().await;
+
+        assert_eq!(controller.losses.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            registry.route_target(&bridge_connection),
+            Ok(worker_connection_id)
+        );
+    }
+
+    #[cfg(feature = "controller-runtime")]
+    #[tokio::test]
+    async fn normal_shutdown_retries_real_pending_containment() {
+        let controller = Arc::new(FakeController::new(binding()));
+        controller.fail_next_loss();
+        let (relay, registry) = orchestrator(Arc::clone(&controller));
+        let BridgeOpenOutcome::Attached(bridge) = relay
+            .activate_bridge(activation_request(BrokerMappingExpectationV1::Absent))
+            .await
+            .unwrap()
+        else {
+            panic!("durable generation must attach")
+        };
+        drop(bridge);
+
+        wait_for_losses(&controller, 1).await;
+        relay.wait_for_owned_tasks().await.unwrap();
+        assert_eq!(registry.pending_containments().len(), 1);
+        let mut health = relay.health();
+
+        finish_normal_shutdown_for_test(&mut health, Duration::from_secs(1), &relay)
+            .await
+            .unwrap();
+
+        assert_eq!(controller.losses.load(Ordering::SeqCst), 2);
+        assert!(registry.pending_containments().is_empty());
+    }
+
+    #[cfg(feature = "controller-runtime")]
+    #[tokio::test]
+    async fn failed_final_shutdown_containment_is_not_clean() {
+        let controller = Arc::new(FakeController::new(binding()));
+        controller.fail_next_loss();
+        controller.fail_next_loss();
+        let (relay, registry) = orchestrator(Arc::clone(&controller));
+        let BridgeOpenOutcome::Attached(bridge) = relay
+            .activate_bridge(activation_request(BrokerMappingExpectationV1::Absent))
+            .await
+            .unwrap()
+        else {
+            panic!("durable generation must attach")
+        };
+        drop(bridge);
+
+        wait_for_losses(&controller, 1).await;
+        relay.wait_for_owned_tasks().await.unwrap();
+        let mut health = relay.health();
+
+        assert!(matches!(
+            finish_normal_shutdown_for_test(&mut health, Duration::from_secs(1), &relay).await,
+            Err(
+                crate::controller::ControllerRuntimeServeError::FinalContainmentIncomplete {
+                    failures: 1
+                }
+            )
+        ));
+        assert_eq!(controller.losses.load(Ordering::SeqCst), 2);
+        assert_eq!(registry.pending_containments().len(), 1);
     }
 
     #[tokio::test]

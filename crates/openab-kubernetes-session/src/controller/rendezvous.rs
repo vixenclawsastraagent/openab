@@ -827,6 +827,10 @@ impl RendezvousRegistry {
         self.health.subscribe()
     }
 
+    pub(crate) fn is_healthy(&self) -> bool {
+        matches!(*self.health.borrow(), RendezvousHealth::Healthy)
+    }
+
     pub(crate) fn latch_fatal(&self, source: RendezvousFatalError) {
         latch_fatal_health(&self.health, source);
     }

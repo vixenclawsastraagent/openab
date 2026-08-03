@@ -2,9 +2,9 @@
 
 use super::{
     ControllerCoordinatorConfigError, ControllerCoordinators, ControllerEndpoint,
-    ControllerEndpointBuildError, ControllerEndpointConfig, ControllerListener,
-    ControllerListenerError, ControllerService, ControllerServiceConfigError,
-    ControllerServiceError, ControllerTlsAcceptor, GenerationProvisioner,
+    ControllerEndpointBuildError, ControllerEndpointConfig, ControllerListener, ControllerService,
+    ControllerServiceConfigError, ControllerServiceError, ControllerSupervisor,
+    ControllerSupervisorConfig, ControllerTlsAcceptor, GenerationProvisioner,
     GenerationProvisionerError, KubernetesGenerationProvisioner, LifecycleProvisioner,
     RegistrationProvisioner, RelayByteBudget, RelayOrchestrator, ReleaseProvisioner,
     RendezvousFatalError, RendezvousHealth, StartupOrphanReport,
@@ -15,12 +15,10 @@ use crate::resources::MvpWorkerProfile;
 use crate::state::ProfileRef;
 use crate::store::{AnchorStoreError, ConfigMapAnchorStore};
 use kube::Client;
-use std::future::Future;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::net::TcpListener;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::watch;
 
 /// Fully configured controller that has not passed startup containment.
 ///
@@ -119,6 +117,7 @@ impl ControllerStartup {
         require_healthy(&self.health).map_err(ControllerStartupError::FatalHealth)?;
 
         Ok(PreparedController {
+            service: self.service,
             relay: self.relay,
             health: self.health,
             listener: self.listener,
@@ -129,10 +128,11 @@ impl ControllerStartup {
 
 /// Controller that passed restart containment and may now own one listener.
 pub struct PreparedController {
-    relay: RelayOrchestrator,
-    health: watch::Receiver<RendezvousHealth>,
-    listener: ControllerListener,
-    startup_orphans: StartupOrphanReport,
+    pub(super) service: Arc<ControllerService>,
+    pub(super) relay: RelayOrchestrator,
+    pub(super) health: watch::Receiver<RendezvousHealth>,
+    pub(super) listener: ControllerListener,
+    pub(super) startup_orphans: StartupOrphanReport,
 }
 
 impl PreparedController {
@@ -141,108 +141,19 @@ impl PreparedController {
         &self.startup_orphans
     }
 
-    /// Serve one already-bound socket until shutdown or a terminal health
-    /// event.
+    /// Consume the prepared startup gate into the only built-in serving path.
     ///
-    /// This method enforces admission-after-prepare, but the caller owns socket
-    /// binding and must not advertise readiness before entering this method.
-    /// Any return is terminal for this value; no endpoint or listener is
-    /// returned for an in-process restart. Dropping this future is not a clean
-    /// shutdown: callers must resolve the supplied shutdown future and await
-    /// the result. Periodic maintenance and bounded final containment are
-    /// owned by the executable supervisor rather than this startup gate.
-    pub async fn serve_until<F>(
-        self,
-        listener: TcpListener,
-        shutdown: F,
-    ) -> Result<(), ControllerRuntimeServeError>
-    where
-        F: Future<Output = ()> + Send,
-    {
-        let Self {
-            relay,
-            health,
-            listener: controller_listener,
-            startup_orphans: _startup_orphans,
-        } = self;
-        require_healthy(&health).map_err(ControllerRuntimeServeError::FatalHealth)?;
-        let (stop_tx, stop_rx) = oneshot::channel();
-        let serving = controller_listener.serve_until(listener, async move {
-            let _ = stop_rx.await;
-        });
-        let result = supervise_serving(health, serving, stop_tx, shutdown).await;
-        if result.is_ok() && relay.wait_for_owned_tasks().await.is_err() {
-            return Err(ControllerRuntimeServeError::OwnedTaskFailed);
-        }
-        drop(relay);
-        result
+    /// The supervisor owns readiness, periodic maintenance, and bounded clean
+    /// shutdown. Lower-level controller transports remain responsible for
+    /// enforcing the same contracts themselves.
+    pub fn into_supervisor(self, config: ControllerSupervisorConfig) -> ControllerSupervisor {
+        ControllerSupervisor::new(self, config)
     }
 }
 
-async fn supervise_serving<S, F>(
-    mut health: watch::Receiver<RendezvousHealth>,
-    serving: S,
-    stop_tx: oneshot::Sender<()>,
-    shutdown: F,
-) -> Result<(), ControllerRuntimeServeError>
-where
-    S: Future<Output = Result<(), ControllerListenerError>>,
-    F: Future<Output = ()> + Send,
-{
-    let mut stop_tx = Some(stop_tx);
-    tokio::pin!(serving);
-    tokio::pin!(shutdown);
-
-    loop {
-        tokio::select! {
-            biased;
-
-            changed = health.changed() => {
-                let health_error = match changed {
-                    Err(_) => Some(ControllerRuntimeServeError::HealthChannelClosed),
-                    Ok(()) => match *health.borrow() {
-                        RendezvousHealth::Healthy => None,
-                        RendezvousHealth::Fatal(source) => {
-                            Some(ControllerRuntimeServeError::FatalHealth(source))
-                        }
-                    },
-                };
-                let Some(health_error) = health_error else {
-                    continue;
-                };
-                signal_listener_stop(&mut stop_tx);
-                if let Err(source) = serving.await {
-                    tracing::error!(
-                        error = %source,
-                        "controller listener also failed while draining after fatal health"
-                    );
-                }
-                return Err(health_error);
-            }
-            result = &mut serving => {
-                return match result {
-                    Ok(()) => Err(ControllerRuntimeServeError::ListenerStopped),
-                    Err(source) => Err(ControllerRuntimeServeError::Listener(source)),
-                };
-            }
-            _ = &mut shutdown => {
-                signal_listener_stop(&mut stop_tx);
-                serving
-                    .await
-                    .map_err(ControllerRuntimeServeError::Listener)?;
-                return Ok(());
-            }
-        }
-    }
-}
-
-fn signal_listener_stop(sender: &mut Option<oneshot::Sender<()>>) {
-    if let Some(sender) = sender.take() {
-        let _ = sender.send(());
-    }
-}
-
-fn require_healthy(health: &watch::Receiver<RendezvousHealth>) -> Result<(), RendezvousFatalError> {
+pub(super) fn require_healthy(
+    health: &watch::Receiver<RendezvousHealth>,
+) -> Result<(), RendezvousFatalError> {
     match *health.borrow() {
         RendezvousHealth::Healthy => Ok(()),
         RendezvousHealth::Fatal(source) => Err(source),
@@ -283,26 +194,6 @@ pub enum ControllerStartupError {
     StartupContainmentIncomplete { report: StartupOrphanReport },
 }
 
-/// Terminal failure while supervising the built-in controller listener.
-#[derive(Debug, Error)]
-pub enum ControllerRuntimeServeError {
-    /// The relay entered a process-fatal state.
-    #[error("controller relay health became fatal")]
-    FatalHealth(#[source] RendezvousFatalError),
-    /// Every relay health sender disappeared unexpectedly.
-    #[error("controller relay health channel closed")]
-    HealthChannelClosed,
-    /// The listener failed while accepting or serving connections.
-    #[error("controller listener failed")]
-    Listener(#[source] ControllerListenerError),
-    /// The listener returned without shutdown or a fatal health signal.
-    #[error("controller listener stopped without a terminal signal")]
-    ListenerStopped,
-    /// A controller-owned relay task panicked before clean settlement.
-    #[error("a controller-owned relay task failed")]
-    OwnedTaskFailed,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,35 +208,5 @@ mod tests {
             require_healthy(&fatal),
             Err(RendezvousFatalError::StatePoisoned)
         );
-    }
-
-    #[tokio::test]
-    async fn fatal_health_preempts_shutdown_and_drains_serving() {
-        let (health_tx, health) = watch::channel(RendezvousHealth::Healthy);
-        let (stop_tx, stop_rx) = oneshot::channel();
-        let (started_tx, started_rx) = oneshot::channel();
-        let (drained_tx, drained_rx) = oneshot::channel();
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let serving = async move {
-            let _ = started_tx.send(());
-            let _ = stop_rx.await;
-            let _ = drained_tx.send(());
-            Ok(())
-        };
-        let task = tokio::spawn(supervise_serving(health, serving, stop_tx, async move {
-            let _ = shutdown_rx.await;
-        }));
-        started_rx.await.unwrap();
-
-        health_tx.send_replace(RendezvousHealth::Fatal(RendezvousFatalError::StatePoisoned));
-        let _ = shutdown_tx.send(());
-
-        assert!(matches!(
-            task.await.unwrap(),
-            Err(ControllerRuntimeServeError::FatalHealth(
-                RendezvousFatalError::StatePoisoned
-            ))
-        ));
-        drained_rx.await.unwrap();
     }
 }

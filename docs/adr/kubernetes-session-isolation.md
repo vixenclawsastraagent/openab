@@ -576,6 +576,36 @@ while a parent task unwinds. A controller-owned task panic latches the same
 process-fatal health signal, and a normal shutdown cannot report clean task
 settlement until the count returns to zero.
 
+The built-in serving capability is exposed only after the startup gate is
+consumed into a controller supervisor. Its readiness publisher begins
+`NotReady`, changes to `Ready` only after the already-bound listener future has
+entered while relay health is still healthy, and returns to `NotReady` before
+shutdown or any terminal error is drained. Publisher loss is also interpreted
+as not ready. A process-fatal relay signal preempts shutdown, listener, and
+maintenance work. After observing it the supervisor seals controller-owned
+task admission, requests cancellation of every admitted task, and drops the
+other futures. Attachment drop-containment shares that admission fence: a
+registry transition already inside the fence may finish before it closes, but
+no new containment task is admitted afterward, and every previously admitted
+task receives an abort request before the supervisor returns. The executable
+then terminates the process; the replacement startup scan is the sole recovery
+authority.
+
+Steady-state maintenance is one non-overlapping sequential loop. Each delayed
+tick retries pending relay containment, scans lifecycle deadlines, and then
+reconciles already-durable intents. Missed ticks are skipped rather than run as
+a burst. Ordinary Kubernetes inventory or per-session failures are logged and
+retried on a later tick without changing readiness; process-fatal relay health
+remains the fail-closed termination boundary.
+
+Normal shutdown first withdraws readiness and stops listener admission. One
+shared grace deadline then bounds listener and in-progress maintenance drain,
+all already-admitted relay tasks, and a final pending-containment pass. Clean
+shutdown is reported only when relay health remains healthy, every admitted
+task settles without panic, and the final containment report has no failure.
+A timeout or incomplete final pass is terminal and non-clean; the replacement
+process must run startup orphan containment before becoming ready.
+
 Controller restart discards every process-local authenticated lane. Before it
 admits relay traffic or reports readiness, the controller therefore lists all
 anchors and schedules every observed `Provisioning`, `Ready`, and `Busy`
