@@ -7,13 +7,14 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
 use openab_kubernetes_session::identity::{ResourceNames, ScopeId, SessionId};
 use openab_kubernetes_session::profile_config::{
     ControllerPolicy, ResolvedClusterReferences, TrustedControllerConfigV1, MAX_ACTIVE_WORKERS,
-    MAX_LIFECYCLE_TTL_SECONDS,
+    MAX_LIFECYCLE_TTL_SECONDS, MAX_PROFILE_CONFIG_BYTES,
 };
 use openab_kubernetes_session::resources::{
     AllowedRuntimeClass, DesiredGeneration, GenerationContext, PinnedSkillsConfigMap,
     RuntimeClassSelection,
 };
 use openab_kubernetes_session::state::{ProfileRef, SessionAnchorV1};
+use std::io::{self, Cursor, Read};
 use uuid::Uuid;
 
 const NAMESPACE: &str = "team-a-workers";
@@ -592,4 +593,64 @@ name = "team-skills-v1"
 "#
     );
     assert!(TrustedControllerConfigV1::from_toml(&ambiguous_name).is_err());
+}
+
+#[test]
+fn reads_profile_toml_through_the_bounded_utf8_api() {
+    let config = TrustedControllerConfigV1::from_reader(Cursor::new(VALID_CONFIG.as_bytes()))
+        .expect("valid bounded profile config");
+
+    assert_eq!(config.profiles().len(), 1);
+}
+
+#[test]
+fn bounded_profile_reader_accepts_the_exact_ceiling() {
+    let prefix = format!("{VALID_CONFIG}\n#");
+    let source = format!(
+        "{prefix}{}",
+        "x".repeat(MAX_PROFILE_CONFIG_BYTES - prefix.len())
+    );
+    assert_eq!(source.len(), MAX_PROFILE_CONFIG_BYTES);
+
+    assert!(TrustedControllerConfigV1::from_reader(Cursor::new(source)).is_ok());
+}
+
+#[test]
+fn profile_parser_and_reader_reject_oversize_input_before_decode() {
+    let oversized = "#".repeat(MAX_PROFILE_CONFIG_BYTES + 1);
+    assert!(matches!(
+        TrustedControllerConfigV1::from_toml(&oversized),
+        Err(openab_kubernetes_session::profile_config::ProfileConfigError::TooLarge)
+    ));
+    assert!(matches!(
+        TrustedControllerConfigV1::from_reader(Cursor::new(oversized)),
+        Err(openab_kubernetes_session::profile_config::ProfileConfigError::TooLarge)
+    ));
+}
+
+#[test]
+fn profile_reader_rejects_non_utf8_and_sanitizes_io_errors() {
+    use openab_kubernetes_session::profile_config::ProfileConfigError;
+
+    assert!(matches!(
+        TrustedControllerConfigV1::from_reader(Cursor::new([0xff])),
+        Err(ProfileConfigError::InvalidUtf8)
+    ));
+
+    let error =
+        TrustedControllerConfigV1::from_reader(SensitiveReadFailure).expect_err("reader must fail");
+    let rendered = error.to_string();
+    assert!(matches!(error, ProfileConfigError::Read));
+    assert!(!rendered.contains("secret-profile"));
+    assert!(!rendered.contains("/etc/openab-session"));
+}
+
+struct SensitiveReadFailure;
+
+impl Read for SensitiveReadFailure {
+    fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+        Err(io::Error::other(
+            "secret-profile at /etc/openab-session/profiles.toml",
+        ))
+    }
 }

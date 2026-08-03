@@ -6,6 +6,7 @@ use openab_kubernetes_session::controller_process_config::{
 };
 use openab_kubernetes_session::identity::ScopeId;
 use openab_kubernetes_session::wire::MAX_ACP_FRAME_BYTES;
+use std::io::{self, Cursor, Read};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -294,6 +295,51 @@ fn rejects_process_toml_over_the_parser_ceiling_before_decode() {
 }
 
 #[test]
+fn reads_process_toml_through_the_bounded_utf8_api() {
+    let config = ControllerProcessConfigV1::from_reader(Cursor::new(VALID_CONFIG.as_bytes()))
+        .expect("valid bounded process config");
+
+    assert_eq!(config.scope_id(), ScopeId::derive("team-a"));
+}
+
+#[test]
+fn bounded_process_reader_accepts_the_exact_ceiling() {
+    let prefix = format!("{VALID_CONFIG}\n#");
+    let source = format!(
+        "{prefix}{}",
+        "x".repeat(MAX_PROCESS_CONFIG_BYTES - prefix.len())
+    );
+    assert_eq!(source.len(), MAX_PROCESS_CONFIG_BYTES);
+
+    assert!(ControllerProcessConfigV1::from_reader(Cursor::new(source)).is_ok());
+}
+
+#[test]
+fn bounded_process_reader_rejects_oversize_and_non_utf8_input() {
+    let oversized = vec![b'#'; MAX_PROCESS_CONFIG_BYTES + 1];
+    assert!(matches!(
+        ControllerProcessConfigV1::from_reader(Cursor::new(oversized)),
+        Err(ProcessConfigError::TooLarge)
+    ));
+    assert!(matches!(
+        ControllerProcessConfigV1::from_reader(Cursor::new([0xff])),
+        Err(ProcessConfigError::InvalidUtf8)
+    ));
+}
+
+#[test]
+fn process_reader_errors_are_sanitized() {
+    let error = ControllerProcessConfigV1::from_reader(SensitiveReadFailure)
+        .err()
+        .expect("reader must fail");
+    let rendered = error.to_string();
+
+    assert_eq!(error, ProcessConfigError::Read);
+    assert!(!rendered.contains("private-team"));
+    assert!(!rendered.contains("/var/run/openab-session"));
+}
+
+#[test]
 fn errors_do_not_echo_sensitive_or_operator_supplied_values() {
     let source = VALID_CONFIG.replace("scope = \"team-a\"", "scope = \" private-team \"");
     let error = ControllerProcessConfigV1::from_toml(&source)
@@ -303,4 +349,14 @@ fn errors_do_not_echo_sensitive_or_operator_supplied_values() {
 
     assert!(!rendered.contains("private-team"));
     assert!(!rendered.contains("/var/run/openab-session"));
+}
+
+struct SensitiveReadFailure;
+
+impl Read for SensitiveReadFailure {
+    fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+        Err(io::Error::other(
+            "private-team at /var/run/openab-session/profiles.toml",
+        ))
+    }
 }

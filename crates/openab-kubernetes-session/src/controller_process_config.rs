@@ -8,6 +8,7 @@ use crate::controller::{ControllerEndpointConfig, ControllerSupervisorConfig};
 use crate::identity::ScopeId;
 use crate::wire::MAX_ACP_FRAME_BYTES;
 use serde::Deserialize;
+use std::io::Read;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -55,6 +56,23 @@ pub struct ControllerProcessConfigV1 {
 }
 
 impl ControllerProcessConfigV1 {
+    /// Read, bound, decode, and validate version-one process configuration.
+    pub fn from_reader<R>(reader: R) -> Result<Self, ProcessConfigError>
+    where
+        R: Read,
+    {
+        let mut source = Vec::new();
+        reader
+            .take((MAX_PROCESS_CONFIG_BYTES + 1) as u64)
+            .read_to_end(&mut source)
+            .map_err(|_| ProcessConfigError::Read)?;
+        if source.len() > MAX_PROCESS_CONFIG_BYTES {
+            return Err(ProcessConfigError::TooLarge);
+        }
+        let source = std::str::from_utf8(&source).map_err(|_| ProcessConfigError::InvalidUtf8)?;
+        Self::from_toml(source)
+    }
+
     /// Parse and validate the complete version-one process configuration.
     pub fn from_toml(source: &str) -> Result<Self, ProcessConfigError> {
         if source.len() > MAX_PROCESS_CONFIG_BYTES {
@@ -192,8 +210,12 @@ impl ControllerProcessConfigV1 {
 /// Sanitized process-configuration failure.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ProcessConfigError {
+    #[error("controller process configuration could not be read")]
+    Read,
     #[error("controller process configuration exceeds its size limit")]
     TooLarge,
+    #[error("controller process configuration is not valid UTF-8")]
+    InvalidUtf8,
     #[error("controller process configuration is not valid TOML")]
     Decode,
     #[error("unsupported controller process configuration schema version {0}")]

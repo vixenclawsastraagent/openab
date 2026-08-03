@@ -723,9 +723,14 @@ version-one operator contract.
 
 The profile file remains an independent schema because worker policy and its
 retained revisions have a different lifecycle from process transport. The MVP
-does not add an `enabled` flag or selectable state backend: running the
-separate controller and selecting `[kubernetes_session]` are the two opt-in
-actions, and namespaced ConfigMap anchors remain the only initial backend.
+executable reads the process document through a 64 KiB bounded UTF-8 reader
+and the profile document through a 1 MiB bounded UTF-8 reader. Both parsers
+apply the same ceiling when called directly, before TOML decoding, and their
+read/decode errors never include raw source contents, underlying I/O details,
+or file paths. The MVP does not add an `enabled` flag or selectable state
+backend. Running the separate controller and selecting `[kubernetes_session]`
+are the two opt-in actions, and namespaced ConfigMap anchors remain the only
+initial backend.
 
 ## 8. Threats and controls
 

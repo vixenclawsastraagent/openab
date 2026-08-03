@@ -8,6 +8,7 @@ use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::api::node::v1::RuntimeClass;
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -17,8 +18,17 @@ pub const MAX_LIFECYCLE_TTL_SECONDS: u64 = 365 * 24 * 60 * 60;
 /// Parser safety ceiling, not a default namespace quota.
 pub const MAX_ACTIVE_WORKERS: usize = 10_000;
 
+/// Maximum accepted UTF-8 bytes in one trusted worker-profile TOML document.
+pub const MAX_PROFILE_CONFIG_BYTES: usize = 1024 * 1024;
+
 #[derive(Debug, Error)]
 pub enum ProfileConfigError {
+    #[error("worker configuration could not be read")]
+    Read,
+    #[error("worker configuration exceeds its size limit")]
+    TooLarge,
+    #[error("worker configuration is not valid UTF-8")]
+    InvalidUtf8,
     #[error("worker configuration is not valid TOML")]
     Decode,
     #[error("unsupported worker configuration schema version {0}")]
@@ -304,7 +314,27 @@ pub struct TrustedControllerConfigV1 {
 }
 
 impl TrustedControllerConfigV1 {
+    /// Read, bound, decode, and validate version-one worker configuration.
+    pub fn from_reader<R>(reader: R) -> Result<Self, ProfileConfigError>
+    where
+        R: Read,
+    {
+        let mut source = Vec::new();
+        reader
+            .take((MAX_PROFILE_CONFIG_BYTES + 1) as u64)
+            .read_to_end(&mut source)
+            .map_err(|_| ProfileConfigError::Read)?;
+        if source.len() > MAX_PROFILE_CONFIG_BYTES {
+            return Err(ProfileConfigError::TooLarge);
+        }
+        let source = std::str::from_utf8(&source).map_err(|_| ProfileConfigError::InvalidUtf8)?;
+        Self::from_toml(source)
+    }
+
     pub fn from_toml(source: &str) -> Result<Self, ProfileConfigError> {
+        if source.len() > MAX_PROFILE_CONFIG_BYTES {
+            return Err(ProfileConfigError::TooLarge);
+        }
         let decoded: ControllerConfigDto =
             toml::from_str(source).map_err(|_| ProfileConfigError::Decode)?;
         if decoded.schema_version != 1 {
