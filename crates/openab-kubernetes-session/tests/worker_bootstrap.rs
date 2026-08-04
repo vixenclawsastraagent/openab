@@ -296,11 +296,9 @@ fn bootstrap_loads_exact_inputs_and_redacts_all_material() {
     )
     .unwrap();
 
-    assert_eq!(bootstrap.command().executable(), command().executable());
     assert_eq!(bootstrap.controller_url(), CONTROLLER_URL);
     assert_eq!(bootstrap.pod_uid(), POD_UID);
     assert_eq!(bootstrap.controller_ca_pem(), ca);
-    assert_eq!(bootstrap.registration_token(), &raw_token);
     assert_eq!(
         bootstrap.registration().session_id(),
         SessionId::derive("team-sensitive", "discord:thread-sensitive")

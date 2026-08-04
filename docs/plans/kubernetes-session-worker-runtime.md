@@ -144,13 +144,15 @@ Checkpoint evidence:
 
 ### 3. Extract a narrow shared WSS client transport
 
-Move only reusable CA loading, strict WSS URI validation, sensitive request
-header construction, rustls connector creation, and WebSocket limit setup out
-of the broker bridge binary. Keep bridge activation/lifecycle logic and worker
-registration logic in their own modules.
+Move only reusable CA loading, strict WSS URI validation, rustls connector
+creation, and WebSocket limit setup out of the broker bridge binary. Keep
+bridge activation/lifecycle logic and worker registration logic in their own
+modules.
 
-Represent `/v1/bridge` and `/v1/worker` as a closed endpoint choice so a caller
-cannot smuggle an arbitrary path into otherwise shared request code.
+Keep `/v1/bridge` as the only endpoint representable by the ordinary
+tungstenite request builder. Validate `/v1/worker` through a separate closed
+helper and serialize its credential-bearing HTTP request only in the one-shot
+worker state machine.
 
 The extraction must preserve byte-for-byte bridge argv when no private CA is
 configured and preserve all existing bridge TLS/error behavior. It must not
@@ -163,7 +165,11 @@ Checkpoint evidence:
   in meaning and pass;
 - shared helpers reject plaintext, wrong paths, user information, query,
   fragments, invalid roots, and wrong hostname/SNI;
-- credential/header buffers are sensitive, bounded, and zeroized; and
+- the worker's mandatory pinned controller CA is its complete trust store,
+  while the bridge retains its existing native-root behavior;
+- every worker-owned raw-token, encoded-token, plaintext-request, and response
+  scratch buffer is bounded and explicitly zeroized at its earliest safe
+  boundary; and
 - the `worker-runtime` feature does not enable kube or controller dependencies.
 
 ### 4. Implement the worker registration state machine
@@ -175,9 +181,11 @@ once, send Registration as the first text application frame, and wait up to
 
 The worker does not start a child before ACK. Ping/Pong control frames are
 allowed without extending the deadline. Fatal results, ACP-before-ACK,
-duplicate results, invalid frames, close, timeout, and ambiguous send outcomes
-are terminal. There is no same-generation reconnect, registration resend,
-local fallback, or ACP replay.
+correlated or invalid results, invalid frames, close, timeout, and ambiguous
+send outcomes are terminal. The first valid ACK is the V1 transition boundary;
+the registered relay treats every later `ProtocolResult` as a duplicate and
+terminates. There is no same-generation reconnect, registration resend, local
+fallback, or ACP replay.
 
 Checkpoint evidence:
 

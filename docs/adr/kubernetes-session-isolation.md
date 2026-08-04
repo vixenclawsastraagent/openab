@@ -213,6 +213,15 @@ deadline. Binary messages are never reinterpreted as UTF-8 JSON. The adapter
 sets both WebSocket frame and message limits to the wire ACP ceiling, uses a
 finite write buffer, and applies a deadline to every send, flush, and close.
 A bounded, sanitized fatal result may be sent before registration is accepted.
+The worker trusts only its mandatory, controller-pinned private CA and uses
+standard hostname/SNI verification. It establishes verified TLS before
+encoding its credential, writes the closed `/v1/worker` HTTP upgrade through
+one bounded zeroizing plaintext buffer, and accepts only a bounded HTTP/1.1 101
+containing the three exact WebSocket response headers. It does not use
+tungstenite's client handshake serializer or expose a reusable worker request.
+The worker explicitly zeroizes every buffer it owns that contains the raw
+token, encoded token, plaintext request, or response scratch; dependency,
+kernel, and network copies remain outside that literal erasure boundary.
 After registration, EOF, Close, timeout, transport failure, or protocol failure
 drops both socket halves and fences the exact relay attachment before any
 controller I/O; courtesy socket writes never delay that fail-closed transition.

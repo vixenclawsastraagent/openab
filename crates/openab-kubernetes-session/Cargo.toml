@@ -28,8 +28,13 @@ bridge-runtime = [
 ]
 worker-runtime = [
     "client-transport",
+    "dep:futures-util",
+    "dep:httparse",
+    "dep:log",
     "dep:rustix",
     "dep:tokio",
+    "dep:worker-tokio-rustls",
+    "tokio/net",
     "tokio/signal",
 ]
 controller = [
@@ -72,11 +77,16 @@ futures-util = {
 }
 getrandom = { version = "0.4", optional = true }
 hex = "0.4"
+httparse = { version = "=1.10.1", optional = true }
 http = { version = "1", optional = true }
 hyper = { version = "1", default-features = false, features = ["http1", "server"], optional = true }
 hyper-util = { version = "0.1", default-features = false, features = ["service", "tokio"], optional = true }
 k8s-openapi = { version = "=0.28.0", features = ["v1_32"], optional = true }
 kube = { version = "=4.2.0", default-features = false, features = ["client", "ring", "rustls-tls"], optional = true }
+# Tungstenite 0.21 formats text payloads at TRACE and close reasons at DEBUG.
+# Worker builds compile those sites out so ACP and reflected credentials cannot
+# become observable even if a log facade is installed later.
+log = { version = "0.4", features = ["max_level_info", "release_max_level_info"], optional = true }
 rustls = { version = "=0.22.4", default-features = false, features = ["ring", "tls12"], optional = true }
 rustls-native-certs = { version = "=0.7.3", optional = true }
 rustls-pemfile = { version = "=2.2.0", optional = true }
@@ -93,6 +103,7 @@ tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"], optional = true }
 uuid = { version = "1", features = ["serde", "v4"] }
 zeroize = { version = "1", optional = true }
+worker-tokio-rustls = { package = "tokio-rustls", version = "=0.25.0", default-features = false, features = ["ring", "tls12"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "=1.1.4", default-features = false, features = ["fs", "process", "std"], optional = true }

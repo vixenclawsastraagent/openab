@@ -9,7 +9,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 pub const MAX_WORKER_REGISTRATION_BINDING_BYTES: usize = 4 * 1024;
 pub const WORKER_REGISTRATION_TOKEN_BYTES: usize = 32;
@@ -337,10 +337,6 @@ impl WorkerBootstrap {
         }
     }
 
-    pub fn command(&self) -> &WorkerCommand {
-        &self.command
-    }
-
     pub fn controller_url(&self) -> &str {
         &self.controller_url
     }
@@ -349,20 +345,29 @@ impl WorkerBootstrap {
         &self.controller_ca_pem
     }
 
-    /// Expose the one-shot credential only to the worker request builder.
-    ///
-    /// Callers must never log, format, clone, or persist these bytes. The
-    /// bootstrap retains ownership so the credential is zeroized on drop.
-    pub fn registration_token(&self) -> &[u8; WORKER_REGISTRATION_TOKEN_BYTES] {
-        &self.registration_token.0
-    }
-
     pub fn registration(&self) -> &WorkerRegistrationV1 {
         &self.registration
     }
 
     pub fn pod_uid(&self) -> &str {
         &self.pod_uid
+    }
+
+    /// Consume the bootstrap while constructing the only authorized request
+    /// that may observe the raw one-shot credential. The credential is erased
+    /// before any request bytes can be written to the network.
+    pub(super) fn into_registration_request<R, E>(
+        mut self,
+        encode: impl FnOnce(&[u8; WORKER_REGISTRATION_TOKEN_BYTES], &str) -> Result<R, E>,
+    ) -> Result<(R, WorkerRegistrationV1, WorkerCommand), E> {
+        let request = encode(&self.registration_token.0, &self.pod_uid)?;
+        self.registration_token.0.zeroize();
+        let Self {
+            command,
+            registration,
+            ..
+        } = self;
+        Ok((request, registration, command))
     }
 }
 

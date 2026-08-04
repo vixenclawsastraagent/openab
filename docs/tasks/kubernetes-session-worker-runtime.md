@@ -198,21 +198,27 @@ shared read-only while all mutable state remains session-private.
   - Verify: `cargo test --manifest-path crates/openab-kubernetes-session/Cargo.toml --locked --features worker-runtime --test worker_workspace`.
   - Commit: `feat(kubernetes): prepare private workspace`.
 
-- [ ] **Task 9 — Implement registration-first, one-shot activation.**
+- [x] **Task 9 — Implement registration-first, one-shot activation.**
   - Depends on: Tasks 6–7.
   - Test first: use an in-memory/local TLS peer to prove Registration is the
     first text application frame, no child starts before ACK, Ping/Pong does
     not extend the 300-second deadline, and fatal result, ACP-before-ACK,
-    duplicate result, malformed/binary/oversized frame, close, timeout, signal,
-    and ambiguous send are terminal with zero reconnects.
+    correlated result, malformed/binary/oversized frame, close, timeout,
+    signal, and ambiguous send are terminal with zero reconnects. A second
+    result after the valid ACK belongs to the registered-state test in Task 10
+    because V1 has no later handshake delimiter.
   - Work: implement `build_worker_request` and
-    `await_registration_ack`; zeroize token/header buffers after the handshake.
+    `await_registration_ack`; explicitly zeroize every worker-owned token,
+    encoded-header, plaintext-request, and response-scratch buffer at its
+    earliest safe boundary.
   - Files: `src/worker/registration.rs`, worker transport glue,
     `tests/worker_registration.rs`.
   - Acceptance: exactly one connection and one registration attempt occur per
     process; the ACP executable is not touched before a valid no-request-ID
-    ACK.
-  - Verify: `cargo test --manifest-path crates/openab-kubernetes-session/Cargo.toml --locked --features worker-runtime --test worker_registration`.
+    ACK; dependency DEBUG/TRACE payload logging is absent from worker builds.
+  - Verify:
+    - `cargo test --manifest-path crates/openab-kubernetes-session/Cargo.toml --locked --features worker-runtime --test worker_registration`
+    - `cargo test --manifest-path crates/openab-kubernetes-session/Cargo.toml --locked --features worker-runtime --lib worker::registration::tests`
   - Commit: `feat(kubernetes): register worker once`.
 
 ### Checkpoint C
@@ -225,7 +231,8 @@ and the controller's 300-second activation ceiling is the sole deadline.
   - Depends on: Task 9.
   - Test first: cover LF/CRLF, empty input, malformed JSON, exact 64-MiB
     logical acceptance, plus-one rejection before allocation, split reads,
-    FIFO ordering, child EOF, protocol-result/control-envelope leakage, and
+    FIFO ordering, child EOF, duplicate protocol-result/control-envelope
+    leakage, and
     one-message-per-direction backpressure.
   - Work: implement the narrow bidirectional codec/relay adapters using the
     existing V1 ACP envelope and outer-frame limits; keep child stderr

@@ -11,7 +11,7 @@ use thiserror::Error;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::handshake::client::Request;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
-use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue, Uri};
+use tokio_tungstenite::tungstenite::http::{HeaderValue, Uri};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::Connector;
 use zeroize::Zeroizing;
@@ -21,28 +21,17 @@ pub const MAX_CLIENT_URL_BYTES: usize = 2_048;
 
 const CERTIFICATE_BEGIN: &[u8] = b"-----BEGIN CERTIFICATE-----";
 const CERTIFICATE_END: &[u8] = b"-----END CERTIFICATE-----";
-const WORKER_POD_UID_HEADER: HeaderName = HeaderName::from_static("x-openab-pod-uid");
-const WORKER_TOKEN_HEX_BYTES: usize = 64;
-const MAX_WORKER_POD_UID_BYTES: usize = 256;
-
-/// The only outbound WebSocket endpoints understood by this add-on.
+/// The broker bridge endpoint that may use tungstenite's ordinary client
+/// handshake. Worker credentials use the separate zeroizing registration
+/// handshake and are deliberately not representable here.
 #[derive(Clone, Copy)]
 pub enum ClientEndpoint<'a> {
-    Bridge {
-        bearer: &'a [u8],
-    },
-    Worker {
-        token: &'a [u8; 32],
-        pod_uid: &'a str,
-    },
+    Bridge { bearer: &'a [u8] },
 }
 
 impl ClientEndpoint<'_> {
     const fn path(self) -> &'static str {
-        match self {
-            Self::Bridge { .. } => "/v1/bridge",
-            Self::Worker { .. } => "/v1/worker",
-        }
+        "/v1/bridge"
     }
 }
 
@@ -52,11 +41,6 @@ impl fmt::Debug for ClientEndpoint<'_> {
             Self::Bridge { .. } => formatter
                 .debug_struct("Bridge")
                 .field("bearer", &"<redacted>")
-                .finish(),
-            Self::Worker { .. } => formatter
-                .debug_struct("Worker")
-                .field("token", &"<redacted>")
-                .field("pod_uid", &"<redacted>")
                 .finish(),
         }
     }
@@ -90,8 +74,6 @@ pub enum ClientRequestError {
     InvalidUrl,
     #[error("controller bearer authorization is invalid")]
     InvalidAuthorization,
-    #[error("worker Pod UID is invalid")]
-    InvalidWorkerPodUid,
     #[error("controller WebSocket request could not be constructed")]
     InvalidRequest,
 }
@@ -122,6 +104,17 @@ pub fn client_connector(
     build_client_connector(native_roots, private_roots).map(Some)
 }
 
+/// Build the worker's TLS configuration from its mandatory, controller-pinned
+/// private CA only. Public roots remain a bridge concern and must not broaden
+/// trust for the fixed cluster-internal worker endpoint.
+#[cfg(feature = "worker-runtime")]
+pub(crate) fn worker_client_tls_config(
+    private_ca: &mut dyn Read,
+) -> Result<Arc<ClientConfig>, PrivateCaError> {
+    let private_roots = read_private_ca_certificates(private_ca)?;
+    build_client_config(Vec::new(), private_roots)
+}
+
 /// Validate one bounded certificate-only private CA bundle without loading
 /// platform roots or constructing a connector.
 pub fn validate_client_ca_pem(pem: &[u8]) -> Result<(), PrivateCaError> {
@@ -137,6 +130,13 @@ fn build_client_connector(
     native_roots: Vec<rustls::pki_types::CertificateDer<'static>>,
     private_roots: Vec<rustls::pki_types::CertificateDer<'static>>,
 ) -> Result<Connector, PrivateCaError> {
+    build_client_config(native_roots, private_roots).map(Connector::Rustls)
+}
+
+fn build_client_config(
+    native_roots: Vec<rustls::pki_types::CertificateDer<'static>>,
+    private_roots: Vec<rustls::pki_types::CertificateDer<'static>>,
+) -> Result<Arc<ClientConfig>, PrivateCaError> {
     let mut roots = RootCertStore::empty();
     roots.add_parsable_certificates(native_roots);
     for certificate in private_roots {
@@ -148,7 +148,7 @@ fn build_client_connector(
     let config = ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    Ok(Connector::Rustls(Arc::new(config)))
+    Ok(Arc::new(config))
 }
 
 /// Construct one sensitive bearer-authenticated request for a closed endpoint.
@@ -166,22 +166,6 @@ pub fn build_client_request(
                 return Err(ClientRequestError::InvalidAuthorization);
             }
             insert_sensitive_bearer(&mut request, bearer)?;
-        }
-        ClientEndpoint::Worker { token, pod_uid } => {
-            if !is_valid_worker_pod_uid(pod_uid) {
-                return Err(ClientRequestError::InvalidWorkerPodUid);
-            }
-            let mut encoded_token = Zeroizing::new([0_u8; WORKER_TOKEN_HEX_BYTES]);
-            hex::encode_to_slice(token, encoded_token.as_mut())
-                .map_err(|_| ClientRequestError::InvalidAuthorization)?;
-            insert_sensitive_bearer(&mut request, encoded_token.as_slice())?;
-
-            let mut pod_uid_header = HeaderValue::from_str(pod_uid)
-                .map_err(|_| ClientRequestError::InvalidWorkerPodUid)?;
-            pod_uid_header.set_sensitive(true);
-            request
-                .headers_mut()
-                .insert(WORKER_POD_UID_HEADER, pod_uid_header);
         }
     }
     Ok(request)
@@ -234,13 +218,6 @@ fn insert_sensitive_bearer(
     header.set_sensitive(true);
     request.headers_mut().insert(AUTHORIZATION, header);
     Ok(())
-}
-
-fn is_valid_worker_pod_uid(value: &str) -> bool {
-    (1..=MAX_WORKER_POD_UID_BYTES).contains(&value.len())
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_graphic() && byte != b'/' && byte != b'\\')
 }
 
 fn read_private_ca_certificates<R>(

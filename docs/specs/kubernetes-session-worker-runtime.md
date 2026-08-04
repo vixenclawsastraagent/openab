@@ -105,9 +105,11 @@ its fenced worker Pod.
   `openab-kubernetes-session` crate.
 - Tokio 1 for process supervision, bounded asynchronous I/O, signals, and
   deadlines.
-- tokio-tungstenite 0.21 over rustls 0.22.4 for WSS with native roots plus the
-  configured private roots and standard hostname/SNI verification; no custom
-  or permissive verifier.
+- rustls 0.22.4 with tokio-rustls 0.25 for standard hostname/SNI verification;
+  the worker trusts only its mandatory controller-pinned private CA, with no
+  custom or permissive verifier. The bridge retains its existing native-root
+  behavior. tokio-tungstenite 0.21 owns framing only after the worker's strict
+  zeroizing HTTP upgrade succeeds.
 - Existing version-one OpenAB relay envelopes and ACP payload limits.
 - kube 4.2.0 and k8s-openapi 0.28.0 for exact resource construction,
   observation, and UID/resourceVersion fencing.
@@ -165,10 +167,13 @@ HOME
 ```
 
 The 32-byte registration token remains only in the immutable generation
-Secret. It is hex-encoded only while constructing the sensitive HTTP
-Authorization header, zeroized after use, never placed in argv or environment,
-and never logged. The Secret continues to contain only `token` and
-`binding.json`.
+Secret. After verified TLS exists, it is hex-encoded exactly once while
+constructing the sensitive HTTP Authorization header, zeroized before the
+request write, never placed in argv or child environment, and never logged.
+The complete worker-owned plaintext request and bounded response scratch are
+also explicitly zeroized. This guarantee covers buffers owned by the worker;
+it does not claim erasure of compiler, TLS-library, kernel, or network copies.
+The Secret continues to contain only `token` and `binding.json`.
 
 `image_pull_secrets` populate only `PodSpec.imagePullSecrets`. They are not
 mounted, read by the controller, copied to the per-generation ServiceAccount,
@@ -205,16 +210,24 @@ One worker process performs this sequence exactly once:
    HTTP GET for `/v1/worker` with one sensitive
    `Authorization: Bearer <64 lowercase hex>` header and one
    `x-openab-pod-uid` header. Do not send Origin, subprotocol, query, or
-   user-information fields.
+   user-information fields. Do not use tungstenite's client handshake
+   serializer: the worker writes one bounded zeroizing plaintext request,
+   accepts only a strict bounded HTTP/1.1 101 response, then hands the verified
+   stream and any over-read tail to tungstenite framing. Worker builds cap the
+   `log` facade at compile-time `INFO`, compiling tungstenite's DEBUG/TRACE
+   payload and close-reason sites out of the binary.
 4. Send one text `WorkerToControllerV1::Registration` envelope as the first
    application frame. Ping and Pong control frames may be handled while
    waiting, but no ACP child is running and no ACP frame is accepted yet.
 5. Wait for at most 300 seconds, matching the controller activation ceiling,
    for exactly one no-request-ID
    `ControllerToWorkerV1::ProtocolResult` ACK. A fatal result, ACP-before-ACK,
-   duplicate result, invalid frame, timeout, close, or uncertain transport
-   outcome is terminal and never retried.
-6. Zeroize in-memory token/header buffers, remove every transport/bootstrap
+   correlated result, invalid frame, timeout, close, or uncertain transport
+   outcome is terminal and never retried. After this transition, the relay
+   treats any further `ProtocolResult` as a duplicate protocol violation and
+   terminates the process tree.
+6. Ensure every worker-owned token/header/request buffer has already been
+   explicitly zeroized, remove every transport/bootstrap
    variable from the child environment, spawn exactly one ACP child in its own
    process group, and relay newline-delimited ACP JSON-RPC over its piped
    stdin/stdout. Child stderr remains stderr; the supervisor never writes logs

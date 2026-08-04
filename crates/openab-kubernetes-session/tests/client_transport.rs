@@ -17,22 +17,10 @@ use tokio_tungstenite::tungstenite::http::header::{
 use tokio_tungstenite::Connector;
 
 const TEST_CREDENTIAL: &[u8] = b"abc_DEF-123.~+/abc_DEF-123.~+/==";
-const WORKER_POD_UID: &str = "4db5a02c-74e2-4a27-838f-7f3483c541a9";
-const WORKER_TOKEN: [u8; 32] = [
-    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
-    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
-];
 
 fn bridge_endpoint() -> ClientEndpoint<'static> {
     ClientEndpoint::Bridge {
         bearer: TEST_CREDENTIAL,
-    }
-}
-
-fn worker_endpoint() -> ClientEndpoint<'static> {
-    ClientEndpoint::Worker {
-        token: &WORKER_TOKEN,
-        pod_uid: WORKER_POD_UID,
     }
 }
 
@@ -42,7 +30,7 @@ fn test_identity() -> CertifiedKey<KeyPair> {
 }
 
 #[test]
-fn closed_endpoints_build_exact_sensitive_upgrade_requests() {
+fn bridge_builds_one_exact_sensitive_upgrade_request() {
     let bridge_url = "wss://controller.example.test/v1/bridge";
     let bridge = build_client_request(bridge_endpoint(), bridge_url).unwrap();
     assert_upgrade_request(&bridge, bridge_url, "controller.example.test");
@@ -54,34 +42,6 @@ fn closed_endpoints_build_exact_sensitive_upgrade_requests() {
     assert!(bridge.headers()[AUTHORIZATION].is_sensitive());
     assert!(!bridge.headers().contains_key("x-openab-pod-uid"));
     assert!(!format!("{bridge:?}").contains("abc_DEF-123"));
-
-    let worker_url = "wss://controller.example.test:8443/v1/worker";
-    let worker = build_client_request(worker_endpoint(), worker_url).unwrap();
-    assert_upgrade_request(&worker, worker_url, "controller.example.test:8443");
-    let authorization = worker.headers()[AUTHORIZATION]
-        .to_str()
-        .unwrap()
-        .strip_prefix("Bearer ")
-        .unwrap();
-    assert_eq!(
-        authorization,
-        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
-    );
-    assert_eq!(authorization.len(), 64);
-    assert!(authorization
-        .bytes()
-        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
-    assert_eq!(worker.headers().get_all(AUTHORIZATION).iter().count(), 1);
-    assert!(worker.headers()[AUTHORIZATION].is_sensitive());
-    assert_eq!(worker.headers()["x-openab-pod-uid"], WORKER_POD_UID);
-    assert_eq!(
-        worker.headers().get_all("x-openab-pod-uid").iter().count(),
-        1
-    );
-    assert!(worker.headers()["x-openab-pod-uid"].is_sensitive());
-    let debug = format!("{worker:?} {:?}", worker_endpoint());
-    assert!(!debug.contains(authorization));
-    assert!(!debug.contains(WORKER_POD_UID));
 }
 
 #[test]
@@ -98,8 +58,6 @@ fn request_rejects_open_or_ambiguous_url_shapes() {
             "wss://user@controller.example.test/v1/bridge",
         ),
         (bridge_endpoint(), "wss://controller.example.test/v1/worker"),
-        (worker_endpoint(), "wss://controller.example.test/v1/bridge"),
-        (worker_endpoint(), "wss://controller.example.test/arbitrary"),
         (
             bridge_endpoint(),
             "wss://controller.example.test/v1/bridge/",
@@ -163,26 +121,6 @@ fn request_bounds_urls_and_authorization_values() {
             ClientRequestError::InvalidAuthorization
         );
     }
-
-    for pod_uid in [
-        String::new(),
-        "pod uid".to_owned(),
-        "pod/uid".to_owned(),
-        "pod\\uid".to_owned(),
-        "pod\nuid".to_owned(),
-        "x".repeat(257),
-    ] {
-        assert_eq!(
-            request_error(build_client_request(
-                ClientEndpoint::Worker {
-                    token: &WORKER_TOKEN,
-                    pod_uid: &pod_uid,
-                },
-                "wss://controller.example.test/v1/worker",
-            )),
-            ClientRequestError::InvalidWorkerPodUid
-        );
-    }
 }
 
 #[test]
@@ -238,16 +176,6 @@ fn request_errors_do_not_echo_urls_or_credentials() {
             bearer: &credential,
         },
         "wss://controller.example.test/v1/bridge",
-    ));
-    assert!(!format!("{error:?} {error}").contains(sentinel));
-
-    let pod_uid = format!("{sentinel}/bad");
-    let error = request_error(build_client_request(
-        ClientEndpoint::Worker {
-            token: &WORKER_TOKEN,
-            pod_uid: &pod_uid,
-        },
-        "wss://controller.example.test/v1/worker",
     ));
     assert!(!format!("{error:?} {error}").contains(sentinel));
 }

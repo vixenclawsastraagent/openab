@@ -2,11 +2,14 @@ use openab_kubernetes_session::worker::bootstrap::{
     WorkerBootstrap, WorkerBootstrapEnvironment, WorkerBootstrapError, WorkerCommand,
     WorkerCommandError, WorkerEnvironmentError,
 };
+use openab_kubernetes_session::worker::registration::WorkerRegistrationError;
+#[cfg(target_os = "linux")]
+use openab_kubernetes_session::worker::registration::{build_worker_request, register_worker_once};
 use openab_kubernetes_session::worker::{TerminationSignalError, TerminationSignals};
 use std::ffi::OsString;
 use thiserror::Error;
 
-#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Error, PartialEq, Eq)]
 enum ApplicationError {
     #[error(transparent)]
     Signal(#[from] TerminationSignalError),
@@ -16,8 +19,10 @@ enum ApplicationError {
     Environment(#[from] WorkerEnvironmentError),
     #[error(transparent)]
     Bootstrap(#[from] WorkerBootstrapError),
-    #[error("worker activation is unavailable in this build stage")]
-    ActivationUnavailable,
+    #[error(transparent)]
+    Registration(#[from] WorkerRegistrationError),
+    #[error("worker ACP relay is unavailable in this build stage")]
+    RelayUnavailable,
 }
 
 fn prepare_startup<I, S, Args, Install, Load>(
@@ -37,6 +42,26 @@ where
     Ok((signals, bootstrap))
 }
 
+#[cfg(target_os = "linux")]
+async fn run<I, Args>(args: Args) -> Result<(), ApplicationError>
+where
+    I: IntoIterator<Item = OsString>,
+    Args: FnOnce() -> I,
+{
+    let (mut signals, bootstrap) = prepare_startup(
+        args,
+        || TerminationSignals::install().map_err(ApplicationError::from),
+        |command| {
+            let environment = WorkerBootstrapEnvironment::from_environment()?;
+            WorkerBootstrap::load_from_files(command, environment).map_err(ApplicationError::from)
+        },
+    )?;
+    let request = build_worker_request(bootstrap)?;
+    let _registered = register_worker_once(request, signals.wait()).await?;
+    Err(ApplicationError::RelayUnavailable)
+}
+
+#[cfg(not(target_os = "linux"))]
 fn run<I, Args>(args: Args) -> Result<(), ApplicationError>
 where
     I: IntoIterator<Item = OsString>,
@@ -50,7 +75,7 @@ where
             WorkerBootstrap::load_from_files(command, environment).map_err(ApplicationError::from)
         },
     )?;
-    Err(ApplicationError::ActivationUnavailable)
+    Err(ApplicationError::RelayUnavailable)
 }
 
 fn report(result: Result<(), ApplicationError>) {
@@ -64,7 +89,7 @@ fn report(result: Result<(), ApplicationError>) {
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     install_sanitized_panic_hook();
-    report(run(|| std::env::args_os().skip(1)));
+    report(run(|| std::env::args_os().skip(1)).await);
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -102,11 +127,11 @@ mod tests {
             },
             |_| {
                 events.borrow_mut().push("load");
-                Err(ApplicationError::ActivationUnavailable)
+                Err(ApplicationError::RelayUnavailable)
             },
         )
         .unwrap_err();
-        assert_eq!(error, ApplicationError::ActivationUnavailable);
+        assert_eq!(error, ApplicationError::RelayUnavailable);
         assert_eq!(*events.borrow(), ["signal", "args", "load"]);
 
         events.borrow_mut().clear();
@@ -121,7 +146,7 @@ mod tests {
             },
             |_| {
                 events.borrow_mut().push("load");
-                Err(ApplicationError::ActivationUnavailable)
+                Err(ApplicationError::RelayUnavailable)
             },
         )
         .unwrap_err();
@@ -149,7 +174,7 @@ mod tests {
             },
             |_| {
                 *loaded.borrow_mut() = true;
-                Err(ApplicationError::ActivationUnavailable)
+                Err(ApplicationError::RelayUnavailable)
             },
         )
         .unwrap_err();
