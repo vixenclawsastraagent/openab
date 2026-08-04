@@ -1,5 +1,8 @@
 #![cfg(feature = "controller")]
 
+#[path = "support/worker_transport.rs"]
+mod worker_transport;
+
 use chrono::{Duration, TimeZone, Utc};
 use http::{Method, Request, Response, StatusCode};
 use k8s_openapi::api::core::v1::ConfigMap;
@@ -154,6 +157,10 @@ enum ExternalPinDrift {
     SkillsDeleting,
     RuntimeClassResourceVersion,
     RuntimeClassHandler,
+    RelayCaUid,
+    RelayCaResourceVersion,
+    RelayCaDeleting,
+    RelayCaInvalidPem,
 }
 
 fn proof() -> VerifiedBootstrap {
@@ -315,6 +322,7 @@ async fn run_verification_scenario_with_profile(
         GenerationContext::from_anchor(NAMESPACE, names.anchor(), ANCHOR_UID, &anchor, names)
             .unwrap();
     let desired = DesiredGeneration::build(context, worker_profile.clone(), TOKEN).unwrap();
+    let has_relay_ca = worker_profile.relay_ca_config_map().is_some();
     let pvc = observed_value(desired.persistent_volume_claim(), "pvc-uid-a");
     let policy = observed_value(desired.network_policy(), "policy-uid-a");
     let account = observed_value(desired.service_account(), "account-uid-a");
@@ -407,6 +415,8 @@ async fn run_verification_scenario_with_profile(
     if let Some(drift) = external_pin_drift {
         let mut skills = observed_skills_config_map();
         let mut runtime_class = observed_runtime_class();
+        let mut relay_ca =
+            serde_json::to_value(worker_transport::observed_relay_ca(NAMESPACE)).unwrap();
         match drift {
             ExternalPinDrift::SkillsUid => {
                 skills["metadata"]["uid"] = json!("replacement-skills-uid");
@@ -426,14 +436,21 @@ async fn run_verification_scenario_with_profile(
             ExternalPinDrift::RuntimeClassHandler => {
                 runtime_class["handler"] = json!("replacement-handler");
             }
+            ExternalPinDrift::RelayCaUid => {
+                relay_ca["metadata"]["uid"] = json!("replacement-relay-ca-uid");
+            }
+            ExternalPinDrift::RelayCaResourceVersion => {
+                relay_ca["metadata"]["resourceVersion"] =
+                    json!("replacement-relay-ca-resource-version");
+            }
+            ExternalPinDrift::RelayCaDeleting => {
+                relay_ca["metadata"]["deletionTimestamp"] = json!("2026-08-01T08:01:00Z");
+            }
+            ExternalPinDrift::RelayCaInvalidPem => {
+                relay_ca["data"]["ca.crt"] = json!("not a certificate");
+            }
         }
 
-        respond_get(
-            &mut handle,
-            &format!("/api/v1/namespaces/{NAMESPACE}/configmaps/{SKILLS_NAME}"),
-            skills,
-        )
-        .await;
         if matches!(
             drift,
             ExternalPinDrift::SkillsUid
@@ -441,20 +458,59 @@ async fn run_verification_scenario_with_profile(
                 | ExternalPinDrift::SkillsMutable
                 | ExternalPinDrift::SkillsDeleting
         ) {
+            respond_get(
+                &mut handle,
+                &format!("/api/v1/namespaces/{NAMESPACE}/configmaps/{SKILLS_NAME}"),
+                skills,
+            )
+            .await;
             let result = task.await.unwrap();
             assert_no_request(&mut handle).await;
             return result;
         }
 
-        respond_get(
-            &mut handle,
-            &format!("/apis/node.k8s.io/v1/runtimeclasses/{RUNTIME_CLASS_NAME}"),
-            runtime_class,
-        )
-        .await;
+        if matches!(
+            drift,
+            ExternalPinDrift::RuntimeClassResourceVersion | ExternalPinDrift::RuntimeClassHandler
+        ) {
+            respond_get(
+                &mut handle,
+                &format!("/api/v1/namespaces/{NAMESPACE}/configmaps/{SKILLS_NAME}"),
+                skills,
+            )
+            .await;
+            respond_get(
+                &mut handle,
+                &format!("/apis/node.k8s.io/v1/runtimeclasses/{RUNTIME_CLASS_NAME}"),
+                runtime_class,
+            )
+            .await;
+        } else {
+            respond_get(
+                &mut handle,
+                &format!(
+                    "/api/v1/namespaces/{NAMESPACE}/configmaps/{}",
+                    worker_transport::RELAY_CA_NAME
+                ),
+                relay_ca,
+            )
+            .await;
+        }
         let result = task.await.unwrap();
         assert_no_request(&mut handle).await;
         return result;
+    }
+
+    if has_relay_ca {
+        respond_get(
+            &mut handle,
+            &format!(
+                "/api/v1/namespaces/{NAMESPACE}/configmaps/{}",
+                worker_transport::RELAY_CA_NAME
+            ),
+            serde_json::to_value(worker_transport::observed_relay_ca(NAMESPACE)).unwrap(),
+        )
+        .await;
     }
 
     respond_get(&mut handle, &exact_secret_path, final_secret).await;
@@ -544,6 +600,101 @@ async fn external_pin_drift_fails_registration_before_bootstrap_secret_deletion(
             .unwrap_err(),
             RegistrationProvisionerError::ResourceRejected
         );
+    }
+}
+
+#[tokio::test]
+async fn relay_ca_drift_or_invalidity_fails_before_bootstrap_secret_deletion() {
+    for drift in [
+        ExternalPinDrift::RelayCaUid,
+        ExternalPinDrift::RelayCaResourceVersion,
+        ExternalPinDrift::RelayCaDeleting,
+        ExternalPinDrift::RelayCaInvalidPem,
+    ] {
+        assert_eq!(
+            run_verification_scenario_with_profile(
+                TOKEN,
+                POD_UID,
+                SECRET_UID,
+                &format!("rv-{SECRET_UID}"),
+                worker_transport::transport_profile(NAMESPACE),
+                Some(drift),
+            )
+            .await
+            .unwrap_err(),
+            RegistrationProvisionerError::ResourceRejected
+        );
+    }
+}
+
+#[tokio::test]
+async fn exact_relay_ca_allows_bootstrap_verification() {
+    assert!(run_verification_scenario_with_profile(
+        TOKEN,
+        POD_UID,
+        SECRET_UID,
+        &format!("rv-{SECRET_UID}"),
+        worker_transport::transport_profile(NAMESPACE),
+        None,
+    )
+    .await
+    .is_ok());
+}
+
+#[tokio::test]
+async fn relay_ca_drift_at_consumption_fails_before_bootstrap_secret_deletion() {
+    for drift in [
+        ExternalPinDrift::RelayCaUid,
+        ExternalPinDrift::RelayCaResourceVersion,
+        ExternalPinDrift::RelayCaDeleting,
+        ExternalPinDrift::RelayCaInvalidPem,
+    ] {
+        let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+        let client = Client::new(service, "default");
+        let provisioner =
+            KubernetesGenerationProvisioner::new(client, NAMESPACE, scope_id()).unwrap();
+        let worker_profile = worker_transport::transport_profile(NAMESPACE);
+        let task = tokio::spawn(async move {
+            provisioner
+                .consume_bootstrap(&worker_profile, proof())
+                .await
+        });
+        let mut handle = std::pin::pin!(handle);
+
+        let (request, send) = handle.next_request().await.expect("relay CA GET");
+        assert_eq!(request.method(), Method::GET);
+        assert_eq!(
+            request.uri().path(),
+            format!(
+                "/api/v1/namespaces/{NAMESPACE}/configmaps/{}",
+                worker_transport::RELAY_CA_NAME
+            )
+        );
+        let mut observed_ca =
+            serde_json::to_value(worker_transport::observed_relay_ca(NAMESPACE)).unwrap();
+        match drift {
+            ExternalPinDrift::RelayCaUid => {
+                observed_ca["metadata"]["uid"] = json!("replacement-relay-ca-uid");
+            }
+            ExternalPinDrift::RelayCaResourceVersion => {
+                observed_ca["metadata"]["resourceVersion"] =
+                    json!("replacement-relay-ca-resource-version");
+            }
+            ExternalPinDrift::RelayCaDeleting => {
+                observed_ca["metadata"]["deletionTimestamp"] = json!("2026-08-01T08:01:00Z");
+            }
+            ExternalPinDrift::RelayCaInvalidPem => {
+                observed_ca["data"]["ca.crt"] = json!("not a certificate");
+            }
+            _ => unreachable!(),
+        }
+        send.send_response(json_response(StatusCode::OK, observed_ca));
+
+        assert_eq!(
+            task.await.unwrap().unwrap_err(),
+            RegistrationProvisionerError::ResourceRejected
+        );
+        assert_no_request(&mut handle).await;
     }
 }
 
@@ -648,7 +799,8 @@ async fn bootstrap_is_consumed_with_exact_preconditions_and_confirmed_absent() {
     let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
     let client = Client::new(service, "default");
     let provisioner = KubernetesGenerationProvisioner::new(client, NAMESPACE, scope_id()).unwrap();
-    let task = tokio::spawn(async move { provisioner.consume_bootstrap(proof()).await });
+    let task =
+        tokio::spawn(async move { provisioner.consume_bootstrap(&profile(), proof()).await });
     let mut handle = std::pin::pin!(handle);
 
     let (request, send) = handle.next_request().await.expect("Secret DELETE");
@@ -687,11 +839,62 @@ async fn bootstrap_is_consumed_with_exact_preconditions_and_confirmed_absent() {
 }
 
 #[tokio::test]
+async fn exact_relay_ca_is_revalidated_immediately_before_bootstrap_consumption() {
+    let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+    let client = Client::new(service, "default");
+    let provisioner = KubernetesGenerationProvisioner::new(client, NAMESPACE, scope_id()).unwrap();
+    let worker_profile = worker_transport::transport_profile(NAMESPACE);
+    let task = tokio::spawn(async move {
+        provisioner
+            .consume_bootstrap(&worker_profile, proof())
+            .await
+    });
+    let mut handle = std::pin::pin!(handle);
+
+    respond_get(
+        &mut handle,
+        &format!(
+            "/api/v1/namespaces/{NAMESPACE}/configmaps/{}",
+            worker_transport::RELAY_CA_NAME
+        ),
+        serde_json::to_value(worker_transport::observed_relay_ca(NAMESPACE)).unwrap(),
+    )
+    .await;
+    let (request, send) = handle.next_request().await.expect("Secret DELETE");
+    assert_eq!(request.method(), Method::DELETE);
+    let body = request_body(request).await;
+    assert_eq!(body["preconditions"]["uid"], SECRET_UID);
+    assert_eq!(
+        body["preconditions"]["resourceVersion"],
+        SECRET_RESOURCE_VERSION
+    );
+    send.send_response(json_response(
+        StatusCode::OK,
+        json!({
+            "apiVersion": "v1",
+            "kind": "Status",
+            "status": "Success",
+            "code": 200
+        }),
+    ));
+    let (request, send) = handle
+        .next_request()
+        .await
+        .expect("authoritative Secret GET");
+    assert_eq!(request.method(), Method::GET);
+    send.send_response(missing_response());
+
+    assert_eq!(task.await.unwrap().unwrap().pod_uid(), "pod-uid-a");
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
 async fn retry_after_an_already_absent_secret_still_requires_a_confirming_get() {
     let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
     let client = Client::new(service, "default");
     let provisioner = KubernetesGenerationProvisioner::new(client, NAMESPACE, scope_id()).unwrap();
-    let task = tokio::spawn(async move { provisioner.consume_bootstrap(proof()).await });
+    let task =
+        tokio::spawn(async move { provisioner.consume_bootstrap(&profile(), proof()).await });
     let mut handle = std::pin::pin!(handle);
 
     let (request, send) = handle.next_request().await.expect("retry Secret DELETE");
@@ -719,7 +922,8 @@ async fn replacement_secret_uid_after_delete_fails_closed() {
     let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
     let client = Client::new(service, "default");
     let provisioner = KubernetesGenerationProvisioner::new(client, NAMESPACE, scope_id()).unwrap();
-    let task = tokio::spawn(async move { provisioner.consume_bootstrap(proof()).await });
+    let task =
+        tokio::spawn(async move { provisioner.consume_bootstrap(&profile(), proof()).await });
     let mut handle = std::pin::pin!(handle);
 
     let (_delete, send) = handle.next_request().await.expect("Secret DELETE");
@@ -762,7 +966,8 @@ async fn a_secret_still_present_after_delete_never_produces_a_consumed_proof() {
     let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
     let client = Client::new(service, "default");
     let provisioner = KubernetesGenerationProvisioner::new(client, NAMESPACE, scope_id()).unwrap();
-    let task = tokio::spawn(async move { provisioner.consume_bootstrap(proof()).await });
+    let task =
+        tokio::spawn(async move { provisioner.consume_bootstrap(&profile(), proof()).await });
     let mut handle = std::pin::pin!(handle);
 
     let (_delete, send) = handle.next_request().await.expect("Secret DELETE");

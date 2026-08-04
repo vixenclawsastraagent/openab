@@ -1,5 +1,8 @@
 #![cfg(feature = "controller")]
 
+#[path = "support/worker_transport.rs"]
+mod worker_transport;
+
 use chrono::{Duration as ChronoDuration, TimeZone, Utc};
 use http::{Method, Request, Response, StatusCode};
 use k8s_openapi::api::core::v1::ConfigMap;
@@ -853,7 +856,8 @@ async fn existing_secret_and_raced_pod_are_adopted_without_rotation() {
     let client = Client::new(service, "default");
     let session_id = session_id("discord:secret-recovery");
     let anchor = anchor(session_id);
-    let existing_desired = desired_for(&anchor, profile(), [0x5a; 32]);
+    let worker_profile = worker_transport::transport_profile(NAMESPACE);
+    let existing_desired = desired_for(&anchor, worker_profile.clone(), [0x5a; 32]);
     let existing_secret = observed_value(existing_desired.registration_secret(), "secret-uid");
     let existing_pod = observed_value(existing_desired.pod(), "recovered-pod-uid");
     let mut handle = std::pin::pin!(handle);
@@ -861,7 +865,7 @@ async fn existing_secret_and_raced_pod_are_adopted_without_rotation() {
     let provisioner = KubernetesGenerationProvisioner::new(client, NAMESPACE, scope_id()).unwrap();
     let task = tokio::spawn(async move {
         provisioner
-            .ensure_provisioning_generation(&stored, &profile())
+            .ensure_provisioning_generation(&stored, &worker_profile)
             .await
     });
     respond_initial_pod_absent(&mut handle, session_id, 1).await;
@@ -952,6 +956,15 @@ async fn existing_secret_and_raced_pod_are_adopted_without_rotation() {
     )
     .await;
     respond_list(&mut handle, &pod_path, "v1", "PodList", vec![]).await;
+    respond_get(
+        &mut handle,
+        &format!(
+            "/api/v1/namespaces/{NAMESPACE}/configmaps/{}",
+            worker_transport::RELAY_CA_NAME
+        ),
+        serde_json::to_value(worker_transport::observed_relay_ca(NAMESPACE)).unwrap(),
+    )
+    .await;
 
     let (request, send) = handle.next_request().await.expect("Pod create");
     assert_eq!(request.method(), Method::POST);
@@ -973,6 +986,15 @@ async fn existing_secret_and_raced_pod_are_adopted_without_rotation() {
         &account,
         &existing_secret,
         &existing_pod,
+    )
+    .await;
+    respond_get(
+        &mut handle,
+        &format!(
+            "/api/v1/namespaces/{NAMESPACE}/configmaps/{}",
+            worker_transport::RELAY_CA_NAME
+        ),
+        serde_json::to_value(worker_transport::observed_relay_ca(NAMESPACE)).unwrap(),
     )
     .await;
 
@@ -1570,6 +1592,145 @@ async fn pinned_dependencies_are_revalidated_and_drift_fails_before_pod_creation
         }
     );
     assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn relay_ca_drift_or_invalidity_fails_before_pod_creation() {
+    for drift_field in ["uid", "resourceVersion", "deletionTimestamp", "data"] {
+        let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+        let client = Client::new(service, "default");
+        let session_id = session_id(&format!("discord:relay-ca-drift-{drift_field}"));
+        let anchor = anchor(session_id);
+        let worker_profile = worker_transport::transport_profile(NAMESPACE);
+        let mut handle = std::pin::pin!(handle);
+        let stored = load_stored_anchor(client.clone(), &mut handle, anchor).await;
+        let provisioner =
+            KubernetesGenerationProvisioner::new(client, NAMESPACE, scope_id()).unwrap();
+        let task = tokio::spawn(async move {
+            provisioner
+                .ensure_provisioning_generation(&stored, &worker_profile)
+                .await
+        });
+        respond_initial_pod_absent(&mut handle, session_id, 1).await;
+
+        let pvc = respond_created(
+            &mut handle,
+            &format!("/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims"),
+            "pvc-uid",
+        )
+        .await;
+        let policy = respond_created(
+            &mut handle,
+            &format!("/apis/networking.k8s.io/v1/namespaces/{NAMESPACE}/networkpolicies"),
+            "policy-uid",
+        )
+        .await;
+        let account = respond_created(
+            &mut handle,
+            &format!("/api/v1/namespaces/{NAMESPACE}/serviceaccounts"),
+            "account-uid",
+        )
+        .await;
+        let secret = respond_created(
+            &mut handle,
+            &format!("/api/v1/namespaces/{NAMESPACE}/secrets"),
+            "secret-uid",
+        )
+        .await;
+        let names = ResourceNames::new(session_id);
+        let pod_name = names.pod(1).unwrap();
+        let pvc_path = format!("/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims");
+        let policy_path =
+            format!("/apis/networking.k8s.io/v1/namespaces/{NAMESPACE}/networkpolicies");
+        let account_path = format!("/api/v1/namespaces/{NAMESPACE}/serviceaccounts");
+        let secret_path = format!("/api/v1/namespaces/{NAMESPACE}/secrets");
+        let pod_path = format!("/api/v1/namespaces/{NAMESPACE}/pods");
+        respond_get(
+            &mut handle,
+            &format!("{pvc_path}/{}", names.pvc()),
+            pvc.clone(),
+        )
+        .await;
+        respond_get(
+            &mut handle,
+            &format!("{policy_path}/{pod_name}-net"),
+            policy.clone(),
+        )
+        .await;
+        respond_get(
+            &mut handle,
+            &format!("{account_path}/{}", names.service_account(1).unwrap()),
+            account.clone(),
+        )
+        .await;
+        respond_get(
+            &mut handle,
+            &format!("{secret_path}/{}", names.registration_secret(1).unwrap()),
+            secret.clone(),
+        )
+        .await;
+        let (request, send) = handle.next_request().await.expect("Pod preflight GET");
+        assert_eq!(request.uri().path(), format!("{pod_path}/{pod_name}"));
+        send.send_response(missing_response());
+        respond_list(
+            &mut handle,
+            &pvc_path,
+            "v1",
+            "PersistentVolumeClaimList",
+            vec![pvc],
+        )
+        .await;
+        respond_list(
+            &mut handle,
+            &policy_path,
+            "networking.k8s.io/v1",
+            "NetworkPolicyList",
+            vec![policy],
+        )
+        .await;
+        respond_list(
+            &mut handle,
+            &account_path,
+            "v1",
+            "ServiceAccountList",
+            vec![account],
+        )
+        .await;
+        respond_list(&mut handle, &secret_path, "v1", "SecretList", vec![secret]).await;
+        respond_list(&mut handle, &pod_path, "v1", "PodList", vec![]).await;
+
+        let mut observed_ca =
+            serde_json::to_value(worker_transport::observed_relay_ca(NAMESPACE)).unwrap();
+        match drift_field {
+            "uid" => observed_ca["metadata"]["uid"] = json!("replacement-relay-ca-uid"),
+            "resourceVersion" => {
+                observed_ca["metadata"]["resourceVersion"] =
+                    json!("replacement-relay-ca-resource-version");
+            }
+            "deletionTimestamp" => {
+                observed_ca["metadata"]["deletionTimestamp"] = json!("2026-08-01T08:01:00Z");
+            }
+            "data" => observed_ca["data"]["ca.crt"] = json!("not a certificate"),
+            _ => unreachable!(),
+        }
+        respond_get(
+            &mut handle,
+            &format!(
+                "/api/v1/namespaces/{NAMESPACE}/configmaps/{}",
+                worker_transport::RELAY_CA_NAME
+            ),
+            observed_ca,
+        )
+        .await;
+
+        assert_eq!(
+            task.await.unwrap().unwrap_err(),
+            GenerationProvisionerError::ResourceRejected {
+                resource: GenerationResource::WorkerRelayCaConfigMap,
+            }
+        );
+        assert_no_request(&mut handle).await;
+    }
 }
 
 #[tokio::test]

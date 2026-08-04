@@ -77,6 +77,7 @@ pub enum GenerationResource {
     RegistrationSecret,
     Pod,
     SkillsConfigMap,
+    WorkerRelayCaConfigMap,
     RuntimeClass,
 }
 

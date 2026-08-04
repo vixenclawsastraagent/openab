@@ -118,7 +118,7 @@ tests pass.
   - Verify: `cargo test --manifest-path crates/openab-kubernetes-session/Cargo.toml --locked --all-features --test resource_builder`.
   - Commit: `feat(kubernetes): render worker transport`.
 
-- [ ] **Task 5 — Revalidate CA identity at both consumption boundaries.**
+- [x] **Task 5 — Revalidate CA identity at both consumption boundaries.**
   - Depends on: Task 4.
   - Test first: add generation and registration cases in which the CA name is
     replaced after resolution or becomes deleting; assert no Pod is created

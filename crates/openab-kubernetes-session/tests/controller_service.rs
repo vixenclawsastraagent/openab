@@ -106,6 +106,7 @@ impl RegistrationProvisioner for FakeProvisioner {
 
     async fn consume_bootstrap(
         &self,
+        _profile: &MvpWorkerProfile,
         verified: VerifiedBootstrap,
     ) -> Result<ConsumedBootstrap, RegistrationProvisionerError> {
         Ok(verified.into_consumed())

@@ -116,6 +116,7 @@ impl RegistrationProvisioner for FakeProvisioner {
 
     async fn consume_bootstrap(
         &self,
+        _profile: &MvpWorkerProfile,
         _verified: VerifiedBootstrap,
     ) -> Result<ConsumedBootstrap, RegistrationProvisionerError> {
         self.registration_calls.fetch_add(1, Ordering::SeqCst);

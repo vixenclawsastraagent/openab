@@ -215,8 +215,11 @@ pub trait RegistrationProvisioner: Send + Sync {
         auth: &WorkerBootstrapAuth,
     ) -> Result<VerifiedBootstrap, RegistrationProvisionerError>;
 
+    /// Consume the one-time credential only after revalidating the worker
+    /// relay trust input from the exact profile selected for this generation.
     async fn consume_bootstrap(
         &self,
+        profile: &MvpWorkerProfile,
         verified: VerifiedBootstrap,
     ) -> Result<ConsumedBootstrap, RegistrationProvisionerError>;
 
@@ -409,7 +412,10 @@ impl RegistrationCoordinator {
             return Err(RegistrationError::AnchorChanged);
         }
 
-        let consumed = self.provisioner.consume_bootstrap(verified).await?;
+        let consumed = self
+            .provisioner
+            .consume_bootstrap(&self.profile, verified)
+            .await?;
         self.validate_consumed(
             &consumed,
             &expected_binding,

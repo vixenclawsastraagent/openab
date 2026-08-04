@@ -149,6 +149,8 @@ pub enum ResourceValidationError {
     SpecMismatch { resource: &'static str },
     #[error("this generation does not use a skills ConfigMap")]
     SkillsConfigMapNotConfigured,
+    #[error("this generation does not use a worker relay CA ConfigMap")]
+    WorkerRelayCaConfigMapNotConfigured,
     #[error("this generation does not use a RuntimeClass")]
     RuntimeClassNotConfigured,
 }
@@ -841,6 +843,34 @@ impl PinnedWorkerRelayCaConfigMap {
 
     pub(crate) fn matches_intent(&self, name: &str) -> bool {
         self.name == name
+    }
+
+    pub(crate) fn validate_observed(
+        &self,
+        expected_namespace: &str,
+        observed: &ConfigMap,
+    ) -> Result<(), ResourceValidationError> {
+        let observed_pin = Self::from_observed(expected_namespace, observed).map_err(|_| {
+            ResourceValidationError::SpecMismatch {
+                resource: "worker relay CA ConfigMap",
+            }
+        })?;
+        for (field, matches) in [
+            ("metadata.name", observed_pin.name == self.name),
+            ("metadata.uid", observed_pin.uid == self.uid),
+            (
+                "metadata.resourceVersion",
+                observed_pin.resource_version == self.resource_version,
+            ),
+        ] {
+            if !matches {
+                return Err(ResourceValidationError::MetadataMismatch {
+                    resource: "worker relay CA ConfigMap",
+                    field,
+                });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1662,6 +1692,16 @@ impl DesiredGeneration {
             });
         }
         Ok(())
+    }
+
+    pub fn validate_worker_relay_ca_config_map(
+        &self,
+        observed: &ConfigMap,
+    ) -> Result<(), ResourceValidationError> {
+        self.relay_ca
+            .as_ref()
+            .ok_or(ResourceValidationError::WorkerRelayCaConfigMapNotConfigured)?
+            .validate_observed(self.context.namespace(), observed)
     }
 }
 

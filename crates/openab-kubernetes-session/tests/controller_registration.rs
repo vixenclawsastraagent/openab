@@ -49,6 +49,7 @@ struct FakeProvisioner {
     consume_calls: Arc<AtomicUsize>,
     missing: bool,
     recovery_error: Option<RegistrationProvisionerError>,
+    consume_error: Option<RegistrationProvisionerError>,
     consume_entered: Arc<Notify>,
     consume_release: Arc<Notify>,
     gate_consume: bool,
@@ -61,6 +62,7 @@ impl FakeProvisioner {
             consume_calls: Arc::new(AtomicUsize::new(0)),
             missing: false,
             recovery_error: None,
+            consume_error: None,
             consume_entered: Arc::new(Notify::new()),
             consume_release: Arc::new(Notify::new()),
             gate_consume: false,
@@ -77,6 +79,13 @@ impl FakeProvisioner {
     fn gated() -> Self {
         Self {
             gate_consume: true,
+            ..Self::successful()
+        }
+    }
+
+    fn with_consume_error(error: RegistrationProvisionerError) -> Self {
+        Self {
+            consume_error: Some(error),
             ..Self::successful()
         }
     }
@@ -119,12 +128,16 @@ impl RegistrationProvisioner for FakeProvisioner {
 
     async fn consume_bootstrap(
         &self,
+        _profile: &MvpWorkerProfile,
         verified: VerifiedBootstrap,
     ) -> Result<ConsumedBootstrap, RegistrationProvisionerError> {
         self.consume_calls.fetch_add(1, Ordering::SeqCst);
         if self.gate_consume {
             self.consume_entered.notify_one();
             self.consume_release.notified().await;
+        }
+        if let Some(error) = self.consume_error.clone() {
+            return Err(error);
         }
         Ok(verified.into_consumed())
     }
@@ -352,6 +365,38 @@ async fn ready_is_persisted_only_after_bootstrap_consumption_finishes() {
     assert_eq!(registered.pod_uid(), POD_UID);
     assert_eq!(fake.verify_calls.load(Ordering::SeqCst), 1);
     assert_eq!(fake.consume_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn consumption_revalidation_failure_never_persists_ready() {
+    let fake = FakeProvisioner::with_consume_error(RegistrationProvisionerError::ResourceRejected);
+    let (coordinator, handle) = coordinator(fake.clone());
+    let anchor = provisioning_anchor(session_id("discord:consumption-revalidation-drift"));
+    let expected_binding = binding(&anchor);
+    let registration = WorkerRegistrationV1::new(&expected_binding);
+    let auth = WorkerBootstrapAuth::new(POD_UID, &TOKEN).unwrap();
+    let target = anchor.session_id();
+    let task = tokio::spawn(async move { coordinator.register(target, registration, auth).await });
+
+    let mut handle = std::pin::pin!(handle);
+    for _ in 0..2 {
+        let (request, send) = handle.next_request().await.unwrap();
+        assert_eq!(request.method(), Method::GET);
+        send.send_response(json_response(
+            StatusCode::OK,
+            config_map(&anchor, "anchor-rv-1"),
+        ));
+    }
+
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(RegistrationError::Provisioner(
+            RegistrationProvisionerError::ResourceRejected
+        ))
+    ));
+    assert_eq!(fake.verify_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fake.consume_calls.load(Ordering::SeqCst), 1);
+    assert_no_request(&mut handle).await;
 }
 
 #[tokio::test]

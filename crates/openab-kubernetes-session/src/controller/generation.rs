@@ -319,7 +319,7 @@ pub struct KubernetesGenerationProvisioner {
     service_accounts: Api<ServiceAccount>,
     registration_secrets: Api<Secret>,
     pods: Api<Pod>,
-    skills_config_maps: Api<ConfigMap>,
+    config_maps: Api<ConfigMap>,
     runtime_classes: Api<RuntimeClass>,
 }
 
@@ -339,7 +339,7 @@ impl KubernetesGenerationProvisioner {
             service_accounts: Api::namespaced(client.clone(), &namespace),
             registration_secrets: Api::namespaced(client.clone(), &namespace),
             pods: Api::namespaced(client.clone(), &namespace),
-            skills_config_maps: Api::namespaced(client.clone(), &namespace),
+            config_maps: Api::namespaced(client.clone(), &namespace),
             runtime_classes: Api::all(client),
             namespace,
             scope_id,
@@ -1477,7 +1477,7 @@ impl KubernetesGenerationProvisioner {
     ) -> Result<(), GenerationProvisionerError> {
         if let Some(name) = desired.skills_config_map_name() {
             self.get_exact(
-                &self.skills_config_maps,
+                &self.config_maps,
                 name,
                 GenerationResource::SkillsConfigMap,
                 |observed| desired.validate_skills_config_map(observed),
@@ -1490,6 +1490,15 @@ impl KubernetesGenerationProvisioner {
                 name,
                 GenerationResource::RuntimeClass,
                 |observed| desired.validate_runtime_class(observed),
+            )
+            .await?;
+        }
+        if let Some(relay_ca) = desired.relay_ca_config_map() {
+            self.get_exact(
+                &self.config_maps,
+                relay_ca.name(),
+                GenerationResource::WorkerRelayCaConfigMap,
+                |observed| desired.validate_worker_relay_ca_config_map(observed),
             )
             .await?;
         }
@@ -1836,8 +1845,20 @@ impl RegistrationProvisioner for KubernetesGenerationProvisioner {
 
     async fn consume_bootstrap(
         &self,
+        profile: &MvpWorkerProfile,
         verified: VerifiedBootstrap,
     ) -> Result<ConsumedBootstrap, RegistrationProvisionerError> {
+        if let Some(relay_ca) = profile.relay_ca_config_map() {
+            let observed = self
+                .config_maps
+                .get_opt(relay_ca.name())
+                .await
+                .map_err(|_| registration_api_error(RegistrationOperation::VerifyResources))?
+                .ok_or(RegistrationProvisionerError::ResourceRejected)?;
+            relay_ca
+                .validate_observed(&self.namespace, &observed)
+                .map_err(|_| RegistrationProvisionerError::ResourceRejected)?;
+        }
         let preconditions = Preconditions {
             resource_version: Some(verified.secret_resource_version().to_owned()),
             uid: Some(verified.secret_uid().to_owned()),
