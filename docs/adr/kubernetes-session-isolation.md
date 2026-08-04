@@ -329,6 +329,15 @@ Organization-managed skills may be baked into the image or mounted read-only
 at a pinned version. Any generated state, credentials, mutable configuration,
 or behavior-affecting cache remains session-private.
 
+Workspace preparation treats the mounted filesystem as a capability boundary,
+not a string-prefix check. The worker opens only the fixed `session`, `home`,
+and `workspace` components relative to retained directory descriptors, rejects
+symbolic links, and verifies the live device/inode binding. The `/session`
+volume root may be storage-driver-owned; `home` and `workspace` must have the
+worker's exact effective UID and primary GID. After controller activation and
+immediately before child spawn, the worker revalidates binding, ownership, and
+writability and enters the workspace through the retained descriptor.
+
 ### 4.4 Controller transport boundary
 
 The controller WebSocket endpoint is cluster-internal infrastructure, not a

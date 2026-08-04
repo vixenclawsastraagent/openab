@@ -193,8 +193,14 @@ One worker process performs this sequence exactly once:
    child.
 2. Create or verify real directories at `/session/home` and
    `/session/workspace`; reject symlinks, non-directories, paths escaping the
-   canonical `/session` root, and non-writable directories. Change the child
-   working directory to `/session/workspace`.
+   canonical `/session` root, and non-writable directories. The volume root
+   may be owned by the storage driver, but each private child directory must
+   retain the worker's exact effective UID and primary GID. New child
+   directories use mode `0700`; conforming existing directories and their
+   contents are preserved. Retain directory capabilities, revalidate their
+   identity, ownership, and writability immediately before spawn, and change
+   the child working directory through the retained workspace capability
+   rather than by re-resolving a pathname.
 3. Connect once with standard TLS hostname/SNI validation. Send exactly one
    HTTP GET for `/v1/worker` with one sensitive
    `Authorization: Bearer <64 lowercase hex>` header and one

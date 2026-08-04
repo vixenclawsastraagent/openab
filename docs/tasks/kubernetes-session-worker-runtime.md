@@ -184,7 +184,7 @@ shared read-only while all mutable state remains session-private.
     - `cargo check --manifest-path crates/openab-kubernetes-session/Cargo.toml --locked --no-default-features`
   - Commit: `feat(kubernetes): load worker bootstrap`.
 
-- [ ] **Task 8 — Prepare the private worker workspace.**
+- [x] **Task 8 — Prepare the private worker workspace.**
   - Depends on: Task 7.
   - Test first: cover missing directories, creation, existing real
     directories, non-directory entries, symlinks at every component, canonical
@@ -239,9 +239,10 @@ and the controller's 300-second activation ceiling is the sole deadline.
 - [ ] **Task 11 — Supervise exactly one ACP process tree.**
   - Depends on: Tasks 8 and 10.
   - Test first: cover absolute executable enforcement, no shell, workspace
-    cwd, sanitized child environment, process-group creation, child exit,
-    TERM/KILL grace behavior, descendant cleanup, signal/socket/write races,
-    reaping, and socket-drop-before-process-termination ordering.
+    cwd through the retained directory capability, post-ACK workspace
+    revalidation, sanitized child environment, process-group creation, child
+    exit, TERM/KILL grace behavior, descendant cleanup, signal/socket/write
+    races, reaping, and socket-drop-before-process-termination ordering.
   - Work: add injectable process/signal/clock boundaries for deterministic
     tests and the Linux process-group implementation. Never restart the child.
   - Files: `src/worker/process.rs`, `src/worker/supervisor.rs`,

@@ -5,6 +5,7 @@
 //! hosts without touching an ACP executable or the network.
 
 pub mod bootstrap;
+pub mod workspace;
 
 use thiserror::Error;
 
