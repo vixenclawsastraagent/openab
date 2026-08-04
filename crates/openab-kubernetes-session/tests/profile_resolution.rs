@@ -5,20 +5,27 @@ use kube::client::Body;
 use kube::Client;
 use openab_kubernetes_session::controller::{resolve_profile_revisions, ProfileResolutionError};
 use openab_kubernetes_session::profile_config::TrustedControllerConfigV1;
+use openab_kubernetes_session::resources::MAX_WORKER_RELAY_CA_PEM_BYTES;
+use rcgen::{generate_simple_self_signed, CertifiedKey};
 use serde_json::{json, Value};
 use std::error::Error as _;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tower_test::mock;
 
 const NAMESPACE: &str = "team-a-workers";
+const DEFAULT_RELAY_CA_NAME: &str = "openab-session-controller-ca-v1";
+const RELAY_CA_RESOURCE_VERSION: &str = "relay-ca-rv-1";
 
 #[derive(Clone, Copy, Default)]
 struct References<'a> {
     runtime_class: Option<(&'a str, &'a str)>,
     skills: Option<&'a str>,
+    relay_ca: Option<&'a str>,
 }
 
 fn revision(profile: &str, version: &str, references: References<'_>) -> String {
+    let relay_ca = references.relay_ca.unwrap_or(DEFAULT_RELAY_CA_NAME);
     let runtime_class = references
         .runtime_class
         .map_or_else(String::new, |(name, handler)| {
@@ -46,7 +53,7 @@ image = "ghcr.io/example/openab-worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
 [profiles.{profile}.revisions."{version}".relay]
 url = "wss://openab-session-controller.openab-system.svc:8443/v1/worker"
-ca_config_map_name = "openab-session-controller-ca-v1"
+ca_config_map_name = "{relay_ca}"
 
 [profiles.{profile}.revisions."{version}".supervisor]
 executable = "/usr/local/bin/openab-session-supervisor"
@@ -158,6 +165,55 @@ fn skills_config_map(name: &str) -> Value {
     })
 }
 
+fn relay_ca_pem() -> &'static str {
+    static PEM: OnceLock<String> = OnceLock::new();
+    PEM.get_or_init(|| {
+        let CertifiedKey { cert, .. } =
+            generate_simple_self_signed(vec!["controller.example.test".to_owned()])
+                .expect("test relay CA certificate");
+        cert.pem()
+    })
+}
+
+fn relay_ca_config_map(name: &str, pem: &str) -> Value {
+    json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": name,
+            "namespace": NAMESPACE,
+            "uid": format!("{name}-uid"),
+            "resourceVersion": RELAY_CA_RESOURCE_VERSION
+        },
+        "immutable": true,
+        "data": { "ca.crt": pem }
+    })
+}
+
+async fn serve_relay_ca(
+    handle: &mut std::pin::Pin<&mut mock::Handle<Request<Body>, Response<Body>>>,
+    name: &str,
+    observed: Value,
+) {
+    next_get(
+        handle,
+        &format!("/api/v1/namespaces/{NAMESPACE}/configmaps/{name}"),
+    )
+    .await
+    .send_response(json_response(StatusCode::OK, observed));
+}
+
+async fn serve_default_relay_ca(
+    handle: &mut std::pin::Pin<&mut mock::Handle<Request<Body>, Response<Body>>>,
+) {
+    serve_relay_ca(
+        handle,
+        DEFAULT_RELAY_CA_NAME,
+        relay_ca_config_map(DEFAULT_RELAY_CA_NAME, relay_ca_pem()),
+    )
+    .await;
+}
+
 fn api_failure(sentinel: &str) -> Response<Body> {
     json_response(
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -189,6 +245,26 @@ async fn assert_no_request(
     assert!(!matches!(unexpected, Ok(Some(_))));
 }
 
+async fn resolve_current_relay_ca_response(
+    response: Response<Body>,
+) -> Result<openab_kubernetes_session::controller::ResolvedProfileRevisions, ProfileResolutionError>
+{
+    let profile_config = config("v1", &[("v1", References::default())]);
+    let (client, handle) = client_and_handle();
+    let task =
+        tokio::spawn(
+            async move { resolve_profile_revisions(client, NAMESPACE, &profile_config).await },
+        );
+    let mut handle = std::pin::pin!(handle);
+    next_get(
+        &mut handle,
+        &format!("/api/v1/namespaces/{NAMESPACE}/configmaps/{DEFAULT_RELAY_CA_NAME}"),
+    )
+    .await
+    .send_response(response);
+    task.await.unwrap()
+}
+
 #[tokio::test]
 async fn invalid_worker_namespace_fails_before_kubernetes_and_is_redacted() {
     const SENTINEL: &str = "invalid/secret-namespace";
@@ -210,14 +286,17 @@ async fn resolves_all_current_references_before_historical_references() {
     let alpha_current = References {
         runtime_class: Some(("kata-alpha-current", "kata-qemu")),
         skills: Some("skills-alpha-current-v2"),
+        ..References::default()
     };
     let alpha_historical = References {
         runtime_class: Some(("kata-alpha-historical", "kata-qemu")),
         skills: Some("skills-alpha-historical-v1"),
+        ..References::default()
     };
     let zulu_current = References {
         runtime_class: Some(("kata-zulu-current", "kata-qemu")),
         skills: Some("skills-zulu-current-v1"),
+        ..References::default()
     };
     let config = config_with_profiles(&[
         profile_config(
@@ -250,6 +329,7 @@ async fn resolves_all_current_references_before_historical_references() {
         StatusCode::OK,
         skills_config_map("skills-alpha-current-v2"),
     ));
+    serve_default_relay_ca(&mut handle).await;
     next_get(
         &mut handle,
         "/apis/node.k8s.io/v1/runtimeclasses/kata-zulu-current",
@@ -315,10 +395,12 @@ async fn current_reference_failure_is_fatal_before_historical_resolution() {
     let current = References {
         runtime_class: Some(("current-private-name", "kata-qemu")),
         skills: None,
+        ..References::default()
     };
     let historical = References {
         runtime_class: Some(("historical-private-name", "kata-qemu")),
         skills: None,
+        ..References::default()
     };
     let config = config("v2", &[("v1", historical), ("v2", current)]);
     let (client, handle) = client_and_handle();
@@ -343,12 +425,15 @@ async fn historical_failure_omits_only_that_revision() {
     let historical = References {
         runtime_class: None,
         skills: Some("deleted-historical-skills"),
+        ..References::default()
     };
     let config = config("v2", &[("v1", historical), ("v2", References::default())]);
     let (client, handle) = client_and_handle();
     let task =
         tokio::spawn(async move { resolve_profile_revisions(client, NAMESPACE, &config).await });
     let mut handle = std::pin::pin!(handle);
+
+    serve_default_relay_ca(&mut handle).await;
 
     next_get(
         &mut handle,
@@ -368,6 +453,7 @@ async fn shared_failed_reference_is_fetched_once_but_counted_per_historical_revi
     let shared = References {
         runtime_class: None,
         skills: Some("shared-historical-skills"),
+        ..References::default()
     };
     let config = config(
         "v3",
@@ -381,6 +467,8 @@ async fn shared_failed_reference_is_fetched_once_but_counted_per_historical_revi
     let task =
         tokio::spawn(async move { resolve_profile_revisions(client, NAMESPACE, &config).await });
     let mut handle = std::pin::pin!(handle);
+
+    serve_default_relay_ca(&mut handle).await;
 
     next_get(
         &mut handle,
@@ -396,20 +484,253 @@ async fn shared_failed_reference_is_fetched_once_but_counted_per_historical_revi
 }
 
 #[tokio::test]
-async fn profiles_without_cluster_references_do_not_call_kubernetes() {
+async fn profiles_with_only_relay_ca_fetch_it_once() {
     let config = config(
         "v2",
         &[("v1", References::default()), ("v2", References::default())],
     );
     let (client, handle) = client_and_handle();
+    let task =
+        tokio::spawn(async move { resolve_profile_revisions(client, NAMESPACE, &config).await });
+    let mut handle = std::pin::pin!(handle);
 
-    let resolved = resolve_profile_revisions(client, NAMESPACE, &config)
-        .await
-        .unwrap();
+    serve_default_relay_ca(&mut handle).await;
+
+    let resolved = task.await.unwrap().unwrap();
     assert_eq!(resolved.profiles().len(), 2);
     assert_eq!(resolved.unavailable_historical_revision_count(), 0);
+    assert_no_request(&mut handle).await;
+}
 
+#[tokio::test]
+async fn mandatory_relay_ca_is_pinned_without_retaining_pem() {
+    let resolved = resolve_current_relay_ca_response(json_response(
+        StatusCode::OK,
+        relay_ca_config_map(DEFAULT_RELAY_CA_NAME, relay_ca_pem()),
+    ))
+    .await
+    .unwrap();
+
+    let pin = resolved.profiles()[0]
+        .relay_ca_config_map()
+        .expect("mandatory relay CA pin");
+    assert_eq!(pin.name(), DEFAULT_RELAY_CA_NAME);
+    assert_eq!(pin.uid(), &format!("{DEFAULT_RELAY_CA_NAME}-uid"));
+    assert_eq!(pin.resource_version(), RELAY_CA_RESOURCE_VERSION);
+
+    let debug = format!("{resolved:?}\n{pin:?}");
+    for hidden in [
+        DEFAULT_RELAY_CA_NAME,
+        RELAY_CA_RESOURCE_VERSION,
+        relay_ca_pem(),
+    ] {
+        assert!(!debug.contains(hidden));
+    }
+}
+
+#[tokio::test]
+async fn current_relay_ca_unavailable_is_fatal_and_redacted() {
+    const SENTINEL: &str = "private relay CA API response";
+    let missing = json_response(
+        StatusCode::NOT_FOUND,
+        json!({
+            "apiVersion": "v1",
+            "kind": "Status",
+            "status": "Failure",
+            "message": SENTINEL,
+            "reason": "NotFound",
+            "code": 404
+        }),
+    );
+
+    for response in [api_failure(SENTINEL), missing] {
+        let error = resolve_current_relay_ca_response(response)
+            .await
+            .unwrap_err();
+        assert_eq!(error, ProfileResolutionError::CurrentReferenceUnavailable);
+        assert!(!format!("{error}\n{error:?}").contains(SENTINEL));
+    }
+}
+
+#[tokio::test]
+async fn current_relay_ca_rejects_invalid_metadata_ownership_and_content() {
+    let valid = || relay_ca_config_map(DEFAULT_RELAY_CA_NAME, relay_ca_pem());
+    let mut cases = Vec::new();
+
+    let mut observed = valid();
+    observed["immutable"] = json!(false);
+    cases.push(observed);
+
+    let mut observed = valid();
+    observed["metadata"]["deletionTimestamp"] = json!("2026-08-03T01:02:03Z");
+    cases.push(observed);
+
+    let mut observed = valid();
+    observed["metadata"]["name"] = json!("different-relay-ca-v1");
+    cases.push(observed);
+
+    let mut observed = valid();
+    observed["metadata"]["namespace"] = json!("different-workers");
+    cases.push(observed);
+
+    for field in ["uid", "resourceVersion"] {
+        let mut missing = valid();
+        missing["metadata"].as_object_mut().unwrap().remove(field);
+        cases.push(missing);
+
+        let mut invalid = valid();
+        invalid["metadata"][field] = json!("not\nprintable");
+        cases.push(invalid);
+    }
+
+    let mut observed = valid();
+    observed.as_object_mut().unwrap().remove("data");
+    cases.push(observed);
+
+    let mut observed = valid();
+    observed["data"] = json!({ "wrong.crt": relay_ca_pem() });
+    cases.push(observed);
+
+    let mut observed = valid();
+    observed["data"]["unexpected"] = json!("must be rejected");
+    cases.push(observed);
+
+    let mut observed = valid();
+    observed["binaryData"] = json!({ "ca.crt": "AA==" });
+    cases.push(observed);
+
+    for invalid_pem in [
+        "",
+        "not a PEM bundle",
+        "-----BEGIN PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\n",
+        "-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n",
+    ] {
+        cases.push(relay_ca_config_map(DEFAULT_RELAY_CA_NAME, invalid_pem));
+    }
+
+    let mut observed = valid();
+    observed["metadata"]["ownerReferences"] = json!([{
+        "apiVersion": "openab.dev/v1",
+        "kind": "OABSession",
+        "name": "private-session",
+        "uid": "private-session-uid"
+    }]);
+    cases.push(observed);
+
+    for (key, value) in [
+        ("openab.dev/resource", "worker-pod"),
+        ("openab.dev/session", "private-session"),
+        ("openab.dev/generation", "1"),
+        ("app.kubernetes.io/managed-by", "openab-session-controller"),
+    ] {
+        let mut observed = valid();
+        observed["metadata"]["labels"] = json!({ (key): value });
+        cases.push(observed);
+    }
+
+    let mut oversized_pem = relay_ca_pem().to_owned();
+    oversized_pem.push_str(&" ".repeat(MAX_WORKER_RELAY_CA_PEM_BYTES + 1 - oversized_pem.len()));
+    cases.push(relay_ca_config_map(DEFAULT_RELAY_CA_NAME, &oversized_pem));
+
+    for observed in cases {
+        assert_eq!(
+            resolve_current_relay_ca_response(json_response(StatusCode::OK, observed))
+                .await
+                .unwrap_err(),
+            ProfileResolutionError::CurrentReferenceInvalid
+        );
+    }
+}
+
+#[tokio::test]
+async fn relay_ca_accepts_the_exact_pem_size_limit() {
+    let mut exact_pem = relay_ca_pem().to_owned();
+    exact_pem.push_str(&" ".repeat(MAX_WORKER_RELAY_CA_PEM_BYTES - exact_pem.len()));
+    assert_eq!(exact_pem.len(), MAX_WORKER_RELAY_CA_PEM_BYTES);
+
+    let resolved = resolve_current_relay_ca_response(json_response(
+        StatusCode::OK,
+        relay_ca_config_map(DEFAULT_RELAY_CA_NAME, &exact_pem),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(resolved.profiles().len(), 1);
+}
+
+#[tokio::test]
+async fn invalid_historical_relay_ca_omits_only_affected_revisions_and_is_cached() {
+    const HISTORICAL_CA: &str = "historical-relay-ca-v1";
+    let historical = References {
+        relay_ca: Some(HISTORICAL_CA),
+        ..References::default()
+    };
+    let profile_config = config(
+        "v3",
+        &[
+            ("v1", historical),
+            ("v2", historical),
+            ("v3", References::default()),
+        ],
+    );
+    let (client, handle) = client_and_handle();
+    let task =
+        tokio::spawn(
+            async move { resolve_profile_revisions(client, NAMESPACE, &profile_config).await },
+        );
     let mut handle = std::pin::pin!(handle);
+
+    serve_default_relay_ca(&mut handle).await;
+    serve_relay_ca(
+        &mut handle,
+        HISTORICAL_CA,
+        relay_ca_config_map(HISTORICAL_CA, "not a certificate"),
+    )
+    .await;
+
+    let resolved = task.await.unwrap().unwrap();
+    assert_eq!(resolved.profiles().len(), 1);
+    assert_eq!(resolved.profiles()[0].profile().version(), "v3");
+    assert_eq!(resolved.unavailable_historical_revision_count(), 2);
+    assert_no_request(&mut handle).await;
+}
+
+#[tokio::test]
+async fn unavailable_historical_relay_ca_omits_only_that_revision() {
+    const HISTORICAL_CA: &str = "missing-historical-relay-ca-v1";
+    const SENTINEL: &str = "private historical CA API response";
+    let profile_config = config(
+        "v2",
+        &[
+            (
+                "v1",
+                References {
+                    relay_ca: Some(HISTORICAL_CA),
+                    ..References::default()
+                },
+            ),
+            ("v2", References::default()),
+        ],
+    );
+    let (client, handle) = client_and_handle();
+    let task =
+        tokio::spawn(
+            async move { resolve_profile_revisions(client, NAMESPACE, &profile_config).await },
+        );
+    let mut handle = std::pin::pin!(handle);
+
+    serve_default_relay_ca(&mut handle).await;
+    next_get(
+        &mut handle,
+        &format!("/api/v1/namespaces/{NAMESPACE}/configmaps/{HISTORICAL_CA}"),
+    )
+    .await
+    .send_response(api_failure(SENTINEL));
+
+    let resolved = task.await.unwrap().unwrap();
+    assert_eq!(resolved.profiles().len(), 1);
+    assert_eq!(resolved.profiles()[0].profile().version(), "v2");
+    assert_eq!(resolved.unavailable_historical_revision_count(), 1);
+    assert!(!format!("{resolved:?}").contains(SENTINEL));
     assert_no_request(&mut handle).await;
 }
 
@@ -438,6 +759,7 @@ async fn mutable_deleting_and_mismatched_observations_fail_current_resolution() 
                 References {
                     runtime_class: None,
                     skills: Some("skills-current"),
+                    ..References::default()
                 },
             )],
         );
@@ -472,6 +794,7 @@ async fn mutable_deleting_and_mismatched_observations_fail_current_resolution() 
                 References {
                     runtime_class: Some(("kata", "expected-handler")),
                     skills: None,
+                    ..References::default()
                 },
             )],
         );
@@ -500,6 +823,7 @@ async fn mutable_and_deleting_historical_skills_are_omitted_and_counted() {
                 References {
                     runtime_class: None,
                     skills: Some("mutable-historical-skills"),
+                    ..References::default()
                 },
             ),
             (
@@ -507,6 +831,7 @@ async fn mutable_and_deleting_historical_skills_are_omitted_and_counted() {
                 References {
                     runtime_class: None,
                     skills: Some("deleting-historical-skills"),
+                    ..References::default()
                 },
             ),
             ("v3", References::default()),
@@ -516,6 +841,8 @@ async fn mutable_and_deleting_historical_skills_are_omitted_and_counted() {
     let task =
         tokio::spawn(async move { resolve_profile_revisions(client, NAMESPACE, &config).await });
     let mut handle = std::pin::pin!(handle);
+
+    serve_default_relay_ca(&mut handle).await;
 
     let mut mutable = skills_config_map("mutable-historical-skills");
     mutable["immutable"] = json!(false);
@@ -551,6 +878,7 @@ async fn shared_runtime_class_is_fetched_once_and_validated_against_each_intent(
                 References {
                     runtime_class: Some(("shared-runtime", "historical-handler")),
                     skills: None,
+                    ..References::default()
                 },
             ),
             (
@@ -558,6 +886,7 @@ async fn shared_runtime_class_is_fetched_once_and_validated_against_each_intent(
                 References {
                     runtime_class: Some(("shared-runtime", "current-handler")),
                     skills: None,
+                    ..References::default()
                 },
             ),
         ],
@@ -576,6 +905,7 @@ async fn shared_runtime_class_is_fetched_once_and_validated_against_each_intent(
         StatusCode::OK,
         runtime_class("shared-runtime", "current-handler"),
     ));
+    serve_default_relay_ca(&mut handle).await;
 
     let resolved = task.await.unwrap().unwrap();
     assert_eq!(resolved.profiles().len(), 1);
@@ -598,6 +928,7 @@ async fn errors_and_result_debug_never_expose_operator_values_or_kubernetes_bodi
             References {
                 runtime_class: Some((SENTINEL_NAME, "private-handler")),
                 skills: None,
+                ..References::default()
             },
         )],
     )]);
@@ -632,10 +963,14 @@ async fn errors_and_result_debug_never_expose_operator_values_or_kubernetes_bodi
         SENTINEL_REVISION,
         &[(SENTINEL_REVISION, References::default())],
     )]);
-    let (client, _handle) = client_and_handle();
-    let resolved = resolve_profile_revisions(client, NAMESPACE, &success_config)
-        .await
-        .unwrap();
+    let (client, handle) = client_and_handle();
+    let task =
+        tokio::spawn(
+            async move { resolve_profile_revisions(client, NAMESPACE, &success_config).await },
+        );
+    let mut handle = std::pin::pin!(handle);
+    serve_default_relay_ca(&mut handle).await;
+    let resolved = task.await.unwrap().unwrap();
     let debug = format!("{resolved:?}");
     for secret in [SENTINEL_PROFILE, SENTINEL_REVISION, NAMESPACE] {
         assert!(!debug.contains(secret));

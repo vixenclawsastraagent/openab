@@ -1,8 +1,8 @@
 use crate::profile_config::{
     LoadedWorkerProfile, ResolvedClusterReferences, RuntimeClassIntent, SkillsConfigMapIntent,
-    TrustedControllerConfigV1,
+    TrustedControllerConfigV1, WorkerRelayCaConfigMapIntent,
 };
-use crate::resources::{MvpWorkerProfile, PinnedSkillsConfigMap};
+use crate::resources::{MvpWorkerProfile, PinnedSkillsConfigMap, PinnedWorkerRelayCaConfigMap};
 use crate::state::ProfileRef;
 use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::api::node::v1::RuntimeClass;
@@ -80,18 +80,24 @@ enum ReferenceFailure {
 struct ClusterReferenceResolver {
     runtime_classes: Api<RuntimeClass>,
     skills_config_maps: Api<ConfigMap>,
+    relay_ca_config_maps: Api<ConfigMap>,
     runtime_class_cache: BTreeMap<String, Result<RuntimeClass, ReferenceFailure>>,
     skills_config_map_cache: BTreeMap<String, Result<PinnedSkillsConfigMap, ReferenceFailure>>,
+    relay_ca_config_map_cache:
+        BTreeMap<String, Result<PinnedWorkerRelayCaConfigMap, ReferenceFailure>>,
     worker_namespace: String,
 }
 
 impl ClusterReferenceResolver {
     fn new(client: Client, worker_namespace: &str) -> Self {
+        let config_maps = Api::namespaced(client.clone(), worker_namespace);
         Self {
-            runtime_classes: Api::all(client.clone()),
-            skills_config_maps: Api::namespaced(client, worker_namespace),
+            runtime_classes: Api::all(client),
+            skills_config_maps: config_maps.clone(),
+            relay_ca_config_maps: config_maps,
             runtime_class_cache: BTreeMap::new(),
             skills_config_map_cache: BTreeMap::new(),
+            relay_ca_config_map_cache: BTreeMap::new(),
             worker_namespace: worker_namespace.to_string(),
         }
     }
@@ -108,10 +114,17 @@ impl ClusterReferenceResolver {
             Some(intent) => Some(self.resolve_skills_config_map(intent).await?),
             None => None,
         };
+        let relay_ca = self
+            .resolve_relay_ca_config_map(loaded.relay().ca_config_map())
+            .await?;
 
         loaded
             .clone()
-            .resolve_cluster_references(ResolvedClusterReferences::new(runtime_class, skills))
+            .resolve_cluster_references(ResolvedClusterReferences::new(
+                runtime_class,
+                skills,
+                relay_ca,
+            ))
             .map(|resolved| resolved.into_worker_profile())
             .map_err(|_| ReferenceFailure::Invalid)
     }
@@ -159,6 +172,31 @@ impl ClusterReferenceResolver {
                     .map_err(|_| ReferenceFailure::Invalid)
             });
         self.skills_config_map_cache
+            .insert(intent.name().to_string(), resolved.clone());
+        resolved
+    }
+
+    async fn resolve_relay_ca_config_map(
+        &mut self,
+        intent: &WorkerRelayCaConfigMapIntent,
+    ) -> Result<PinnedWorkerRelayCaConfigMap, ReferenceFailure> {
+        if let Some(cached) = self.relay_ca_config_map_cache.get(intent.name()) {
+            return cached.clone();
+        }
+
+        // Validate and discard the observed ConfigMap immediately. The cache
+        // retains only the immutable identity pin, never CA PEM bytes.
+        let resolved = self
+            .relay_ca_config_maps
+            .get(intent.name())
+            .await
+            .map_err(|_| ReferenceFailure::Unavailable)
+            .and_then(|observed| {
+                intent
+                    .resolve_observed(&self.worker_namespace, &observed)
+                    .map_err(|_| ReferenceFailure::Invalid)
+            });
+        self.relay_ca_config_map_cache
             .insert(intent.name().to_string(), resolved.clone());
         resolved
     }

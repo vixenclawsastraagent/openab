@@ -19,8 +19,11 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use k8s_openapi::ByteString;
+use rustls::RootCertStore;
+use rustls_pemfile::Item;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::io::Cursor;
 use std::net::IpAddr;
 use thiserror::Error;
 use uuid::Uuid;
@@ -48,6 +51,12 @@ const RUNTIME_UID_ANNOTATION: &str = "openab.dev/runtime-class-uid";
 const RUNTIME_RESOURCE_VERSION_ANNOTATION: &str = "openab.dev/runtime-class-resource-version";
 const WORKER_IMAGE_CONTRACT_ANNOTATION: &str = "openab.dev/worker-image-contract";
 const WORKER_IMAGE_CONTRACT: &str = "session-layout-v1";
+/// Fixed key containing the worker relay trust bundle.
+pub const WORKER_RELAY_CA_CONFIG_MAP_KEY: &str = "ca.crt";
+/// Maximum accepted UTF-8 bytes in the worker relay trust bundle.
+pub const MAX_WORKER_RELAY_CA_PEM_BYTES: usize = 256 * 1024;
+const CERTIFICATE_BEGIN: &[u8] = b"-----BEGIN CERTIFICATE-----";
+const CERTIFICATE_END: &[u8] = b"-----END CERTIFICATE-----";
 const TOKEN_KEY: &str = "token";
 const BINDING_KEY: &str = "binding.json";
 const TOKEN_DIRECTORY: &str = "/var/run/openab-registration";
@@ -110,6 +119,8 @@ pub enum ResourceBuildError {
     InvalidEgressCidr,
     #[error("invalid pinned skills ConfigMap {field}")]
     InvalidSkillsConfigMap { field: &'static str },
+    #[error("invalid pinned worker relay CA ConfigMap {field}")]
+    InvalidWorkerRelayCaConfigMap { field: &'static str },
     #[error("could not derive a generation resource name")]
     ResourceName(#[source] IdentityError),
     #[error("session anchor could not produce a worker registration binding")]
@@ -680,6 +691,251 @@ impl PinnedSkillsConfigMap {
     }
 }
 
+/// Identity pin for the centrally managed worker-relay trust bundle.
+///
+/// The certificate bytes are validated while observing the ConfigMap and are
+/// deliberately discarded. Only the Kubernetes identity needed for later
+/// drift checks is retained. The operator must use versioned names that are
+/// never reused because a ConfigMap volume ultimately selects by name.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PinnedWorkerRelayCaConfigMap {
+    name: String,
+    uid: String,
+    resource_version: String,
+}
+
+impl PinnedWorkerRelayCaConfigMap {
+    fn new(
+        name: impl Into<String>,
+        uid: impl Into<String>,
+        resource_version: impl Into<String>,
+    ) -> Result<Self, ResourceBuildError> {
+        let pin = Self {
+            name: name.into(),
+            uid: uid.into(),
+            resource_version: resource_version.into(),
+        };
+        if !is_dns_subdomain(&pin.name) {
+            return Err(ResourceBuildError::InvalidWorkerRelayCaConfigMap {
+                field: "metadata.name",
+            });
+        }
+        if !is_printable_identifier(&pin.uid) {
+            return Err(ResourceBuildError::InvalidWorkerRelayCaConfigMap {
+                field: "metadata.uid",
+            });
+        }
+        if !is_printable_identifier(&pin.resource_version) {
+            return Err(ResourceBuildError::InvalidWorkerRelayCaConfigMap {
+                field: "metadata.resourceVersion",
+            });
+        }
+        Ok(pin)
+    }
+
+    /// Validate and pin one live, immutable CA ConfigMap observation.
+    ///
+    /// The returned value never retains the PEM or the observed Kubernetes
+    /// object, keeping trust material out of session state and debug output.
+    pub fn from_observed(
+        expected_namespace: &str,
+        observed: &ConfigMap,
+    ) -> Result<Self, ResourceBuildError> {
+        if !is_dns_label(expected_namespace) {
+            return Err(ResourceBuildError::InvalidWorkerRelayCaConfigMap {
+                field: "expectedNamespace",
+            });
+        }
+        let name = observed.metadata.name.as_deref().ok_or(
+            ResourceBuildError::InvalidWorkerRelayCaConfigMap {
+                field: "metadata.name",
+            },
+        )?;
+        if !is_dns_subdomain(name) {
+            return Err(ResourceBuildError::InvalidWorkerRelayCaConfigMap {
+                field: "metadata.name",
+            });
+        }
+        if observed.metadata.namespace.as_deref() != Some(expected_namespace) {
+            return Err(ResourceBuildError::InvalidWorkerRelayCaConfigMap {
+                field: "metadata.namespace",
+            });
+        }
+        if observed.metadata.deletion_timestamp.is_some() {
+            return Err(ResourceBuildError::InvalidWorkerRelayCaConfigMap {
+                field: "metadata.deletionTimestamp",
+            });
+        }
+        if observed.immutable != Some(true) {
+            return Err(ResourceBuildError::InvalidWorkerRelayCaConfigMap { field: "immutable" });
+        }
+        if observed
+            .metadata
+            .owner_references
+            .as_ref()
+            .is_some_and(|references| !references.is_empty())
+        {
+            return Err(ResourceBuildError::InvalidWorkerRelayCaConfigMap {
+                field: "metadata.ownerReferences",
+            });
+        }
+        if has_session_management_labels(observed.metadata.labels.as_ref()) {
+            return Err(ResourceBuildError::InvalidWorkerRelayCaConfigMap {
+                field: "metadata.labels",
+            });
+        }
+        if observed
+            .binary_data
+            .as_ref()
+            .is_some_and(|data| !data.is_empty())
+        {
+            return Err(ResourceBuildError::InvalidWorkerRelayCaConfigMap {
+                field: "binaryData",
+            });
+        }
+        let data = observed
+            .data
+            .as_ref()
+            .ok_or(ResourceBuildError::InvalidWorkerRelayCaConfigMap { field: "data" })?;
+        if data.len() != 1 {
+            return Err(ResourceBuildError::InvalidWorkerRelayCaConfigMap { field: "data" });
+        }
+        let pem = data.get(WORKER_RELAY_CA_CONFIG_MAP_KEY).ok_or(
+            ResourceBuildError::InvalidWorkerRelayCaConfigMap {
+                field: "data.ca.crt",
+            },
+        )?;
+        validate_worker_relay_ca_pem(pem)?;
+
+        let uid = observed.metadata.uid.as_deref().ok_or(
+            ResourceBuildError::InvalidWorkerRelayCaConfigMap {
+                field: "metadata.uid",
+            },
+        )?;
+        let resource_version = observed.metadata.resource_version.as_deref().ok_or(
+            ResourceBuildError::InvalidWorkerRelayCaConfigMap {
+                field: "metadata.resourceVersion",
+            },
+        )?;
+        Self::new(name, uid, resource_version)
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn uid(&self) -> &str {
+        &self.uid
+    }
+
+    pub fn resource_version(&self) -> &str {
+        &self.resource_version
+    }
+
+    pub(crate) fn matches_intent(&self, name: &str) -> bool {
+        self.name == name
+    }
+}
+
+impl fmt::Debug for PinnedWorkerRelayCaConfigMap {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PinnedWorkerRelayCaConfigMap")
+            .finish_non_exhaustive()
+    }
+}
+
+fn has_session_management_labels(labels: Option<&BTreeMap<String, String>>) -> bool {
+    labels.is_some_and(|labels| {
+        labels.get(MANAGED_BY_LABEL).map(String::as_str) == Some(MANAGED_BY_VALUE)
+            || labels.contains_key(RESOURCE_LABEL)
+            || labels.contains_key(SESSION_LABEL)
+            || labels.contains_key(GENERATION_LABEL)
+    })
+}
+
+fn validate_worker_relay_ca_pem(pem: &str) -> Result<(), ResourceBuildError> {
+    let bytes = pem.as_bytes();
+    if bytes.len() > MAX_WORKER_RELAY_CA_PEM_BYTES {
+        return Err(ResourceBuildError::InvalidWorkerRelayCaConfigMap {
+            field: "data.ca.crt",
+        });
+    }
+    validate_certificate_only_envelope(bytes)?;
+
+    let mut roots = RootCertStore::empty();
+    let mut certificate_count = 0usize;
+    for item in rustls_pemfile::read_all(&mut Cursor::new(bytes)) {
+        let item = item.map_err(|_| ResourceBuildError::InvalidWorkerRelayCaConfigMap {
+            field: "data.ca.crt",
+        })?;
+        let Item::X509Certificate(certificate) = item else {
+            return Err(ResourceBuildError::InvalidWorkerRelayCaConfigMap {
+                field: "data.ca.crt",
+            });
+        };
+        roots
+            .add(certificate)
+            .map_err(|_| ResourceBuildError::InvalidWorkerRelayCaConfigMap {
+                field: "data.ca.crt",
+            })?;
+        certificate_count += 1;
+    }
+    if certificate_count == 0 {
+        return Err(ResourceBuildError::InvalidWorkerRelayCaConfigMap {
+            field: "data.ca.crt",
+        });
+    }
+    Ok(())
+}
+
+fn validate_certificate_only_envelope(bytes: &[u8]) -> Result<(), ResourceBuildError> {
+    let invalid = || ResourceBuildError::InvalidWorkerRelayCaConfigMap {
+        field: "data.ca.crt",
+    };
+    let mut inside_certificate = false;
+    let mut body_line_seen = false;
+    let mut certificate_count = 0usize;
+
+    for raw_line in bytes.split(|byte| *byte == b'\n') {
+        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        if !inside_certificate {
+            if line.iter().all(|byte| byte.is_ascii_whitespace()) {
+                continue;
+            }
+            if line == CERTIFICATE_BEGIN {
+                inside_certificate = true;
+                body_line_seen = false;
+                continue;
+            }
+            return Err(invalid());
+        }
+
+        if line == CERTIFICATE_END {
+            if !body_line_seen {
+                return Err(invalid());
+            }
+            inside_certificate = false;
+            certificate_count += 1;
+            continue;
+        }
+        if line.is_empty()
+            || line.starts_with(b"-----")
+            || !line
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+        {
+            return Err(invalid());
+        }
+        body_line_seen = true;
+    }
+
+    if inside_certificate || certificate_count == 0 {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 /// A narrow, immutable worker profile.
 ///
 /// Images admitted to a profile must implement the `session-layout-v1`
@@ -701,6 +957,7 @@ pub struct MvpWorkerProfile {
     identity: RunAsIdentity,
     runtime_class: Option<RuntimeClassSelection>,
     skills: Option<PinnedSkillsConfigMap>,
+    relay_ca: Option<PinnedWorkerRelayCaConfigMap>,
 }
 
 impl MvpWorkerProfile {
@@ -757,6 +1014,7 @@ impl MvpWorkerProfile {
             identity,
             runtime_class,
             skills,
+            relay_ca: None,
         })
     }
 
@@ -770,10 +1028,16 @@ impl MvpWorkerProfile {
         mut self,
         runtime_class: Option<RuntimeClassSelection>,
         skills: Option<PinnedSkillsConfigMap>,
+        relay_ca: PinnedWorkerRelayCaConfigMap,
     ) -> Self {
         self.runtime_class = runtime_class;
         self.skills = skills;
+        self.relay_ca = Some(relay_ca);
         self
+    }
+
+    pub fn relay_ca_config_map(&self) -> Option<&PinnedWorkerRelayCaConfigMap> {
+        self.relay_ca.as_ref()
     }
 }
 

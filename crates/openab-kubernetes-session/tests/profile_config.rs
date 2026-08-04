@@ -12,15 +12,19 @@ use openab_kubernetes_session::profile_config::{
 };
 use openab_kubernetes_session::resources::{
     AllowedRuntimeClass, DesiredGeneration, GenerationContext, PinnedSkillsConfigMap,
-    RuntimeClassSelection,
+    PinnedWorkerRelayCaConfigMap, RuntimeClassSelection,
 };
 use openab_kubernetes_session::state::{ProfileRef, SessionAnchorV1};
+use rcgen::{generate_simple_self_signed, CertifiedKey};
+use std::collections::BTreeMap;
 use std::io::{self, Cursor, Read};
+use std::sync::OnceLock;
 use uuid::Uuid;
 
 const NAMESPACE: &str = "team-a-workers";
 const RAW_SCOPE: &str = "organization-secret-team-a";
 const ANCHOR_UID: &str = "f6d6f3dd-1274-4a17-83dd-d14be72edb86";
+const RELAY_CA_NAME: &str = "openab-session-controller-ca-2026-08";
 
 const VALID_CONFIG: &str = r#"
 schema_version = 1
@@ -162,7 +166,11 @@ fn controller_config_builds_policy_and_existing_worker_domain_types() {
 
     let resolved = loaded
         .clone()
-        .resolve_cluster_references(ResolvedClusterReferences::none())
+        .resolve_cluster_references(ResolvedClusterReferences::new(
+            None,
+            None,
+            selected_relay_ca(RELAY_CA_NAME),
+        ))
         .unwrap();
     let desired = generation(resolved.into_worker_profile());
     let pod_spec = desired.pod().spec.as_ref().unwrap();
@@ -705,6 +713,42 @@ fn observed_skills_config_map(name: &str, namespace: &str) -> ConfigMap {
     }
 }
 
+fn relay_ca_pem() -> &'static str {
+    static PEM: OnceLock<String> = OnceLock::new();
+    PEM.get_or_init(|| {
+        let CertifiedKey { cert, .. } =
+            generate_simple_self_signed(vec!["controller.example.test".to_owned()])
+                .expect("test relay CA certificate");
+        cert.pem()
+    })
+}
+
+fn observed_relay_ca_config_map(name: &str, namespace: &str) -> ConfigMap {
+    ConfigMap {
+        data: Some(BTreeMap::from([(
+            "ca.crt".to_owned(),
+            relay_ca_pem().to_owned(),
+        )])),
+        immutable: Some(true),
+        metadata: ObjectMeta {
+            name: Some(name.into()),
+            namespace: Some(namespace.into()),
+            uid: Some(format!("{name}-uid")),
+            resource_version: Some("relay-ca-rv-1".into()),
+            ..ObjectMeta::default()
+        },
+        ..ConfigMap::default()
+    }
+}
+
+fn selected_relay_ca(name: &str) -> PinnedWorkerRelayCaConfigMap {
+    PinnedWorkerRelayCaConfigMap::from_observed(
+        NAMESPACE,
+        &observed_relay_ca_config_map(name, NAMESPACE),
+    )
+    .unwrap()
+}
+
 #[test]
 fn skills_pin_requires_an_exact_immutable_live_observation() {
     let observed = observed_skills_config_map("team-skills-v1", NAMESPACE);
@@ -758,7 +802,11 @@ config_map_name = "team-skills-v1"
     assert_eq!(skills_intent.name(), "team-skills-v1");
     assert!(loaded
         .clone()
-        .resolve_cluster_references(ResolvedClusterReferences::none())
+        .resolve_cluster_references(ResolvedClusterReferences::new(
+            None,
+            None,
+            selected_relay_ca(RELAY_CA_NAME),
+        ))
         .is_err());
 
     let observed = observed_runtime_class("kata", "kata-qemu");
@@ -772,6 +820,7 @@ config_map_name = "team-skills-v1"
         .resolve_cluster_references(ResolvedClusterReferences::new(
             Some(runtime.clone()),
             Some(skills),
+            selected_relay_ca(RELAY_CA_NAME),
         ))
         .unwrap();
     let desired = generation(resolved.into_worker_profile());
@@ -804,6 +853,7 @@ config_map_name = "team-skills-v1"
         .resolve_cluster_references(ResolvedClusterReferences::new(
             Some(runtime.clone()),
             Some(PinnedSkillsConfigMap::from_observed(NAMESPACE, &wrong_skills).unwrap()),
+            selected_relay_ca(RELAY_CA_NAME),
         ))
         .is_err());
 
@@ -817,6 +867,16 @@ config_map_name = "team-skills-v1"
         .resolve_cluster_references(ResolvedClusterReferences::new(
             Some(wrong_runtime),
             Some(PinnedSkillsConfigMap::from_observed(NAMESPACE, &observed_skills).unwrap()),
+            selected_relay_ca(RELAY_CA_NAME),
+        ))
+        .is_err());
+
+    assert!(loaded
+        .clone()
+        .resolve_cluster_references(ResolvedClusterReferences::new(
+            Some(runtime),
+            Some(PinnedSkillsConfigMap::from_observed(NAMESPACE, &observed_skills).unwrap()),
+            selected_relay_ca("different-relay-ca-v1"),
         ))
         .is_err());
 }

@@ -70,7 +70,7 @@ tests pass.
 
 ## Stage B: freeze and inject the worker transport profile
 
-- [ ] **Task 2 — Parse the revisioned relay and pull-secret contract.**
+- [x] **Task 2 — Parse the revisioned relay and pull-secret contract.**
   - Depends on: Task 1.
   - Test first: extend `tests/profile_config.rs` with the valid example and
     rejection cases for non-WSS URLs, missing host, user information, query,
@@ -85,7 +85,7 @@ tests pass.
   - Verify: `cargo test --manifest-path crates/openab-kubernetes-session/Cargo.toml --locked --all-features --test profile_config`.
   - Commit: `feat(kubernetes): parse worker relay profile`.
 
-- [ ] **Task 3 — Resolve and pin the immutable CA ConfigMap.**
+- [x] **Task 3 — Resolve and pin the immutable CA ConfigMap.**
   - Depends on: Task 2.
   - Test first: extend `tests/profile_resolution.rs` for one bounded
     certificate-only `ca.crt`, immutability, UID/resourceVersion pinning,

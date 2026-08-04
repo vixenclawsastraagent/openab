@@ -1,7 +1,7 @@
 use crate::resources::{
     AllowedRuntimeClass, EgressPort, EgressProtocol, MvpWorkerProfile, PersistentWorkspace,
-    PinnedSkillsConfigMap, PvcAccessMode, ResourceBuildError, RunAsIdentity, RuntimeClassSelection,
-    TrustedEgressRule, WorkerResources,
+    PinnedSkillsConfigMap, PinnedWorkerRelayCaConfigMap, PvcAccessMode, ResourceBuildError,
+    RunAsIdentity, RuntimeClassSelection, TrustedEgressRule, WorkerResources,
 };
 use crate::state::{validate_profile_name, ProfileRef, StateError};
 use http::Uri;
@@ -198,6 +198,20 @@ impl WorkerRelayCaConfigMapIntent {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn resolve_observed(
+        &self,
+        expected_namespace: &str,
+        observed: &ConfigMap,
+    ) -> Result<PinnedWorkerRelayCaConfigMap, ResourceBuildError> {
+        let pinned = PinnedWorkerRelayCaConfigMap::from_observed(expected_namespace, observed)?;
+        if !pinned.matches_intent(&self.name) {
+            return Err(ResourceBuildError::InvalidWorkerRelayCaConfigMap {
+                field: "metadata.name",
+            });
+        }
+        Ok(pinned)
     }
 }
 
@@ -411,15 +425,27 @@ impl LoadedWorkerProfile {
         };
         if !skills_match {
             return Err(ProfileConfigError::ClusterReferenceMismatch {
-                profile: profile_name,
+                profile: profile_name.clone(),
                 reference: "skills ConfigMap",
             });
         }
 
+        if !references
+            .relay_ca
+            .matches_intent(self.relay.ca_config_map().name())
+        {
+            return Err(ProfileConfigError::ClusterReferenceMismatch {
+                profile: profile_name,
+                reference: "worker relay CA ConfigMap",
+            });
+        }
+
         Ok(ResolvedWorkerProfile {
-            profile: self
-                .profile
-                .with_cluster_references(references.runtime_class, references.skills),
+            profile: self.profile.with_cluster_references(
+                references.runtime_class,
+                references.skills,
+                references.relay_ca,
+            ),
         })
     }
 }
@@ -428,23 +454,19 @@ impl LoadedWorkerProfile {
 pub struct ResolvedClusterReferences {
     runtime_class: Option<RuntimeClassSelection>,
     skills: Option<PinnedSkillsConfigMap>,
+    relay_ca: PinnedWorkerRelayCaConfigMap,
 }
 
 impl ResolvedClusterReferences {
-    pub fn none() -> Self {
-        Self {
-            runtime_class: None,
-            skills: None,
-        }
-    }
-
     pub fn new(
         runtime_class: Option<RuntimeClassSelection>,
         skills: Option<PinnedSkillsConfigMap>,
+        relay_ca: PinnedWorkerRelayCaConfigMap,
     ) -> Self {
         Self {
             runtime_class,
             skills,
+            relay_ca,
         }
     }
 }
