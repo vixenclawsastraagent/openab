@@ -4,11 +4,11 @@ use crate::state::{Fence, ProfileRef, SessionAnchorV1};
 use crate::wire::WorkerRegistrationV1;
 use k8s_openapi::api::core::v1::{
     Capabilities, ConfigMap, ConfigMapVolumeSource, Container, ContainerResizePolicy,
-    EmptyDirVolumeSource, EnvVar, EnvVarSource, KeyToPath, ObjectFieldSelector,
-    PersistentVolumeClaim, PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource, Pod,
-    PodOS, PodSecurityContext, PodSpec, ResourceRequirements, SeccompProfile, Secret,
-    SecretVolumeSource, SecurityContext, ServiceAccount, Toleration, Volume, VolumeMount,
-    VolumeResourceRequirements,
+    EmptyDirVolumeSource, EnvVar, EnvVarSource, KeyToPath, LocalObjectReference,
+    ObjectFieldSelector, PersistentVolumeClaim, PersistentVolumeClaimSpec,
+    PersistentVolumeClaimVolumeSource, Pod, PodOS, PodSecurityContext, PodSpec,
+    ResourceRequirements, SeccompProfile, Secret, SecretVolumeSource, SecurityContext,
+    ServiceAccount, Toleration, Volume, VolumeMount, VolumeResourceRequirements,
 };
 use k8s_openapi::api::networking::v1::{
     IPBlock, NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyPeer, NetworkPolicyPort,
@@ -49,6 +49,10 @@ const RUNTIME_NAME_ANNOTATION: &str = "openab.dev/runtime-class-name";
 const RUNTIME_HANDLER_ANNOTATION: &str = "openab.dev/runtime-class-handler";
 const RUNTIME_UID_ANNOTATION: &str = "openab.dev/runtime-class-uid";
 const RUNTIME_RESOURCE_VERSION_ANNOTATION: &str = "openab.dev/runtime-class-resource-version";
+const WORKER_RELAY_CA_NAME_ANNOTATION: &str = "openab.dev/worker-relay-ca-config-map-name";
+const WORKER_RELAY_CA_UID_ANNOTATION: &str = "openab.dev/worker-relay-ca-config-map-uid";
+const WORKER_RELAY_CA_RESOURCE_VERSION_ANNOTATION: &str =
+    "openab.dev/worker-relay-ca-config-map-resource-version";
 const WORKER_IMAGE_CONTRACT_ANNOTATION: &str = "openab.dev/worker-image-contract";
 const WORKER_IMAGE_CONTRACT: &str = "session-layout-v1";
 /// Fixed key containing the worker relay trust bundle.
@@ -62,6 +66,9 @@ const BINDING_KEY: &str = "binding.json";
 const TOKEN_DIRECTORY: &str = "/var/run/openab-registration";
 const TOKEN_FILE: &str = "/var/run/openab-registration/token";
 const BINDING_FILE: &str = "/var/run/openab-registration/binding.json";
+const WORKER_RELAY_CA_VOLUME: &str = "controller-ca";
+const WORKER_RELAY_CA_DIRECTORY: &str = "/var/run/openab-controller-ca";
+const WORKER_RELAY_CA_FILE: &str = "/var/run/openab-controller-ca/ca.crt";
 const SESSION_ROOT: &str = "/session";
 const SESSION_HOME: &str = "/session/home";
 /// Writable workspace root promised by the `session-layout-v1` worker image.
@@ -936,6 +943,13 @@ fn validate_certificate_only_envelope(bytes: &[u8]) -> Result<(), ResourceBuildE
     Ok(())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkerTransportProfile {
+    relay_url: String,
+    relay_ca: PinnedWorkerRelayCaConfigMap,
+    image_pull_secrets: Vec<String>,
+}
+
 /// A narrow, immutable worker profile.
 ///
 /// Images admitted to a profile must implement the `session-layout-v1`
@@ -957,7 +971,7 @@ pub struct MvpWorkerProfile {
     identity: RunAsIdentity,
     runtime_class: Option<RuntimeClassSelection>,
     skills: Option<PinnedSkillsConfigMap>,
-    relay_ca: Option<PinnedWorkerRelayCaConfigMap>,
+    transport: Option<WorkerTransportProfile>,
 }
 
 impl MvpWorkerProfile {
@@ -1014,7 +1028,7 @@ impl MvpWorkerProfile {
             identity,
             runtime_class,
             skills,
-            relay_ca: None,
+            transport: None,
         })
     }
 
@@ -1028,16 +1042,22 @@ impl MvpWorkerProfile {
         mut self,
         runtime_class: Option<RuntimeClassSelection>,
         skills: Option<PinnedSkillsConfigMap>,
+        relay_url: String,
         relay_ca: PinnedWorkerRelayCaConfigMap,
+        image_pull_secrets: Vec<String>,
     ) -> Self {
         self.runtime_class = runtime_class;
         self.skills = skills;
-        self.relay_ca = Some(relay_ca);
+        self.transport = Some(WorkerTransportProfile {
+            relay_url,
+            relay_ca,
+            image_pull_secrets,
+        });
         self
     }
 
     pub fn relay_ca_config_map(&self) -> Option<&PinnedWorkerRelayCaConfigMap> {
-        self.relay_ca.as_ref()
+        self.transport.as_ref().map(|transport| &transport.relay_ca)
     }
 }
 
@@ -1046,6 +1066,7 @@ pub struct DesiredGeneration {
     context: GenerationContext,
     skills: Option<PinnedSkillsConfigMap>,
     runtime_class: Option<RuntimeClassSelection>,
+    relay_ca: Option<PinnedWorkerRelayCaConfigMap>,
     persistent_volume_claim: PersistentVolumeClaim,
     registration_secret: Secret,
     service_account: ServiceAccount,
@@ -1075,6 +1096,10 @@ impl DesiredGeneration {
         if profile.profile != context.profile {
             return Err(ResourceBuildError::ProfileMismatch);
         }
+        let worker_transport = profile.transport.clone();
+        let relay_ca = worker_transport
+            .as_ref()
+            .map(|transport| transport.relay_ca.clone());
 
         let generation = context.fence.generation();
         let pod_name = context
@@ -1140,6 +1165,7 @@ impl DesiredGeneration {
                 "registration-secret",
                 profile.skills.as_ref(),
                 profile.runtime_class.as_ref(),
+                relay_ca.as_ref(),
             ),
             string_data: None,
             type_: Some("Opaque".into()),
@@ -1154,6 +1180,7 @@ impl DesiredGeneration {
                 "worker-service-account",
                 profile.skills.as_ref(),
                 profile.runtime_class.as_ref(),
+                relay_ca.as_ref(),
             ),
             secrets: None,
         };
@@ -1233,6 +1260,38 @@ impl DesiredGeneration {
                 ..VolumeMount::default()
             });
         }
+        if let Some(transport) = worker_transport.as_ref() {
+            volumes.push(Volume {
+                name: WORKER_RELAY_CA_VOLUME.into(),
+                config_map: Some(ConfigMapVolumeSource {
+                    default_mode: Some(0o444),
+                    items: Some(vec![KeyToPath {
+                        key: WORKER_RELAY_CA_CONFIG_MAP_KEY.into(),
+                        mode: None,
+                        path: WORKER_RELAY_CA_CONFIG_MAP_KEY.into(),
+                    }]),
+                    name: transport.relay_ca.name.clone(),
+                    optional: Some(false),
+                }),
+                ..Volume::default()
+            });
+            volume_mounts.push(VolumeMount {
+                mount_path: WORKER_RELAY_CA_DIRECTORY.into(),
+                name: WORKER_RELAY_CA_VOLUME.into(),
+                read_only: Some(true),
+                ..VolumeMount::default()
+            });
+        }
+
+        let image_pull_secrets = worker_transport.as_ref().and_then(|transport| {
+            (!transport.image_pull_secrets.is_empty()).then(|| {
+                transport
+                    .image_pull_secrets
+                    .iter()
+                    .map(|name| LocalObjectReference { name: name.clone() })
+                    .collect()
+            })
+        });
 
         let identity = profile.identity;
         let pod = Pod {
@@ -1242,30 +1301,14 @@ impl DesiredGeneration {
                 "worker-pod",
                 profile.skills.as_ref(),
                 profile.runtime_class.as_ref(),
+                relay_ca.as_ref(),
             ),
             spec: Some(PodSpec {
                 automount_service_account_token: Some(false),
                 containers: vec![Container {
                     args: Some(profile.args),
                     command: Some(profile.command),
-                    env: Some(vec![
-                        literal_env("HOME", SESSION_HOME),
-                        literal_env("OPENAB_WORKSPACE", SESSION_WORKSPACE_V1),
-                        literal_env("OPENAB_SESSION_ROOT", SESSION_ROOT),
-                        literal_env("OPENAB_REGISTRATION_TOKEN_FILE", TOKEN_FILE),
-                        literal_env("OPENAB_REGISTRATION_BINDING_FILE", BINDING_FILE),
-                        EnvVar {
-                            name: "OPENAB_WORKER_POD_UID".into(),
-                            value: None,
-                            value_from: Some(EnvVarSource {
-                                field_ref: Some(ObjectFieldSelector {
-                                    api_version: Some("v1".into()),
-                                    field_path: "metadata.uid".into(),
-                                }),
-                                ..EnvVarSource::default()
-                            }),
-                        },
-                    ]),
+                    env: Some(worker_environment(worker_transport.as_ref())),
                     image: Some(profile.image),
                     image_pull_policy: Some("IfNotPresent".into()),
                     name: "worker".into(),
@@ -1295,6 +1338,7 @@ impl DesiredGeneration {
                 host_ipc: None,
                 host_network: None,
                 host_pid: None,
+                image_pull_secrets,
                 node_selector: Some(BTreeMap::from([(
                     "kubernetes.io/os".into(),
                     "linux".into(),
@@ -1338,6 +1382,7 @@ impl DesiredGeneration {
                 "worker-network-policy",
                 profile.skills.as_ref(),
                 profile.runtime_class.as_ref(),
+                relay_ca.as_ref(),
             ),
             spec: Some(NetworkPolicySpec {
                 egress: Some(
@@ -1359,6 +1404,7 @@ impl DesiredGeneration {
             context,
             skills: profile.skills,
             runtime_class: profile.runtime_class,
+            relay_ca,
             persistent_volume_claim,
             registration_secret,
             service_account,
@@ -1403,6 +1449,10 @@ impl DesiredGeneration {
         self.runtime_class
             .as_ref()
             .map(|runtime_class| runtime_class.name.as_str())
+    }
+
+    pub fn relay_ca_config_map(&self) -> Option<&PinnedWorkerRelayCaConfigMap> {
+        self.relay_ca.as_ref()
     }
 
     pub fn validate_persistent_volume_claim(
@@ -1621,6 +1671,7 @@ fn metadata(
     resource: &'static str,
     skills: Option<&PinnedSkillsConfigMap>,
     runtime_class: Option<&RuntimeClassSelection>,
+    relay_ca: Option<&PinnedWorkerRelayCaConfigMap>,
 ) -> ObjectMeta {
     let mut annotations = BTreeMap::from([
         (SCOPE_ANNOTATION.into(), context.scope_id.as_hex()),
@@ -1670,6 +1721,17 @@ fn metadata(
         annotations.insert(
             RUNTIME_RESOURCE_VERSION_ANNOTATION.into(),
             runtime_class.resource_version.clone(),
+        );
+    }
+    if let Some(relay_ca) = relay_ca {
+        annotations.insert(
+            WORKER_RELAY_CA_NAME_ANNOTATION.into(),
+            relay_ca.name.clone(),
+        );
+        annotations.insert(WORKER_RELAY_CA_UID_ANNOTATION.into(), relay_ca.uid.clone());
+        annotations.insert(
+            WORKER_RELAY_CA_RESOURCE_VERSION_ANNOTATION.into(),
+            relay_ca.resource_version.clone(),
         );
     }
     ObjectMeta {
@@ -1948,6 +2010,44 @@ fn is_default_resize_policy(policies: &[ContainerResizePolicy]) -> bool {
         }
     }
     cpu && memory
+}
+
+fn worker_environment(transport: Option<&WorkerTransportProfile>) -> Vec<EnvVar> {
+    if let Some(transport) = transport {
+        vec![
+            literal_env("OPENAB_SESSION_CONTROLLER_URL", &transport.relay_url),
+            literal_env("OPENAB_SESSION_CONTROLLER_CA_FILE", WORKER_RELAY_CA_FILE),
+            literal_env("OPENAB_REGISTRATION_TOKEN_FILE", TOKEN_FILE),
+            literal_env("OPENAB_REGISTRATION_BINDING_FILE", BINDING_FILE),
+            worker_pod_uid_env(),
+            literal_env("OPENAB_SESSION_ROOT", SESSION_ROOT),
+            literal_env("OPENAB_WORKSPACE", SESSION_WORKSPACE_V1),
+            literal_env("HOME", SESSION_HOME),
+        ]
+    } else {
+        vec![
+            literal_env("HOME", SESSION_HOME),
+            literal_env("OPENAB_WORKSPACE", SESSION_WORKSPACE_V1),
+            literal_env("OPENAB_SESSION_ROOT", SESSION_ROOT),
+            literal_env("OPENAB_REGISTRATION_TOKEN_FILE", TOKEN_FILE),
+            literal_env("OPENAB_REGISTRATION_BINDING_FILE", BINDING_FILE),
+            worker_pod_uid_env(),
+        ]
+    }
+}
+
+fn worker_pod_uid_env() -> EnvVar {
+    EnvVar {
+        name: "OPENAB_WORKER_POD_UID".into(),
+        value: None,
+        value_from: Some(EnvVarSource {
+            field_ref: Some(ObjectFieldSelector {
+                api_version: Some("v1".into()),
+                field_path: "metadata.uid".into(),
+            }),
+            ..EnvVarSource::default()
+        }),
+    }
 }
 
 fn literal_env(name: &str, value: &str) -> EnvVar {

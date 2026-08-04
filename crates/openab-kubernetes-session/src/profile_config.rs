@@ -440,11 +440,21 @@ impl LoadedWorkerProfile {
             });
         }
 
+        let relay_url = self.relay.url().as_str().to_owned();
+        let image_pull_secrets = self
+            .image_pull_secrets
+            .0
+            .into_iter()
+            .map(|name| name.0)
+            .collect();
+
         Ok(ResolvedWorkerProfile {
             profile: self.profile.with_cluster_references(
                 references.runtime_class,
                 references.skills,
+                relay_url,
                 references.relay_ca,
+                image_pull_secrets,
             ),
         })
     }

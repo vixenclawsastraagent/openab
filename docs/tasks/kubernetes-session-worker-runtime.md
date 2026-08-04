@@ -102,7 +102,7 @@ tests pass.
   - Verify: `cargo test --manifest-path crates/openab-kubernetes-session/Cargo.toml --locked --all-features --test profile_resolution`.
   - Commit: `feat(kubernetes): pin worker relay CA`.
 
-- [ ] **Task 4 — Render the exact worker Pod transport resources.**
+- [x] **Task 4 — Render the exact worker Pod transport resources.**
   - Depends on: Tasks 2–3.
   - Test first: extend `tests/resource_builder.rs` with exact env, read-only
     CA volume/mount, `defaultMode`, pin annotations, and deduplicated
@@ -116,7 +116,7 @@ tests pass.
   - Acceptance: two sessions may reference the same immutable CA and skills
     objects but share no writable volume or ServiceAccount.
   - Verify: `cargo test --manifest-path crates/openab-kubernetes-session/Cargo.toml --locked --all-features --test resource_builder`.
-  - Commit: `feat(kubernetes): inject worker transport resources`.
+  - Commit: `feat(kubernetes): render worker transport`.
 
 - [ ] **Task 5 — Revalidate CA identity at both consumption boundaries.**
   - Depends on: Task 4.
