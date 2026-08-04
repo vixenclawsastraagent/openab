@@ -122,6 +122,17 @@ pub fn client_connector(
     build_client_connector(native_roots, private_roots).map(Some)
 }
 
+/// Validate one bounded certificate-only private CA bundle without loading
+/// platform roots or constructing a connector.
+pub fn validate_client_ca_pem(pem: &[u8]) -> Result<(), PrivateCaError> {
+    read_private_ca_certificates(&mut Cursor::new(pem)).map(drop)
+}
+
+/// Validate the one worker relay URL without constructing a secret header.
+pub fn validate_worker_controller_url(controller_url: &str) -> Result<(), ClientRequestError> {
+    validate_client_uri(controller_url, "/v1/worker").map(drop)
+}
+
 fn build_client_connector(
     native_roots: Vec<rustls::pki_types::CertificateDer<'static>>,
     private_roots: Vec<rustls::pki_types::CertificateDer<'static>>,
@@ -145,31 +156,7 @@ pub fn build_client_request(
     endpoint: ClientEndpoint<'_>,
     controller_url: &str,
 ) -> Result<Request, ClientRequestError> {
-    if controller_url.len() > MAX_CLIENT_URL_BYTES {
-        return Err(ClientRequestError::UrlTooLarge);
-    }
-    if controller_url.contains('#') {
-        return Err(ClientRequestError::InvalidUrl);
-    }
-    let uri = controller_url
-        .parse::<Uri>()
-        .map_err(|_| ClientRequestError::InvalidUrl)?;
-    let authority = uri.authority().ok_or(ClientRequestError::InvalidUrl)?;
-    let explicit_port = authority
-        .as_str()
-        .strip_prefix(authority.host())
-        .ok_or(ClientRequestError::InvalidUrl)?;
-    let port_is_valid = explicit_port.is_empty()
-        || (explicit_port.starts_with(':') && authority.port_u16().is_some());
-    if uri.scheme_str() != Some("wss")
-        || authority.host().is_empty()
-        || authority.as_str().contains('@')
-        || !port_is_valid
-        || uri.query().is_some()
-        || uri.path() != endpoint.path()
-    {
-        return Err(ClientRequestError::InvalidUrl);
-    }
+    let uri = validate_client_uri(controller_url, endpoint.path())?;
     let mut request = uri
         .into_client_request()
         .map_err(|_| ClientRequestError::InvalidRequest)?;
@@ -198,6 +185,38 @@ pub fn build_client_request(
         }
     }
     Ok(request)
+}
+
+fn validate_client_uri(
+    controller_url: &str,
+    expected_path: &'static str,
+) -> Result<Uri, ClientRequestError> {
+    if controller_url.len() > MAX_CLIENT_URL_BYTES {
+        return Err(ClientRequestError::UrlTooLarge);
+    }
+    if controller_url.contains('#') {
+        return Err(ClientRequestError::InvalidUrl);
+    }
+    let uri = controller_url
+        .parse::<Uri>()
+        .map_err(|_| ClientRequestError::InvalidUrl)?;
+    let authority = uri.authority().ok_or(ClientRequestError::InvalidUrl)?;
+    let explicit_port = authority
+        .as_str()
+        .strip_prefix(authority.host())
+        .ok_or(ClientRequestError::InvalidUrl)?;
+    let port_is_valid = explicit_port.is_empty()
+        || (explicit_port.starts_with(':') && authority.port_u16().is_some());
+    if uri.scheme_str() != Some("wss")
+        || authority.host().is_empty()
+        || authority.as_str().contains('@')
+        || !port_is_valid
+        || uri.query().is_some()
+        || uri.path() != expected_path
+    {
+        return Err(ClientRequestError::InvalidUrl);
+    }
+    Ok(uri)
 }
 
 fn insert_sensitive_bearer(

@@ -20,3 +20,6 @@ pub mod resources;
 
 #[cfg(feature = "controller")]
 pub mod store;
+
+#[cfg(feature = "worker-runtime")]
+pub mod worker;

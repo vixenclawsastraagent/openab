@@ -26,6 +26,11 @@ bridge-runtime = [
     "tokio/io-std",
     "tokio/net",
 ]
+worker-runtime = [
+    "client-transport",
+    "dep:tokio",
+    "tokio/signal",
+]
 controller = [
     "dep:futures-util",
     "dep:getrandom",
@@ -103,3 +108,8 @@ required-features = ["bridge-runtime"]
 name = "openab-kubernetes-session-controller"
 path = "src/bin/openab-kubernetes-session-controller.rs"
 required-features = ["controller-runtime"]
+
+[[bin]]
+name = "openab-kubernetes-session-worker"
+path = "src/bin/openab-kubernetes-session-worker.rs"
+required-features = ["worker-runtime"]

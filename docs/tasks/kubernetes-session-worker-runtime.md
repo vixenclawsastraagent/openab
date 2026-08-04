@@ -164,7 +164,7 @@ shared read-only while all mutable state remains session-private.
     - `cargo test --manifest-path crates/openab-kubernetes-session/Cargo.toml --locked --all-features --test bridge_websocket`
   - Commit: `refactor(kubernetes): share WSS client transport`.
 
-- [ ] **Task 7 — Add the worker feature, CLI grammar, and bootstrap loader.**
+- [x] **Task 7 — Add the worker feature, CLI grammar, and bootstrap loader.**
   - Depends on: Tasks 2 and 6.
   - Test first: add parser/loader tests for `serve -- <absolute executable>`,
     the fixed environment, exactly 32 raw token bytes, at-most-4-KiB bare
@@ -180,6 +180,7 @@ shared read-only while all mutable state remains session-private.
     secrets are not present in `Debug`, argv, or logs.
   - Verify:
     - `cargo test --manifest-path crates/openab-kubernetes-session/Cargo.toml --locked --features worker-runtime --test worker_bootstrap`
+    - `cargo test --manifest-path crates/openab-kubernetes-session/Cargo.toml --locked --features worker-runtime --bin openab-kubernetes-session-worker`
     - `cargo check --manifest-path crates/openab-kubernetes-session/Cargo.toml --locked --no-default-features`
   - Commit: `feat(kubernetes): load worker bootstrap`.
 
