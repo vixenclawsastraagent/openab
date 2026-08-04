@@ -255,6 +255,24 @@ inherit_env = ["HTTPS_PROXY"]
     }
 
     #[test]
+    fn kubernetes_session_and_broker_local_mcp_can_coexist() {
+        let cfg = parse_config_str(
+            &valid_config(
+                r#"
+[mcp]
+listen = "127.0.0.1:8848"
+"#,
+            ),
+            "test",
+        )
+        .unwrap();
+
+        assert!(cfg.kubernetes_session.is_some());
+        assert!(cfg.mcp.is_some());
+        assert_eq!(cfg.agent.command, "openab-kubernetes-session");
+    }
+
+    #[test]
     fn kubernetes_session_appends_controller_ca_file_to_bridge_args() {
         const CONTROLLER_CA_FILE: &str = "/var/run/secrets/openab-session/ca.crt";
         let cfg = parse_config_str(
@@ -400,6 +418,36 @@ inherit_env = ["openab_session_mapping_expectation"]
         assert!(err
             .to_string()
             .contains("OPENAB_SESSION_MAPPING_EXPECTATION"));
+    }
+
+    #[test]
+    fn kubernetes_session_rejects_configured_facade_token_case_insensitively() {
+        let err = parse_config_str(
+            &valid_config(
+                r#"
+[agent.env]
+openab_session_token = "broker-local-token"
+"#,
+            ),
+            "test",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("OPENAB_SESSION_TOKEN"));
+    }
+
+    #[test]
+    fn kubernetes_session_rejects_inherited_facade_token_case_insensitively() {
+        let err = parse_config_str(
+            &valid_config(
+                r#"
+[agent]
+inherit_env = ["openab_session_token"]
+"#,
+            ),
+            "test",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("OPENAB_SESSION_TOKEN"));
     }
 
     #[test]
@@ -586,6 +634,7 @@ bot_token = "x"
 OPENAB_SESSION_KEY = "legacy-value"
 OPENAB_SESSION_ATTEMPT_ID = "legacy-attempt"
 OPENAB_SESSION_MAPPING_EXPECTATION = "legacy-expectation"
+OPENAB_SESSION_TOKEN = "legacy-facade-token"
 "#,
             "test",
         )
@@ -597,6 +646,10 @@ OPENAB_SESSION_MAPPING_EXPECTATION = "legacy-expectation"
         assert_eq!(
             cfg.agent.env["OPENAB_SESSION_MAPPING_EXPECTATION"],
             "legacy-expectation"
+        );
+        assert_eq!(
+            cfg.agent.env["OPENAB_SESSION_TOKEN"],
+            "legacy-facade-token"
         );
     }
 }
