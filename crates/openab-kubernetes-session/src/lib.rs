@@ -3,6 +3,9 @@ pub mod identity;
 pub mod state;
 pub mod wire;
 
+#[cfg(feature = "client-transport")]
+pub mod client_transport;
+
 #[cfg(feature = "controller")]
 pub mod controller;
 

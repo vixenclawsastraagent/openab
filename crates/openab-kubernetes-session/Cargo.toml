@@ -10,17 +10,21 @@ license = "MIT"
 
 [features]
 default = []
-bridge-runtime = [
-    "dep:futures-util",
+client-transport = [
     "dep:rustls",
     "dep:rustls-native-certs",
     "dep:rustls-pemfile",
-    "dep:tokio",
     "dep:tokio-tungstenite",
-    "tokio/io-std",
-    "tokio/net",
+    "dep:zeroize",
     "tokio-tungstenite/connect",
     "tokio-tungstenite/rustls-tls-native-roots",
+]
+bridge-runtime = [
+    "client-transport",
+    "dep:futures-util",
+    "dep:tokio",
+    "tokio/io-std",
+    "tokio/net",
 ]
 controller = [
     "dep:futures-util",

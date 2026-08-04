@@ -142,7 +142,7 @@ shared read-only while all mutable state remains session-private.
 
 ## Stage C: build the one-shot worker runtime
 
-- [ ] **Task 6 — Extract the closed WSS client transport.**
+- [x] **Task 6 — Extract the closed WSS client transport.**
   - Depends on: Task 1; may run in parallel with Tasks 2–5 after the profile
     field names and CA path are frozen.
   - Test first: add focused client-transport tests for exactly `/v1/bridge` and
@@ -160,6 +160,7 @@ shared read-only while all mutable state remains session-private.
     no kube/controller dependency enters the worker feature.
   - Verify:
     - `cargo test --manifest-path crates/openab-kubernetes-session/Cargo.toml --locked --all-features --test client_transport`
+    - `cargo test --manifest-path crates/openab-kubernetes-session/Cargo.toml --locked --all-features --lib client_transport::tests`
     - `cargo test --manifest-path crates/openab-kubernetes-session/Cargo.toml --locked --all-features --test bridge_websocket`
   - Commit: `refactor(kubernetes): share WSS client transport`.
 

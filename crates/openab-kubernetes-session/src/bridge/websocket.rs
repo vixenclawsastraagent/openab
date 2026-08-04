@@ -3,6 +3,7 @@ use super::{
     parse_logical_message, BridgeAction, BridgeIdentity, BridgeKernel, BridgeProtocolError,
     ControllerError, ControllerLifecycleAction, MAX_LOGICAL_MESSAGE_BYTES,
 };
+use crate::client_transport::client_websocket_config;
 use crate::wire::{
     decode_frame, encode_frame, AcpMessageV1, ActivationRequestV1, BridgeToControllerV1,
     BrokerMappingExpectationV1, ControllerToBridgeV1, HandshakeOutcomeV1, LifecycleRequestV1,
@@ -24,14 +25,7 @@ const MAX_BROKER_LINE_BYTES: usize = MAX_LOGICAL_MESSAGE_BYTES + 2;
 
 /// Finite transport limits for a connected broker-side relay socket.
 pub fn bridge_websocket_config() -> WebSocketConfig {
-    WebSocketConfig {
-        write_buffer_size: 0,
-        max_write_buffer_size: MAX_ACP_FRAME_BYTES + MAX_CONTROL_FRAME_BYTES,
-        max_message_size: Some(MAX_ACP_FRAME_BYTES),
-        max_frame_size: Some(MAX_ACP_FRAME_BYTES),
-        accept_unmasked_frames: false,
-        ..WebSocketConfig::default()
-    }
+    client_websocket_config()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
