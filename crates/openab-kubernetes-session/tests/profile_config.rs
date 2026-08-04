@@ -6,8 +6,9 @@ use k8s_openapi::api::node::v1::RuntimeClass;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
 use openab_kubernetes_session::identity::{ResourceNames, ScopeId, SessionId};
 use openab_kubernetes_session::profile_config::{
-    ControllerPolicy, ResolvedClusterReferences, TrustedControllerConfigV1, MAX_ACTIVE_WORKERS,
-    MAX_LIFECYCLE_TTL_SECONDS, MAX_PROFILE_CONFIG_BYTES,
+    ControllerPolicy, ProfileConfigError, ResolvedClusterReferences, TrustedControllerConfigV1,
+    MAX_ACTIVE_WORKERS, MAX_IMAGE_PULL_SECRETS, MAX_LIFECYCLE_TTL_SECONDS,
+    MAX_PROFILE_CONFIG_BYTES, MAX_WORKER_RELAY_URL_BYTES,
 };
 use openab_kubernetes_session::resources::{
     AllowedRuntimeClass, DesiredGeneration, GenerationContext, PinnedSkillsConfigMap,
@@ -34,6 +35,11 @@ current_version = "2026-08-01"
 
 [profiles.codex-strict.revisions."2026-08-01"]
 image = "ghcr.io/example/openab-worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+image_pull_secrets = ["ghcr-pull"]
+
+[profiles.codex-strict.revisions."2026-08-01".relay]
+url = "wss://openab-session-controller.openab-system.svc:8443/v1/worker"
+ca_config_map_name = "openab-session-controller-ca-2026-08"
 
 [profiles.codex-strict.revisions."2026-08-01".supervisor]
 executable = "/usr/local/bin/openab-session-supervisor"
@@ -75,6 +81,25 @@ pod_labels = { "app.kubernetes.io/name" = "openab-session-controller" }
 protocol = "tcp"
 port = 8443
 "#;
+
+const VALID_RELAY_URL: &str = "wss://openab-session-controller.openab-system.svc:8443/v1/worker";
+
+fn with_relay_url(url: &str) -> String {
+    VALID_CONFIG.replacen(VALID_RELAY_URL, url, 1)
+}
+
+fn with_image_pull_secrets(names: &[String]) -> String {
+    let values = names
+        .iter()
+        .map(|name| format!("\"{name}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    VALID_CONFIG.replacen(
+        "image_pull_secrets = [\"ghcr-pull\"]",
+        &format!("image_pull_secrets = [{values}]"),
+        1,
+    )
+}
 
 fn with_second_revision(current_version: &str) -> String {
     let revision_start = VALID_CONFIG
@@ -187,6 +212,223 @@ fn controller_config_builds_policy_and_existing_worker_domain_types() {
 }
 
 #[test]
+fn profile_accepts_the_exact_worker_relay_and_bounded_pull_secret_contract() {
+    let config = TrustedControllerConfigV1::from_toml(VALID_CONFIG).unwrap();
+    let profile = config.profile("codex-strict").unwrap();
+    assert_eq!(profile.relay().url().as_str(), VALID_RELAY_URL);
+    assert_eq!(
+        profile.relay().ca_config_map().name(),
+        "openab-session-controller-ca-2026-08"
+    );
+    assert_eq!(
+        profile
+            .image_pull_secrets()
+            .iter()
+            .map(|name| name.as_str())
+            .collect::<Vec<_>>(),
+        ["ghcr-pull"]
+    );
+
+    let exact_url = format!(
+        "wss://{}/v1/worker",
+        "a".repeat(MAX_WORKER_RELAY_URL_BYTES - "wss://".len() - "/v1/worker".len())
+    );
+    assert_eq!(exact_url.len(), MAX_WORKER_RELAY_URL_BYTES);
+    assert!(TrustedControllerConfigV1::from_toml(&with_relay_url(&exact_url)).is_ok());
+    assert!(TrustedControllerConfigV1::from_toml(&with_relay_url(
+        &VALID_RELAY_URL.replacen(":8443", "", 1)
+    ))
+    .is_ok());
+    for url in [
+        "wss://openab-session-controller.openab-system.svc:65535/v1/worker",
+        "wss://[2001:db8::1]:8443/v1/worker",
+        "wss://[2001:db8::1]/v1/worker",
+    ] {
+        assert!(TrustedControllerConfigV1::from_toml(&with_relay_url(url)).is_ok());
+    }
+
+    let exact_secret_count = (0..MAX_IMAGE_PULL_SECRETS)
+        .map(|index| format!("registry-{index}"))
+        .collect::<Vec<_>>();
+    let exact_secret_config =
+        TrustedControllerConfigV1::from_toml(&with_image_pull_secrets(&exact_secret_count))
+            .unwrap();
+    assert_eq!(
+        exact_secret_config
+            .profile("codex-strict")
+            .unwrap()
+            .image_pull_secrets()
+            .iter()
+            .map(|name| name.as_str())
+            .collect::<Vec<_>>(),
+        exact_secret_count
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    );
+
+    let without_pull_secrets =
+        VALID_CONFIG.replacen("image_pull_secrets = [\"ghcr-pull\"]\n", "", 1);
+    let without_pull_secrets = TrustedControllerConfigV1::from_toml(&without_pull_secrets).unwrap();
+    assert!(without_pull_secrets
+        .profile("codex-strict")
+        .unwrap()
+        .image_pull_secrets()
+        .is_empty());
+    assert!(TrustedControllerConfigV1::from_toml(&with_image_pull_secrets(&[])).is_ok());
+}
+
+#[test]
+fn profile_rejects_unsafe_or_non_worker_relay_urls_without_echoing_them() {
+    const SENTINEL: &str = "do-not-log-relay-token";
+    let oversized_url = format!(
+        "wss://{}/v1/worker",
+        "a".repeat(MAX_WORKER_RELAY_URL_BYTES + 1 - "wss://".len() - "/v1/worker".len())
+    );
+    assert_eq!(oversized_url.len(), MAX_WORKER_RELAY_URL_BYTES + 1);
+    let invalid_urls = [
+        "ws://openab-session-controller.openab-system.svc:8443/v1/worker".to_string(),
+        "https://openab-session-controller.openab-system.svc:8443/v1/worker".to_string(),
+        "/v1/worker".to_string(),
+        "wss:///v1/worker".to_string(),
+        "wss://:8443/v1/worker".to_string(),
+        "wss://openab-session-controller.openab-system.svc:/v1/worker".to_string(),
+        "wss://openab-session-controller.openab-system.svc:not-a-port/v1/worker".to_string(),
+        "wss://openab-session-controller.openab-system.svc:65536/v1/worker".to_string(),
+        "wss://operator@openab-session-controller.openab-system.svc:8443/v1/worker".to_string(),
+        "wss://operator:password@openab-session-controller.openab-system.svc:8443/v1/worker"
+            .to_string(),
+        format!("{VALID_RELAY_URL}?"),
+        format!("{VALID_RELAY_URL}?token={SENTINEL}"),
+        format!("{VALID_RELAY_URL}#"),
+        format!("{VALID_RELAY_URL}#{SENTINEL}"),
+        "wss://openab-session-controller.openab-system.svc:8443/v1/bridge".to_string(),
+        "wss://openab-session-controller.openab-system.svc:8443/v1/./worker".to_string(),
+        "wss://openab-session-controller.openab-system.svc:8443/v1%2Fworker".to_string(),
+        format!("{VALID_RELAY_URL}/"),
+        oversized_url,
+    ];
+
+    for url in invalid_urls {
+        let error = TrustedControllerConfigV1::from_toml(&with_relay_url(&url))
+            .expect_err("invalid relay URL must fail closed");
+        assert!(matches!(&error, ProfileConfigError::InvalidWorkerRelayUrl));
+        assert!(!error.to_string().contains(SENTINEL));
+        assert!(!format!("{error:?}").contains(SENTINEL));
+    }
+}
+
+#[test]
+fn profile_requires_the_complete_relay_block() {
+    let relay_block = format!(
+        "[profiles.codex-strict.revisions.\"2026-08-01\".relay]\nurl = \"{VALID_RELAY_URL}\"\nca_config_map_name = \"openab-session-controller-ca-2026-08\"\n\n"
+    );
+    let missing_relay = VALID_CONFIG.replacen(&relay_block, "", 1);
+    let missing_url = VALID_CONFIG.replacen(&format!("url = \"{VALID_RELAY_URL}\"\n"), "", 1);
+    let missing_ca = VALID_CONFIG.replacen(
+        "ca_config_map_name = \"openab-session-controller-ca-2026-08\"\n",
+        "",
+        1,
+    );
+
+    for invalid in [missing_relay, missing_url, missing_ca] {
+        assert!(matches!(
+            TrustedControllerConfigV1::from_toml(&invalid),
+            Err(ProfileConfigError::Decode)
+        ));
+    }
+}
+
+#[test]
+fn profile_rejects_invalid_ca_and_pull_secret_names() {
+    const SENTINEL: &str = "do-not-log-config-map-name";
+    let exact_name = [
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(61),
+    ]
+    .join(".");
+    assert_eq!(exact_name.len(), 253);
+    let exact_ca = VALID_CONFIG.replacen("openab-session-controller-ca-2026-08", &exact_name, 1);
+    assert!(TrustedControllerConfigV1::from_toml(&exact_ca).is_ok());
+    assert!(
+        TrustedControllerConfigV1::from_toml(&with_image_pull_secrets(std::slice::from_ref(
+            &exact_name
+        )))
+        .is_ok()
+    );
+
+    let oversized_name = [
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(62),
+    ]
+    .join(".");
+    assert_eq!(oversized_name.len(), 254);
+    let invalid_ca_names = vec![
+        String::new(),
+        "UPPERCASE".to_string(),
+        "contains_underscore".to_string(),
+        ".starts-with-dot".to_string(),
+        "ends-with-dot.".to_string(),
+        "a..b".to_string(),
+        "-starts-with-hyphen".to_string(),
+        "ends-with-hyphen-".to_string(),
+        "a".repeat(64),
+        oversized_name,
+    ];
+    for name in &invalid_ca_names {
+        let invalid = VALID_CONFIG.replacen(
+            "ca_config_map_name = \"openab-session-controller-ca-2026-08\"",
+            &format!("ca_config_map_name = \"{name}\""),
+            1,
+        );
+        assert!(matches!(
+            TrustedControllerConfigV1::from_toml(&invalid),
+            Err(ProfileConfigError::InvalidWorkerRelayCaConfigMapName)
+        ));
+    }
+
+    for name in invalid_ca_names {
+        assert!(matches!(
+            TrustedControllerConfigV1::from_toml(&with_image_pull_secrets(&[name])),
+            Err(ProfileConfigError::InvalidImagePullSecretName)
+        ));
+    }
+
+    let sentinel_name = format!("invalid_{SENTINEL}");
+    let invalid = VALID_CONFIG.replacen(
+        "ca_config_map_name = \"openab-session-controller-ca-2026-08\"",
+        &format!("ca_config_map_name = \"{sentinel_name}\""),
+        1,
+    );
+    let error = TrustedControllerConfigV1::from_toml(&invalid).unwrap_err();
+    assert!(!error.to_string().contains(SENTINEL));
+    assert!(!format!("{error:?}").contains(SENTINEL));
+}
+
+#[test]
+fn profile_rejects_excessive_or_duplicate_pull_secrets() {
+    let excessive = (0..=MAX_IMAGE_PULL_SECRETS)
+        .map(|index| format!("registry-{index}"))
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        TrustedControllerConfigV1::from_toml(&with_image_pull_secrets(&excessive)),
+        Err(ProfileConfigError::TooManyImagePullSecrets)
+    ));
+
+    assert!(matches!(
+        TrustedControllerConfigV1::from_toml(&with_image_pull_secrets(&[
+            "same-registry".to_string(),
+            "same-registry".to_string(),
+        ])),
+        Err(ProfileConfigError::DuplicateImagePullSecret)
+    ));
+}
+
+#[test]
 fn controller_config_keeps_historical_revisions_but_selects_one_current_revision() {
     let config = TrustedControllerConfigV1::from_toml(&with_second_revision("2026-08-02"))
         .expect("two valid revisions");
@@ -249,6 +491,11 @@ current_version = "2026-08-01"
 fn every_dto_level_rejects_unknown_fields_including_transport_and_secrets() {
     let cases = [
         format!("relay_url = \"wss://forbidden.example\"\n{VALID_CONFIG}"),
+        VALID_CONFIG.replacen(
+            "ca_config_map_name = \"openab-session-controller-ca-2026-08\"",
+            "ca_config_map_name = \"openab-session-controller-ca-2026-08\"\ncredential = \"forbidden\"",
+            1,
+        ),
         VALID_CONFIG.replacen(
             "max_active_workers = 20",
             "max_active_workers = 20\nunknown = true",

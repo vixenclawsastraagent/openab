@@ -44,6 +44,10 @@ config_map_name = "{name}"
 [profiles.{profile}.revisions."{version}"]
 image = "ghcr.io/example/openab-worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
+[profiles.{profile}.revisions."{version}".relay]
+url = "wss://openab-session-controller.openab-system.svc:8443/v1/worker"
+ca_config_map_name = "openab-session-controller-ca-v1"
+
 [profiles.{profile}.revisions."{version}".supervisor]
 executable = "/usr/local/bin/openab-session-supervisor"
 args = ["serve"]

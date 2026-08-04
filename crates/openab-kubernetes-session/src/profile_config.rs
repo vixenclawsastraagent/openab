@@ -4,10 +4,11 @@ use crate::resources::{
     TrustedEgressRule, WorkerResources,
 };
 use crate::state::{validate_profile_name, ProfileRef, StateError};
+use http::Uri;
 use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::api::node::v1::RuntimeClass;
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::time::Duration;
 use thiserror::Error;
@@ -20,6 +21,14 @@ pub const MAX_ACTIVE_WORKERS: usize = 10_000;
 
 /// Maximum accepted UTF-8 bytes in one trusted worker-profile TOML document.
 pub const MAX_PROFILE_CONFIG_BYTES: usize = 1024 * 1024;
+
+/// Maximum accepted UTF-8 bytes in a worker relay URL.
+pub const MAX_WORKER_RELAY_URL_BYTES: usize = 2_048;
+
+/// Maximum image-pull Secret references in one immutable profile revision.
+pub const MAX_IMAGE_PULL_SECRETS: usize = 16;
+
+const WORKER_RELAY_PATH: &str = "/v1/worker";
 
 #[derive(Debug, Error)]
 pub enum ProfileConfigError {
@@ -60,6 +69,16 @@ pub enum ProfileConfigError {
         profile: String,
         reference: &'static str,
     },
+    #[error("worker relay URL must be an absolute wss URL for /v1/worker")]
+    InvalidWorkerRelayUrl,
+    #[error("worker relay CA ConfigMap name must be a lowercase Kubernetes DNS subdomain")]
+    InvalidWorkerRelayCaConfigMapName,
+    #[error("image-pull Secret name must be a lowercase Kubernetes DNS subdomain")]
+    InvalidImagePullSecretName,
+    #[error("worker profile references too many image-pull Secrets")]
+    TooManyImagePullSecrets,
+    #[error("worker profile contains a duplicate image-pull Secret reference")]
+    DuplicateImagePullSecret,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,6 +141,130 @@ fn validate_bounded_nonzero_ttl(
         });
     }
     Ok(())
+}
+
+/// An operator-owned, exact TLS relay endpoint for worker registration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerRelayUrl(String);
+
+impl WorkerRelayUrl {
+    fn new(value: String) -> Result<Self, ProfileConfigError> {
+        if value.len() > MAX_WORKER_RELAY_URL_BYTES {
+            return Err(ProfileConfigError::InvalidWorkerRelayUrl);
+        }
+        let uri = value
+            .parse::<Uri>()
+            .map_err(|_| ProfileConfigError::InvalidWorkerRelayUrl)?;
+        let authority = uri
+            .authority()
+            .ok_or(ProfileConfigError::InvalidWorkerRelayUrl)?;
+        let explicit_port = authority
+            .as_str()
+            .strip_prefix(authority.host())
+            .ok_or(ProfileConfigError::InvalidWorkerRelayUrl)?;
+        let port_is_valid = explicit_port.is_empty()
+            || (explicit_port.starts_with(':') && authority.port_u16().is_some());
+        if uri.scheme_str() != Some("wss")
+            || authority.host().is_empty()
+            || authority.as_str().contains('@')
+            || !port_is_valid
+            || value.contains('#')
+            || uri.query().is_some()
+            || uri.path() != WORKER_RELAY_PATH
+        {
+            return Err(ProfileConfigError::InvalidWorkerRelayUrl);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// An operator-versioned CA ConfigMap name that must never be reused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerRelayCaConfigMapIntent {
+    name: String,
+}
+
+impl WorkerRelayCaConfigMapIntent {
+    fn new(name: String) -> Result<Self, ProfileConfigError> {
+        if !is_dns_subdomain(&name) {
+            return Err(ProfileConfigError::InvalidWorkerRelayCaConfigMapName);
+        }
+        Ok(Self { name })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// Required transport configuration owned by one immutable profile revision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerRelayIntent {
+    url: WorkerRelayUrl,
+    ca_config_map: WorkerRelayCaConfigMapIntent,
+}
+
+impl WorkerRelayIntent {
+    fn new(url: String, ca_config_map_name: String) -> Result<Self, ProfileConfigError> {
+        Ok(Self {
+            url: WorkerRelayUrl::new(url)?,
+            ca_config_map: WorkerRelayCaConfigMapIntent::new(ca_config_map_name)?,
+        })
+    }
+
+    pub fn url(&self) -> &WorkerRelayUrl {
+        &self.url
+    }
+
+    pub fn ca_config_map(&self) -> &WorkerRelayCaConfigMapIntent {
+        &self.ca_config_map
+    }
+}
+
+/// A validated Pod-only image-pull Secret reference.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImagePullSecretName(String);
+
+impl ImagePullSecretName {
+    fn new(name: String) -> Result<Self, ProfileConfigError> {
+        if !is_dns_subdomain(&name) {
+            return Err(ProfileConfigError::InvalidImagePullSecretName);
+        }
+        Ok(Self(name))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ImagePullSecretNames(Vec<ImagePullSecretName>);
+
+impl ImagePullSecretNames {
+    fn new(names: Vec<String>) -> Result<Self, ProfileConfigError> {
+        if names.len() > MAX_IMAGE_PULL_SECRETS {
+            return Err(ProfileConfigError::TooManyImagePullSecrets);
+        }
+
+        let mut seen = BTreeSet::new();
+        let mut validated = Vec::with_capacity(names.len());
+        for name in names {
+            if !seen.insert(name.clone()) {
+                return Err(ProfileConfigError::DuplicateImagePullSecret);
+            }
+            validated.push(ImagePullSecretName::new(name)?);
+        }
+        Ok(Self(validated))
+    }
+
+    fn as_slice(&self) -> &[ImagePullSecretName] {
+        &self.0
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -191,6 +334,8 @@ pub struct LoadedWorkerProfile {
     profile: MvpWorkerProfile,
     runtime_class: Option<RuntimeClassIntent>,
     skills: Option<SkillsConfigMapIntent>,
+    relay: WorkerRelayIntent,
+    image_pull_secrets: ImagePullSecretNames,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -230,6 +375,14 @@ impl LoadedWorkerProfile {
 
     pub fn skills_intent(&self) -> Option<&SkillsConfigMapIntent> {
         self.skills.as_ref()
+    }
+
+    pub fn relay(&self) -> &WorkerRelayIntent {
+        &self.relay
+    }
+
+    pub fn image_pull_secrets(&self) -> &[ImagePullSecretName] {
+        self.image_pull_secrets.as_slice()
     }
 
     pub fn resolve_cluster_references(
@@ -445,6 +598,8 @@ fn build_profile(
         .map(|intent| SkillsConfigMapIntent::new(intent.config_map_name))
         .transpose()
         .map_err(|source| invalid_profile(&name, source))?;
+    let relay = WorkerRelayIntent::new(decoded.relay.url, decoded.relay.ca_config_map_name)?;
+    let image_pull_secrets = ImagePullSecretNames::new(decoded.image_pull_secrets)?;
     let profile = MvpWorkerProfile::new(
         profile,
         decoded.image,
@@ -463,6 +618,8 @@ fn build_profile(
         profile,
         runtime_class,
         skills,
+        relay,
+        image_pull_secrets,
     })
 }
 
@@ -524,6 +681,9 @@ struct ControllerPolicyDto {
 #[serde(deny_unknown_fields)]
 struct WorkerProfileDto {
     image: String,
+    #[serde(default)]
+    image_pull_secrets: Vec<String>,
+    relay: WorkerRelayIntentDto,
     supervisor: SupervisorDto,
     workspace: WorkspaceDto,
     resources: ResourcesDto,
@@ -531,6 +691,13 @@ struct WorkerProfileDto {
     egress: Vec<EgressRuleDto>,
     runtime_class: Option<RuntimeClassIntentDto>,
     skills: Option<SkillsConfigMapIntentDto>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerRelayIntentDto {
+    url: String,
+    ca_config_map_name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -635,4 +802,25 @@ impl From<EgressProtocolDto> for EgressProtocol {
             EgressProtocolDto::Udp => Self::Udp,
         }
     }
+}
+
+fn is_dns_subdomain(value: &str) -> bool {
+    (1..=253).contains(&value.len())
+        && value
+            .split('.')
+            .all(|component| is_dns_component(component, 63))
+}
+
+fn is_dns_component(value: &str, maximum: usize) -> bool {
+    let bytes = value.as_bytes();
+    (1..=maximum).contains(&bytes.len())
+        && bytes
+            .first()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && bytes
+            .last()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
 }

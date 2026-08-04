@@ -25,6 +25,7 @@ bridge-runtime = [
 controller = [
     "dep:futures-util",
     "dep:getrandom",
+    "dep:http",
     "dep:k8s-openapi",
     "dep:kube",
     "dep:subtle",
@@ -59,6 +60,7 @@ futures-util = {
 }
 getrandom = { version = "0.4", optional = true }
 hex = "0.4"
+http = { version = "1", optional = true }
 hyper = { version = "1", default-features = false, features = ["http1", "server"], optional = true }
 hyper-util = { version = "0.1", default-features = false, features = ["service", "tokio"], optional = true }
 k8s-openapi = { version = "=0.28.0", features = ["v1_32"], optional = true }
@@ -81,7 +83,6 @@ uuid = { version = "1", features = ["serde", "v4"] }
 zeroize = { version = "1", optional = true }
 
 [dev-dependencies]
-http = "1"
 rcgen = "=0.14.8"
 tokio = { version = "1", features = ["io-util", "macros", "rt", "test-util", "time"] }
 tower = { version = "0.5", features = ["util"] }
