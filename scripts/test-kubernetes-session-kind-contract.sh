@@ -139,5 +139,20 @@ grep -Fq 'loaded $output_name image digest differs across Kind nodes' "$TARGET" 
 if grep -Fq 'NODE_NAME=$(kind get nodes' "$TARGET"; then
     fail "loaded image verification must not inspect only one Kind node"
 fi
+grep -Fq 'single_unique_word()' "$TARGET" || {
+    fail "EndpointSlice values must be deduplicated before cardinality checks"
+}
+grep -Fq 'fail "$description values did not agree"' "$TARGET" || {
+    fail "different EndpointSlice values must fail closed"
+}
+grep -Fq 'API_SERVER_IP=$(single_unique_word "$API_SERVER_ENDPOINTS"' "$TARGET" || {
+    fail "the API server address must use the unique EndpointSlice value"
+}
+grep -Fq 'API_SERVER_PORT=$(single_unique_word "$API_SERVER_PORTS"' "$TARGET" || {
+    fail "the API server port must use the unique EndpointSlice value"
+}
+grep -Fq '      - $api_server_ip/32' "$TARGET" || {
+    fail "the controller API egress must remain restricted to one exact IPv4 host"
+}
 
 printf '%s\n' 'kubernetes-session Kind contract test: all checks passed'

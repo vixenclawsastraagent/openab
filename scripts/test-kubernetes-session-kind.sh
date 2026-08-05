@@ -274,6 +274,22 @@ single_word() {
     printf '%s\n' "$1"
 }
 
+single_unique_word() {
+    values=$1
+    description=$2
+    unique=''
+    for candidate in $values; do
+        if [ -z "$unique" ]; then
+            unique=$candidate
+        elif [ "$candidate" != "$unique" ]; then
+            printf '%s\n' "$description values: $values" >&2
+            fail "$description values did not agree"
+        fi
+    done
+    [ -n "$unique" ] || fail "$description was unavailable"
+    printf '%s\n' "$unique"
+}
+
 assert_anchor_owner() {
     resource_type=$1
     resource_name=$2
@@ -717,10 +733,12 @@ printf '%s' "$BRIDGE_TOKEN" > "$BRIDGE_TOKEN_FILE"
 unset BRIDGE_TOKEN
 create_namespaces_and_configuration "$WORKER_DIGEST"
 
+# EndpointSlice clients must deduplicate overlapping slices. This single-node
+# control plane still rejects more than one distinct API address or port.
 API_SERVER_ENDPOINTS=$(kubectl -n default get endpointslice \
     -l kubernetes.io/service-name=kubernetes \
     -o jsonpath='{range .items[*].endpoints[*].addresses[*]}{.}{"\n"}{end}')
-API_SERVER_IP=$(single_word "$API_SERVER_ENDPOINTS" 'Kubernetes API endpoint')
+API_SERVER_IP=$(single_unique_word "$API_SERVER_ENDPOINTS" 'Kubernetes API endpoint')
 case "$API_SERVER_IP" in
     ''|*[!0-9.]*)
         fail "Kind returned an unsupported Kubernetes API endpoint address"
@@ -729,7 +747,7 @@ esac
 API_SERVER_PORTS=$(kubectl -n default get endpointslice \
     -l kubernetes.io/service-name=kubernetes \
     -o jsonpath='{range .items[*].ports[*]}{.port}{"\n"}{end}')
-API_SERVER_PORT=$(single_word "$API_SERVER_PORTS" 'Kubernetes API endpoint port')
+API_SERVER_PORT=$(single_unique_word "$API_SERVER_PORTS" 'Kubernetes API endpoint port')
 case "$API_SERVER_PORT" in
     ''|*[!0-9]*)
         fail "Kind returned an unsupported Kubernetes API endpoint port"
