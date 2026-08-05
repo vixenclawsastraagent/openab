@@ -169,6 +169,9 @@ where
             writer.write_all(b"\n").map_err(|_| FakeAcpError::Io)?;
         }
         writer.flush().map_err(|_| FakeAcpError::Io)?;
+        if fake.state == State::Terminal {
+            return Ok(());
+        }
     }
     Ok(())
 }

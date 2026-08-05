@@ -426,6 +426,15 @@ hostile selected executable can create a new session or process group. The
 worker Pod's cgroup, PID namespace, and eventual `tini` entrypoint remain the
 outer containment and orphan-reaping boundaries.
 
+The thin worker composition root reuses one pinned shutdown future across the
+registration and supervision phases and awaits the supervisor directly. This
+avoids an acknowledgement-boundary signal gap and preserves asynchronous
+reaping. Its stable process exit codes classify only startup (`2`), workspace
+preparation (`3`), pre-acknowledgement registration (`4`), and
+post-acknowledgement supervision (`5`); clean completion and expected
+termination use `0`. Raw child statuses and transport or controller details are
+deliberately not exposed as process outcomes.
+
 ### 4.4 Controller transport boundary
 
 The controller WebSocket endpoint is cluster-internal infrastructure, not a

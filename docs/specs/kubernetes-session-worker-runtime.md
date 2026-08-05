@@ -268,6 +268,15 @@ The supervisor does not interpret prompts, select repositories, manage
 sessions, call Kubernetes, or authorize shared services. Those responsibilities
 remain with the existing ACP CLI, trusted profile, and controller.
 
+The thin composition root exposes only coarse, stable process outcomes. Exit
+code `0` means a clean child completion or an expected SIGINT/SIGTERM before or
+after acknowledgement; `2` covers signal installation, command, environment,
+and bootstrap failures; `3` covers private-workspace preparation; `4` covers
+registration failures before acknowledgement; and `5` covers acknowledged
+relay, child, signal-stream, workspace-revalidation, or containment failures.
+It never forwards a child status, transport code, controller detail, or
+operator-provided value through the process exit code.
+
 ## Commands
 
 - Format:

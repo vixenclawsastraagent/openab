@@ -2,11 +2,16 @@ use openab_kubernetes_session::worker::bootstrap::{
     WorkerBootstrap, WorkerBootstrapEnvironment, WorkerBootstrapError, WorkerCommand,
     WorkerCommandError, WorkerEnvironmentError,
 };
-use openab_kubernetes_session::worker::registration::WorkerRegistrationError;
 #[cfg(target_os = "linux")]
-use openab_kubernetes_session::worker::registration::{build_worker_request, register_worker_once};
-use openab_kubernetes_session::worker::{TerminationSignalError, TerminationSignals};
+use openab_kubernetes_session::worker::run_worker_once;
+#[cfg(target_os = "linux")]
+use openab_kubernetes_session::worker::workspace::prepare_workspace;
+use openab_kubernetes_session::worker::workspace::WorkspacePreparationError;
+use openab_kubernetes_session::worker::{
+    TerminationSignalError, TerminationSignals, WorkerRuntimeError,
+};
 use std::ffi::OsString;
+use std::process::ExitCode;
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -20,9 +25,20 @@ enum ApplicationError {
     #[error(transparent)]
     Bootstrap(#[from] WorkerBootstrapError),
     #[error(transparent)]
-    Registration(#[from] WorkerRegistrationError),
-    #[error("worker ACP relay is unavailable in this build stage")]
-    RelayUnavailable,
+    Workspace(#[from] WorkspacePreparationError),
+    #[error(transparent)]
+    Runtime(#[from] WorkerRuntimeError),
+}
+
+impl ApplicationError {
+    const fn exit_code(&self) -> u8 {
+        match self {
+            Self::Signal(_) | Self::Command(_) | Self::Environment(_) | Self::Bootstrap(_) => 2,
+            Self::Workspace(_) => 3,
+            Self::Runtime(WorkerRuntimeError::Registration(_)) => 4,
+            Self::Runtime(WorkerRuntimeError::Supervision(_)) => 5,
+        }
+    }
 }
 
 fn prepare_startup<I, S, Args, Install, Load>(
@@ -56,9 +72,10 @@ where
             WorkerBootstrap::load_from_files(command, environment).map_err(ApplicationError::from)
         },
     )?;
-    let request = build_worker_request(bootstrap)?;
-    let _registered = register_worker_once(request, signals.wait()).await?;
-    Err(ApplicationError::RelayUnavailable)
+    let workspace = prepare_workspace()?;
+    run_worker_once(bootstrap, workspace, signals.wait())
+        .await
+        .map_err(ApplicationError::from)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -75,27 +92,30 @@ where
             WorkerBootstrap::load_from_files(command, environment).map_err(ApplicationError::from)
         },
     )?;
-    Err(ApplicationError::RelayUnavailable)
+    unreachable!("unsupported targets fail while installing termination signals")
 }
 
-fn report(result: Result<(), ApplicationError>) {
-    if let Err(error) = result {
-        eprintln!("{error}");
-        std::process::exit(1);
+fn report(result: Result<(), ApplicationError>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::from(error.exit_code())
+        }
     }
 }
 
 #[cfg(target_os = "linux")]
 #[tokio::main(flavor = "current_thread")]
-async fn main() {
+async fn main() -> ExitCode {
     install_sanitized_panic_hook();
-    report(run(|| std::env::args_os().skip(1)).await);
+    report(run(|| std::env::args_os().skip(1)).await)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn main() {
+fn main() -> ExitCode {
     install_sanitized_panic_hook();
-    report(run(|| std::env::args_os().skip(1)));
+    report(run(|| std::env::args_os().skip(1)))
 }
 
 fn install_sanitized_panic_hook() {
@@ -127,11 +147,16 @@ mod tests {
             },
             |_| {
                 events.borrow_mut().push("load");
-                Err(ApplicationError::RelayUnavailable)
+                Err(ApplicationError::Bootstrap(
+                    WorkerBootstrapError::OpenRegistrationToken,
+                ))
             },
         )
         .unwrap_err();
-        assert_eq!(error, ApplicationError::RelayUnavailable);
+        assert_eq!(
+            error,
+            ApplicationError::Bootstrap(WorkerBootstrapError::OpenRegistrationToken)
+        );
         assert_eq!(*events.borrow(), ["signal", "args", "load"]);
 
         events.borrow_mut().clear();
@@ -146,7 +171,9 @@ mod tests {
             },
             |_| {
                 events.borrow_mut().push("load");
-                Err(ApplicationError::RelayUnavailable)
+                Err(ApplicationError::Bootstrap(
+                    WorkerBootstrapError::OpenRegistrationToken,
+                ))
             },
         )
         .unwrap_err();
@@ -174,7 +201,9 @@ mod tests {
             },
             |_| {
                 *loaded.borrow_mut() = true;
-                Err(ApplicationError::RelayUnavailable)
+                Err(ApplicationError::Bootstrap(
+                    WorkerBootstrapError::OpenRegistrationToken,
+                ))
             },
         )
         .unwrap_err();
@@ -202,5 +231,56 @@ mod tests {
         );
         assert!(!*args_loaded.borrow());
         assert!(!format!("{error:?} {error}").contains("sensitive-argv"));
+    }
+
+    #[test]
+    fn failures_have_stable_sanitized_phase_exit_codes() {
+        use openab_kubernetes_session::worker::registration::WorkerRegistrationError;
+        use openab_kubernetes_session::worker::supervisor::WorkerSupervisionError;
+        use openab_kubernetes_session::worker::workspace::WorkspacePreparationError;
+
+        let cases = [
+            (
+                ApplicationError::Signal(TerminationSignalError::Initialization),
+                2,
+            ),
+            (
+                ApplicationError::Command(WorkerCommandError::MissingSubcommand),
+                2,
+            ),
+            (
+                ApplicationError::Environment(WorkerEnvironmentError::Unavailable { name: "HOME" }),
+                2,
+            ),
+            (
+                ApplicationError::Bootstrap(WorkerBootstrapError::OpenRegistrationToken),
+                2,
+            ),
+            (
+                ApplicationError::Workspace(WorkspacePreparationError::RootUnavailable),
+                3,
+            ),
+            (
+                ApplicationError::Runtime(WorkerRuntimeError::Registration(
+                    WorkerRegistrationError::Connect,
+                )),
+                4,
+            ),
+            (
+                ApplicationError::Runtime(WorkerRuntimeError::Supervision(
+                    WorkerSupervisionError::ChildFailed,
+                )),
+                5,
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(error.exit_code(), expected);
+            let rendered = format!("{error:?} {error}");
+            assert!(!rendered.contains("sensitive"));
+            assert!(!rendered.contains("Bearer"));
+        }
+
+        assert_eq!(report(Ok(())), ExitCode::SUCCESS);
     }
 }

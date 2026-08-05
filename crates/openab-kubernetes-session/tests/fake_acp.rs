@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const SESSION_ID: &str = "openab-fake-session-v1";
@@ -575,8 +575,20 @@ fn responses_are_flushed_before_stdin_eof_and_cancel_has_no_output() {
         json!({"jsonrpc": "2.0", "id": 22, "result": {}})
     );
 
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("terminal fake ACP session did not exit while stdin remained open");
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(status.success());
     drop(stdin);
-    assert!(child.wait().unwrap().success());
     reader.join().unwrap();
     let mut errors = String::new();
     stderr.read_to_string(&mut errors).unwrap();

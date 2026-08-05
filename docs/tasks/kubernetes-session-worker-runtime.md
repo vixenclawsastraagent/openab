@@ -294,7 +294,7 @@ deadline. Task 10 separately adds the fixed relay write deadline.
   - Verify: `cargo test --manifest-path crates/openab-kubernetes-session/Cargo.toml --locked --all-features --test fake_acp`.
   - Commit: `test(kubernetes): add deterministic fake ACP`.
 
-- [ ] **Task 13 — Compose and test the complete worker process.**
+- [x] **Task 13 — Compose and test the complete worker process.**
   - Depends on: Tasks 7–12.
   - Test first: add a local private-CA WSS integration covering delayed ACK,
     fake-child startup, bidirectional ACP, bootstrap-variable removal, normal

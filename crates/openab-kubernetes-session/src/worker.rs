@@ -12,7 +12,42 @@ pub mod relay;
 pub mod supervisor;
 pub mod workspace;
 
+use registration::{build_worker_request, register_worker_once, WorkerRegistrationError};
+use std::future::Future;
+use supervisor::{supervise_registered_worker, WorkerSupervisionError};
 use thiserror::Error;
+use workspace::PreparedWorkspace;
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum WorkerRuntimeError {
+    #[error(transparent)]
+    Registration(#[from] WorkerRegistrationError),
+    #[error(transparent)]
+    Supervision(#[from] WorkerSupervisionError),
+}
+
+/// Consume one bootstrap and one private workspace to run exactly one
+/// registration and one ACP process tree. A normal termination request before
+/// acknowledgement is a successful shutdown; every other terminal path is
+/// returned without reconnecting, replaying, or restarting.
+pub async fn run_worker_once<Shutdown>(
+    bootstrap: bootstrap::WorkerBootstrap,
+    workspace: PreparedWorkspace,
+    shutdown: Shutdown,
+) -> Result<(), WorkerRuntimeError>
+where
+    Shutdown: Future<Output = Result<(), TerminationSignalError>> + Send,
+{
+    let request = build_worker_request(bootstrap)?;
+    tokio::pin!(shutdown);
+    let registered = match register_worker_once(request, shutdown.as_mut()).await {
+        Ok(registered) => registered,
+        Err(WorkerRegistrationError::Terminated) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    supervise_registered_worker(registered, workspace, shutdown.as_mut()).await?;
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum TerminationSignalError {
