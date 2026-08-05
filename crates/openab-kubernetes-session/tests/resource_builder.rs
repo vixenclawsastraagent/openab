@@ -594,9 +594,17 @@ fn default_generation_is_hardened_and_fully_bound() {
     assert_eq!(container.working_dir.as_deref(), Some("/session"));
     assert_eq!(
         container.command.as_deref(),
-        Some(&["/usr/local/bin/openab-session-supervisor".to_string()][..])
+        Some(&["/usr/bin/tini".to_string(), "--".to_string()][..])
     );
-    assert_eq!(container.args.as_deref(), Some(&["serve".to_string()][..]));
+    assert_eq!(
+        container.args.as_deref(),
+        Some(
+            &[
+                "/usr/local/bin/openab-session-supervisor".to_string(),
+                "serve".to_string(),
+            ][..]
+        )
+    );
     assert!(container
         .volume_mounts
         .as_ref()
@@ -1560,6 +1568,15 @@ fn observed_validation_rejects_sidecars_host_mounts_and_weakened_security() {
         desired.validate_pod(&weakened),
         Err(ResourceValidationError::SpecMismatch { .. })
     ));
+
+    let mut replaced_init = desired.pod().clone();
+    mark_observed(&mut replaced_init.metadata, "pod-uid");
+    replaced_init.spec.as_mut().unwrap().containers[0].command =
+        Some(vec!["/usr/local/bin/openab-session-supervisor".into()]);
+    assert!(matches!(
+        desired.validate_pod(&replaced_init),
+        Err(ResourceValidationError::SpecMismatch { .. })
+    ));
 }
 
 #[test]
@@ -1730,7 +1747,16 @@ fn supervisor_starts_on_the_fresh_pvc_root_before_creating_private_directories()
     assert_eq!(container.working_dir.as_deref(), Some("/session"));
     assert_eq!(
         container.command.as_deref(),
-        Some(&["/usr/local/bin/openab-session-supervisor".to_string()][..])
+        Some(&["/usr/bin/tini".to_string(), "--".to_string()][..])
+    );
+    assert_eq!(
+        container.args.as_deref(),
+        Some(
+            &[
+                "/usr/local/bin/openab-session-supervisor".to_string(),
+                "serve".to_string(),
+            ][..]
+        )
     );
     let env = container.env.as_ref().unwrap();
     assert_eq!(
@@ -1748,6 +1774,34 @@ fn supervisor_starts_on_the_fresh_pvc_root_before_creating_private_directories()
             .value
             .as_deref(),
         Some("/session/workspace")
+    );
+}
+
+#[test]
+fn pod_wraps_a_supervisor_without_profile_arguments_as_literal_tini_argv() {
+    let worker_profile = MvpWorkerProfile::new(
+        ProfileRef::new(PROFILE_NAME, PROFILE_VERSION).unwrap(),
+        IMAGE,
+        ["/usr/local/bin/openab-session-supervisor"],
+        Vec::<String>::new(),
+        PersistentWorkspace::new("20Gi", "encrypted-rwo", PvcAccessMode::default()).unwrap(),
+        WorkerResources::new("250m", "1", "256Mi", "2Gi", "1Gi", "8Gi").unwrap(),
+        trusted_egress(),
+        RunAsIdentity::new(10001, 10001).unwrap(),
+        None,
+        None,
+    )
+    .unwrap();
+    let desired = DesiredGeneration::build(context(), worker_profile, [0x5a; 32]).unwrap();
+    let container = &desired.pod().spec.as_ref().unwrap().containers[0];
+
+    assert_eq!(
+        container.command.as_deref(),
+        Some(&["/usr/bin/tini".to_string(), "--".to_string()][..])
+    );
+    assert_eq!(
+        container.args.as_deref(),
+        Some(&["/usr/local/bin/openab-session-supervisor".to_string()][..])
     );
 }
 

@@ -1,0 +1,40 @@
+name: Kubernetes Session Images
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - '.github/workflows/kubernetes-session-images.yml'
+      - 'Dockerfile.kubernetes-session'
+      - 'scripts/test-kubernetes-session-images.sh'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'src/**'
+      - 'crates/openab-core/Cargo.toml'
+      - 'crates/openab-core/src/**'
+      - 'crates/openab-gateway/Cargo.toml'
+      - 'crates/openab-gateway/src/**'
+      - 'crates/openab-mcp/Cargo.toml'
+      - 'crates/openab-mcp/src/**'
+      - 'crates/openab-kubernetes-session/Cargo.toml'
+      - 'crates/openab-kubernetes-session/Cargo.lock'
+      - 'crates/openab-kubernetes-session/src/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kubernetes-session-images-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  smoke-test:
+    # This is the Linux/Docker verification gate for the add-on and therefore
+    # also runs while an architecture PR remains in draft.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build and verify isolated-session images
+        run: sh scripts/test-kubernetes-session-images.sh --build

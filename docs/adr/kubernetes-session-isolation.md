@@ -423,8 +423,12 @@ fallback for future cancellation or panic; the normal path explicitly waits
 and reaps. The worker must be awaited directly and is never restarted. A
 process group is lifecycle containment, not a security sandbox: a deliberately
 hostile selected executable can create a new session or process group. The
-worker Pod's cgroup, PID namespace, and eventual `tini` entrypoint remain the
-outer containment and orphan-reaping boundaries.
+worker Pod's cgroup and PID namespace remain the outer containment boundary.
+The controller-owned PodSpec explicitly executes `/usr/bin/tini --` before the
+profile-owned supervisor argv, preserving the argv boundary without a shell;
+the image entrypoint is only the direct-container default because Kubernetes
+`command` replaces it. Every admitted worker image must therefore provide
+`tini` at that exact path so it can reap orphaned descendants as PID 1.
 
 The thin worker composition root reuses one pinned shutdown future across the
 registration and supervision phases and awaits the supervisor directly. This

@@ -32,6 +32,9 @@ contracts that are already implemented and tested.
 7. The first repository-owned worker artifact is a generic supervisor plus a
    deterministic fake ACP worker for isolation tests. A production agent
    flavour can extend the pinned worker image without changing the protocol.
+   Every admitted worker image must provide `/usr/bin/tini`; the controller
+   renders the literal `tini -- <profile supervisor argv>` Pod command because
+   Kubernetes would otherwise replace the image entrypoint.
 8. Images and Helm resources are packaged separately from OpenAB's default
    image and `charts/openab`. Enabling this mode is an explicit deployment and
    configuration choice; absent configuration preserves existing behavior.
@@ -188,6 +191,12 @@ separator followed by one absolute ACP child executable and its arguments:
 ```text
 openab-kubernetes-session-worker serve -- /usr/local/bin/<acp-cli> <args...>
 ```
+
+The controller preserves that argv literally as the arguments to the fixed
+`/usr/bin/tini --` Pod command; it never inserts a shell. A worker flavour's
+configured `run_as` UID and GID must match the non-root identity supported by
+that image. The repository-owned reference worker uses UID/GID 1000 and has a
+passwd home of `/session/home`.
 
 One worker process performs this sequence exactly once:
 

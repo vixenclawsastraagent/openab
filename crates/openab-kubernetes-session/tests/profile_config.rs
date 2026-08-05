@@ -181,9 +181,17 @@ fn controller_config_builds_policy_and_existing_worker_domain_types() {
     );
     assert_eq!(
         worker.command.as_deref(),
-        Some(&["/usr/local/bin/openab-session-supervisor".to_string()][..])
+        Some(&["/usr/bin/tini".to_string(), "--".to_string()][..])
     );
-    assert_eq!(worker.args.as_deref(), Some(&["serve".to_string()][..]));
+    assert_eq!(
+        worker.args.as_deref(),
+        Some(
+            &[
+                "/usr/local/bin/openab-session-supervisor".to_string(),
+                "serve".to_string(),
+            ][..]
+        )
+    );
     assert_eq!(
         desired
             .persistent_volume_claim()

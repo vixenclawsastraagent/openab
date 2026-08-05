@@ -69,6 +69,7 @@ const BINDING_FILE: &str = "/var/run/openab-registration/binding.json";
 const WORKER_RELAY_CA_VOLUME: &str = "controller-ca";
 const WORKER_RELAY_CA_DIRECTORY: &str = "/var/run/openab-controller-ca";
 const WORKER_RELAY_CA_FILE: &str = "/var/run/openab-controller-ca/ca.crt";
+const WORKER_INIT_EXECUTABLE: &str = "/usr/bin/tini";
 const SESSION_ROOT: &str = "/session";
 const SESSION_HOME: &str = "/session/home";
 /// Writable workspace root promised by the `session-layout-v1` worker image.
@@ -983,10 +984,12 @@ struct WorkerTransportProfile {
 /// A narrow, immutable worker profile.
 ///
 /// Images admitted to a profile must implement the `session-layout-v1`
-/// contract. `command` names an absolute supervisor executable inside the
-/// pinned image; from the existing `/session` mount root it must create and
-/// verify writable `/session/home` and `/session/workspace`, change directory
-/// to the workspace, and only then exec the ACP worker. Keeping that
+/// contract. Every admitted image provides `/usr/bin/tini`; the generated Pod
+/// owns the literal `tini --` prefix because Kubernetes `command` replaces the
+/// image entrypoint. Profile `command` names an absolute supervisor executable
+/// inside the pinned image; from the existing `/session` mount root it must
+/// create and verify writable `/session/home` and `/session/workspace`, change
+/// directory to the workspace, and only then exec the ACP worker. Keeping that
 /// responsibility in the pinned image avoids a privileged or shell-dependent
 /// init container.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1324,6 +1327,8 @@ impl DesiredGeneration {
         });
 
         let identity = profile.identity;
+        let mut supervisor_argv = profile.command;
+        supervisor_argv.extend(profile.args);
         let pod = Pod {
             metadata: metadata(
                 &context,
@@ -1336,8 +1341,12 @@ impl DesiredGeneration {
             spec: Some(PodSpec {
                 automount_service_account_token: Some(false),
                 containers: vec![Container {
-                    args: Some(profile.args),
-                    command: Some(profile.command),
+                    args: Some(supervisor_argv),
+                    // Kubernetes `command` replaces an image ENTRYPOINT. Pin
+                    // the init wrapper here as part of the desired PodSpec so
+                    // worker Pods retain PID 1 orphan reaping even when the
+                    // selected profile supplies a custom supervisor argv.
+                    command: Some(vec![WORKER_INIT_EXECUTABLE.into(), "--".into()]),
                     env: Some(worker_environment(worker_transport.as_ref())),
                     image: Some(profile.image),
                     image_pull_policy: Some("IfNotPresent".into()),
