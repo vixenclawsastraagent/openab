@@ -81,13 +81,22 @@ impl fmt::Debug for WorkerRequest {
 /// Obtaining the child command and socket before that transition is
 /// impossible through this API.
 pub struct RegisteredWorker<S> {
-    _socket: WebSocketStream<S>,
+    socket: WebSocketStream<S>,
     command: WorkerCommand,
 }
 
 impl<S> RegisteredWorker<S> {
     pub fn command(&self) -> &WorkerCommand {
         &self.command
+    }
+
+    pub(super) fn into_socket(self) -> WebSocketStream<S> {
+        self.socket
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(socket: WebSocketStream<S>, command: WorkerCommand) -> Self {
+        Self { socket, command }
     }
 }
 
@@ -479,10 +488,7 @@ where
                             .into_handshake_outcome()
                             .map_err(|_| WorkerRegistrationError::InvalidControllerFrame)?
                         {
-                            HandshakeOutcomeV1::Ack => Ok(RegisteredWorker {
-                                _socket: socket,
-                                command,
-                            }),
+                            HandshakeOutcomeV1::Ack => Ok(RegisteredWorker { socket, command }),
                             HandshakeOutcomeV1::Fatal(code) => {
                                 Err(WorkerRegistrationError::Rejected(code))
                             }

@@ -6,6 +6,7 @@
 
 pub mod bootstrap;
 pub mod registration;
+pub mod relay;
 pub mod workspace;
 
 use thiserror::Error;

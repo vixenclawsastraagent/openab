@@ -224,20 +224,43 @@ One worker process performs this sequence exactly once:
    `ControllerToWorkerV1::ProtocolResult` ACK. A fatal result, ACP-before-ACK,
    correlated result, invalid frame, timeout, close, or uncertain transport
    outcome is terminal and never retried. After this transition, the relay
-   treats any further `ProtocolResult` as a duplicate protocol violation and
-   terminates the process tree.
+   treats every further `ProtocolResult`--ACK, fatal, correlated, or
+   uncorrelated--as a duplicate protocol violation, writes none of it to child
+   stdin, and terminates the process tree.
 6. Ensure every worker-owned token/header/request buffer has already been
    explicitly zeroized, remove every transport/bootstrap
    variable from the child environment, spawn exactly one ACP child in its own
-   process group, and relay newline-delimited ACP JSON-RPC over its piped
-   stdin/stdout. Child stderr remains stderr; the supervisor never writes logs
-   or framing data to stdout.
+   process group, and relay strictly newline-delimited ACP JSON-RPC over its
+   piped stdin/stdout. Each child-stdout record must end in LF or CRLF. EOF
+   with no pending bytes ends that direction; EOF with any pending bytes is a
+   truncated protocol error and the partial record is never parsed or
+   forwarded. Empty or malformed records are also terminal. Child stderr
+   remains stderr; the supervisor never writes logs or framing data to stdout.
 7. Apply existing ACP payload and outer-frame limits before allocation and
-   keep both directions FIFO with bounded backpressure. The supervisor writes
-   nothing to its own stdout; captured child stdout is treated only as ACP.
+   drive controller-to-child and child-to-controller as two scoped pumps under
+   one parent selection. Neither pump is detached. There is no ACP data queue:
+   each direction completes its downstream write before polling the next
+   logical message and therefore retains at most one message. A capacity-one
+   unit channel exists only to request flushing an automatically queued Pong;
+   a full channel coalesces the duplicate request. Both directions remain
+   FIFO under this natural backpressure. The supervisor writes nothing to its
+   own stdout; captured child stdout is treated only as ACP.
+   Delimiters are not retained in the line buffer, and redundant raw lines,
+   inbound WebSocket text, and typed envelopes are released before uncertain
+   downstream I/O. The existing `serde_json::Value` envelope means the
+   encoded-byte limit is not a tight heap limit for wide JSON. The accepted
+   version-one residual and containment rationale are recorded in
+   [ADR: Kubernetes session isolation](../adr/kubernetes-session-isolation.md#431-worker-acp-relay).
 8. On child exit, Pod termination, WebSocket loss, protocol violation, or
    write deadline, stop both directions and drop the socket first so the
-   controller fences the lane. Then terminate the complete child process
+   controller fences the lane. Every relay WebSocket send or flush and the
+   complete payload-plus-LF child-stdin write and flush use one fixed,
+   non-resetting 30-second deadline; partial progress does not extend it, and
+   an uncertain result is never retried. Relay errors are sanitized categories
+   that retain no raw child line, ACP payload, WebSocket message, close reason,
+   or transport error capable of owning those values. When either scoped pump
+   finishes for any reason, cancel the other and drop both socket halves before
+   returning to the supervisor. Then terminate the complete child process
    group, wait a fixed grace period, kill and reap any survivor, and exit.
    Never reconnect or replay an in-flight ACP message.
 
@@ -329,9 +352,11 @@ prerequisite message rather than silently skip isolation assertions.
 3. Worker state-machine tests prove registration is first, the child starts
    only after ACK, worker-first delayed pairing is bounded to 300 seconds, all
    fatal outcomes are terminal, and no connection or ACP message is retried.
-4. Stdio tests prove CRLF/newline handling, exact boundary acceptance, plus-one
-   rejection, malformed JSON handling, FIFO ordering, bounded backpressure,
-   child EOF, child termination, and no control-envelope leakage.
+4. Stdio tests prove strict LF/CRLF handling, pending-at-EOF truncation, exact
+   boundary acceptance, plus-one rejection, malformed JSON handling, FIFO
+   ordering, one-message-per-direction backpressure, capacity-one Ping flush
+   coalescing, fixed 30-second write deadlines, sanitized failures, coupled
+   pump cancellation, child termination, and no control-envelope leakage.
 5. Controller tests prove mutable/missing/deleting CA ConfigMaps fail closed,
    current-revision failure blocks startup, historical-revision failure
    degrades only that revision, and a UID/resourceVersion replacement observed
@@ -390,8 +415,9 @@ prerequisite message rather than silently skip isolation assertions.
   consumption. Deployment policy forbids reusing a versioned CA name across
   restarts.
 - The supervisor connects and registers once, starts exactly one child only
-  after the delayed ACK, relays valid ACP bidirectionally under bounded memory,
-  and terminates the child on every terminal path.
+  after the delayed ACK, relays valid ACP bidirectionally with bounded wire
+  records and no unbounded queue, and terminates the child on every terminal
+  path.
 - Connection loss produces no reconnect or replay and lets the existing
   controller containment/replacement path preserve logical session identity
   and private PVC state.

@@ -204,17 +204,33 @@ spawn exactly one absolute ACP executable without a shell, in its own process
 group and with bootstrap/transport variables removed from its environment.
 
 Relay one bounded logical message at a time in each direction between child
-stdio and WSS. Natural backpressure preserves FIFO without an unbounded queue.
-On any signal, child, socket, protocol, or write failure, drop the socket first
-to trigger controller fencing, then TERM the child process group, wait a fixed
-grace, KILL survivors, and reap them.
+stdio and WSS. Child stdout is strict LF/CRLF-delimited input: EOF with pending
+bytes is a truncated protocol failure, not an implicit final record. Two
+scoped directional pumps run under one parent selection, with no detached task
+and no ACP data queue. Each direction completes its downstream write before
+polling another message, preserving FIFO with at most one retained logical
+message. Only Ping-triggered Pong flushing uses a capacity-one unit channel;
+duplicate pending flush requests coalesce.
+
+Every WebSocket send or flush and every complete child-stdin record write uses
+one fixed, non-resetting 30-second deadline. An uncertain result is terminal
+and is never retried or replayed. Every post-ACK `ProtocolResult` is likewise
+terminal and never reaches child stdin. Errors retain only sanitized categories,
+not raw child lines, ACP payloads, WebSocket messages, close reasons, or
+payload-owning transport errors. When either pump finishes, cancel the other
+and drop both socket halves before returning. On any signal, child, socket,
+protocol, or write failure, that socket drop triggers controller fencing;
+process supervision then TERMs the child process group, waits a fixed grace,
+KILLs survivors, and reaps them.
 
 Checkpoint evidence:
 
 - layout, ownership, writability, symlink, and escape tests pass;
 - child stdout is ACP-only and stderr remains separate;
-- exact 64-MiB logical boundaries, CRLF, malformed JSON, FIFO, and
-  backpressure tests pass;
+- strict LF/CRLF and truncated-EOF behavior, exact 64-MiB logical boundaries,
+  malformed JSON, FIFO, post-ACK control rejection, capacity-one Ping flush,
+  one-message-per-direction backpressure, fixed write-deadline, sanitized-error,
+  and coupled-cancellation tests pass;
 - child exit and signal races leave no process-tree survivor; and
 - loss before and after ACK produces zero reconnects, restarts, or replay.
 
@@ -340,7 +356,10 @@ changes without an explicit ownership handoff.
 | Registration outcome is ambiguous | Single attempt, ACK-before-child, no retry/replay, controller fencing and new generation |
 | Worker-first lane waits forever and consumes a Pod | Fixed 300-second ACK deadline plus signal-aware cancellation |
 | Agent escapes or aliases the private workspace | Canonical private root, reject symlinks/non-directories, no host/broker mounts |
-| Backpressure becomes unbounded memory | Existing frame ceilings and at most one retained logical message per direction |
+| Backpressure becomes unbounded memory | No worker ACP queue; existing frame ceilings and at most one retained logical message per direction |
+| Wide valid JSON amplifies heap beyond its encoded size | Exclude delimiters, drop duplicate representations before I/O, and contain session failure with cgroup limits and quotas; see the [accepted V1 residual](../adr/kubernetes-session-isolation.md#431-worker-acp-relay) |
+| Partial child output becomes a message after a crash | Require LF/CRLF and reject pending bytes at EOF as truncated |
+| A slow or ambiguous relay write is retried or never ends | One non-resetting 30-second deadline per complete write, followed by sanitized terminal cancellation and no replay |
 | Child descendants survive session loss | Dedicated process group, socket-drop-first, bounded TERM/KILL/reap |
 | Shared resource becomes a writable isolation bypass | Only immutable read-only ConfigMaps or authenticated services; never shared writable volumes |
 | Add-on changes existing deployments | Separate feature, binaries, images, chart, and absent-config regression tests |
@@ -355,7 +374,7 @@ changes without an explicit ownership handoff.
 | Profile/resources | parser, resource builder, profile resolution, generation and registration suites |
 | Shared client transport | bridge regression plus TLS/request boundary suites |
 | Worker handshake | registration-first, delayed ACK, fatal/timeout/cancellation and frame-limit suites |
-| Process relay | layout, stdio, backpressure, signal and process-tree suites |
+| Process relay | strict stdio framing, queue-free scoped pumps, deadline/error sanitization, backpressure, signal and process-tree suites |
 | Images | clean builds, non-root smoke tests, expected binary inventories |
 | Helm | lint, disabled/enabled renders, exact RBAC/network-policy inspection, default-chart regression |
 | Kind | two-session isolation, shared-read-only access, replacement, TTL and release |

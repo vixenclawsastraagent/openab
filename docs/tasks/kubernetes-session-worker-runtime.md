@@ -225,22 +225,41 @@ shared read-only while all mutable state remains session-private.
 
 Run the base, bridge, bootstrap, workspace, and registration tests together.
 Review the dependency tree to confirm `worker-runtime` has no Kubernetes client
-and the controller's 300-second activation ceiling is the sole deadline.
+and the controller's 300-second activation ceiling is the sole registration
+deadline. Task 10 separately adds the fixed relay write deadline.
 
-- [ ] **Task 10 — Add bounded ACP line and WebSocket framing.**
+- [x] **Task 10 — Add bounded ACP line and WebSocket framing.**
   - Depends on: Task 9.
-  - Test first: cover LF/CRLF, empty input, malformed JSON, exact 64-MiB
-    logical acceptance, plus-one rejection before allocation, split reads,
-    FIFO ordering, child EOF, duplicate protocol-result/control-envelope
-    leakage, and
-    one-message-per-direction backpressure.
-  - Work: implement the narrow bidirectional codec/relay adapters using the
-    existing V1 ACP envelope and outer-frame limits; keep child stderr
-    separate and supervisor stdout empty.
-  - Files: `src/worker/relay.rs`, `tests/worker_relay.rs`.
-  - Acceptance: no unbounded queue or ACP replay exists and both directions
-    stop together on a terminal error.
-  - Verify: `cargo test --manifest-path crates/openab-kubernetes-session/Cargo.toml --locked --features worker-runtime --test worker_relay`.
+  - Test first: cover strict LF/CRLF records, empty input, pending bytes at EOF
+    as truncation, malformed JSON, exact 64-MiB logical acceptance, plus-one
+    rejection before allocation or delimiter-driven capacity growth, split
+    reads, FIFO ordering, every post-ACK
+    `ProtocolResult`, control-envelope leakage, capacity-one Ping flush
+    coalescing, fixed 30-second write deadlines, sanitized errors, coupled
+    directional cancellation, and one-message-per-direction backpressure.
+  - Work: consume the registered capability into two scoped directional pumps
+    using the existing V1 ACP envelope and outer-frame limits. Do not spawn a
+    detached pump or create an ACP data queue; complete each downstream write
+    before polling another message. Use only a capacity-one unit channel to
+    request Pong flushing, coalescing a full channel. Apply one non-resetting
+    30-second deadline to every WebSocket send/flush and complete child-stdin
+    payload-plus-LF write/flush. Treat every post-ACK `ProtocolResult` and every
+    uncertain write as terminal without retry or replay. Keep errors free of
+    raw lines, payloads, WebSocket messages, close reasons, and payload-owning
+    transport errors; keep child stderr separate and supervisor stdout empty.
+  - Files: `src/worker/relay.rs`, the narrow registered-socket handoff in
+    `src/worker/registration.rs`, `src/worker.rs`, focused unit tests, and
+    `tests/worker_relay.rs`.
+  - Acceptance: strict newline framing rejects a partial EOF record; no ACP
+    queue, unbounded buffering, detached pump, reconnect, or replay exists;
+    each direction retains at most one logical message; and termination of
+    either direction cancels the other and drops both socket halves before
+    relay return.
+  - Verify:
+    - `cargo test --manifest-path crates/openab-kubernetes-session/Cargo.toml --locked --features worker-runtime --lib worker::relay::tests`
+    - `cargo test --manifest-path crates/openab-kubernetes-session/Cargo.toml --locked --features worker-runtime --test worker_relay`
+    - `cargo fmt --manifest-path crates/openab-kubernetes-session/Cargo.toml --all -- --check`
+    - `cargo clippy --manifest-path crates/openab-kubernetes-session/Cargo.toml --locked --all-targets --features worker-runtime -- -D warnings`
   - Commit: `feat(kubernetes): relay bounded ACP messages`.
 
 - [ ] **Task 11 — Supervise exactly one ACP process tree.**

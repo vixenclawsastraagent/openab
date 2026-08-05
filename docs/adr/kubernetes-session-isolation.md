@@ -347,6 +347,53 @@ worker's exact effective UID and primary GID. After controller activation and
 immediately before child spawn, the worker revalidates binding, ownership, and
 writability and enters the workspace through the retained descriptor.
 
+#### 4.3.1 Worker ACP relay
+
+After the single registration ACK, the worker consumes that registered socket
+into exactly two scoped pumps: child stdout to the controller and the
+controller to child stdin. Neither pump is detached. A parent selection waits
+for the first direction to finish, cancels the other direction, and drops both
+socket halves before returning to process supervision. Each pump completes its
+downstream write before polling another logical ACP message, so each direction
+retains at most one message and there is no worker-side ACP data queue. The
+only channel is a capacity-one unit notification from the socket reader to the
+socket writer so an automatically queued Pong can be flushed; a full channel
+coalesces an equivalent pending notification rather than accumulating work.
+
+Child stdout is a strict newline-delimited boundary. A complete record ends in
+LF, with one immediately preceding CR accepted as the CRLF delimiter. EOF with
+no pending bytes ends that direction, while EOF with any pending bytes is a
+truncated protocol error and the partial record is never parsed or forwarded.
+Treating EOF as an implicit delimiter was rejected because a child crash during
+a write could otherwise turn an ambiguous prefix into an apparently complete
+ACP message. Child stderr bypasses the relay, and the supervisor reserves no
+stdout output of its own.
+
+Every WebSocket send or flush and each complete child-stdin record write uses
+one fixed, non-resetting 30-second deadline. Partial progress does not extend
+that deadline. Timeout, partial or otherwise uncertain delivery, transport
+failure, malformed input, and every post-ACK `ProtocolResult` are terminal;
+the worker never retries or replays the message. Relay errors expose only
+sanitized categories and never retain raw child lines, ACP payloads, WebSocket
+messages, close reasons, or transport errors that can own those values. This
+scoped, queue-free design was chosen over detached reader/writer tasks and
+buffered ACP channels because terminal cancellation and ambiguous delivery
+must have one owner and one observable drop boundary.
+
+The version-one ACP envelope still materializes each payload as a
+`serde_json::Value`. Its 64-MiB encoded-byte ceiling therefore bounds wire
+input but is not a tight heap ceiling: a very wide array or object can consume
+substantially more memory while parsed. The worker excludes delimiters from
+its bounded line buffer and drops redundant raw and typed representations
+before uncertain I/O, but it cannot remove this amplification without changing
+the shared wire contract. The MVP accepts the residual availability risk
+because the worker's cgroup memory limit contains failure to one session
+generation;
+profiles and namespace quotas must still leave deliberate parsing headroom.
+A raw/streaming payload representation or a versioned structural-complexity
+limit is deferred until it can be applied consistently to bridge, controller,
+and worker paths.
+
 ### 4.4 Controller transport boundary
 
 The controller WebSocket endpoint is cluster-internal infrastructure, not a
