@@ -11,6 +11,30 @@ fullnameOverride: ""
 # This chart deliberately does not create or own the namespace.
 workerNamespace: openab-sessions
 
+# Long-lived L3/L4 baselines. Per-session business-service egress remains in
+# immutable worker profiles and is rendered dynamically by the controller.
+networkPolicy:
+  controller:
+    # Required when the add-on is enabled. There is no portable default because
+    # Service translation relative to ipBlock processing is CNI-specific.
+    apiServerCIDRs: []
+    # Use the Service port (normally 443) for pre-DNAT enforcement or the
+    # control-plane endpoint port for a CNI that enforces after DNAT.
+    apiServerPort: 443
+    # Exact broker namespace and Pod label pairs admitted to relay port 8443.
+    # An empty list fails closed: workers can connect, but no broker can.
+    brokerPeers: []
+  worker:
+    dns:
+      selectors:
+        - namespaceLabels:
+            kubernetes.io/metadata.name: kube-system
+          podLabels:
+            k8s-app: kube-dns
+      # Optional exact /32 or /128 destinations for NodeLocal DNS or a
+      # cluster-specific DNS implementation.
+      cidrs: []
+
 image:
   repository: ghcr.io/openabdev/openab-kubernetes-session-controller
   # An empty tag defaults to the chart appVersion. Set either tag or digest;

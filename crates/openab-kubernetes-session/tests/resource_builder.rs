@@ -1946,6 +1946,10 @@ fn egress_profile_rejects_unbounded_or_malformed_rules() {
     assert!(TrustedEgressRule::for_cidr("10.0.0.1", [https.clone()]).is_err());
     assert!(TrustedEgressRule::for_cidr("10.0.0.1/24", [https.clone()]).is_err());
     assert!(TrustedEgressRule::for_cidr("0.0.0.0/0", [https.clone()]).is_err());
+    assert!(TrustedEgressRule::for_cidr("0.0.0.0/1", [https.clone()]).is_err());
+    assert!(TrustedEgressRule::for_cidr("128.0.0.0/1", [https.clone()]).is_err());
+    assert!(TrustedEgressRule::for_cidr("2001:db8::/64", [https.clone()]).is_err());
+    assert!(TrustedEgressRule::for_cidr("2001:db8::1/128", [https.clone()]).is_ok());
     assert!(TrustedEgressRule::for_cidr("10.0.0.1/32", Vec::<EgressPort>::new()).is_err());
     assert!(TrustedEgressRule::for_selectors(
         BTreeMap::from([("INVALID KEY".into(), "namespace".into())]),

@@ -43,3 +43,21 @@ app.kubernetes.io/component: controller
 {{- printf "%s:%s" .Values.image.repository (default .Chart.AppVersion .Values.image.tag) }}
 {{- end }}
 {{- end }}
+
+{{- define "openab-kubernetes-session.controllerNetworkPolicyName" -}}
+{{- $suffix := "controller-net" -}}
+{{- $prefix := include "openab-kubernetes-session.fullname" . | trunc 48 | trimSuffix "-" -}}
+{{- printf "%s-%s" $prefix $suffix -}}
+{{- end }}
+
+{{- define "openab-kubernetes-session.workerNetworkPolicyName" -}}
+{{- $suffix := "worker-net" -}}
+{{- $prefix := include "openab-kubernetes-session.fullname" . | trunc 52 | trimSuffix "-" -}}
+{{- printf "%s-%s" $prefix $suffix -}}
+{{- end }}
+
+{{- define "openab-kubernetes-session.workerDefaultDenyNetworkPolicyName" -}}
+{{- $suffix := "worker-deny" -}}
+{{- $prefix := include "openab-kubernetes-session.fullname" . | trunc 51 | trimSuffix "-" -}}
+{{- printf "%s-%s" $prefix $suffix -}}
+{{- end }}

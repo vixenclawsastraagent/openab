@@ -140,6 +140,12 @@ the fixed byte limit, or do not use the exact `/v1/worker` path. The CA and
 image-pull Secret names must be bounded Kubernetes DNS subdomains; lists must
 be bounded and deduplicated.
 
+Profile CIDR egress targets are restricted to exact IPv4 `/32` or IPv6 `/128`
+hosts. In-cluster shared services should use simultaneous namespace and Pod
+selectors; broader external networks should be reached through a separately
+controlled egress gateway. This prevents multiple subnet rules from composing
+an accidental wildcard Internet route.
+
 The CA ConfigMap:
 
 - lives in the fixed worker namespace;
@@ -304,9 +310,9 @@ operator-provided value through the process exit code.
 - Release build:
   `cargo build --manifest-path crates/openab-kubernetes-session/Cargo.toml --locked --release --all-features`
 - Default Helm regression:
-  `helm template test charts/openab`
+  `helm template test charts/openab --set-string agents.kiro.configUrl=https://example.invalid/config.toml`
 - Add-on Helm render:
-  `helm template test charts/openab-kubernetes-session --set enabled=true`
+  `helm template test charts/openab-kubernetes-session --set enabled=true --set-string 'networkPolicy.controller.apiServerCIDRs[0]=10.96.0.1/32'`
 - Kind isolation test:
   `scripts/test-kubernetes-session-kind.sh`
 

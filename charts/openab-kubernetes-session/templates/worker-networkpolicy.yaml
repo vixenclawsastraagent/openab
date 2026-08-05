@@ -1,0 +1,45 @@
+{{- if .Values.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "openab-kubernetes-session.workerNetworkPolicyName" . }}
+  namespace: {{ .Values.workerNamespace }}
+  labels:
+    {{- include "openab-kubernetes-session.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/managed-by: openab-session-controller
+      openab.dev/resource: worker-pod
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        {{- range .Values.networkPolicy.worker.dns.selectors }}
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .namespaceLabels | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .podLabels | nindent 14 }}
+        {{- end }}
+        {{- range .Values.networkPolicy.worker.dns.cidrs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace }}
+          podSelector:
+            matchLabels:
+              {{- include "openab-kubernetes-session.selectorLabels" . | nindent 14 }}
+      ports:
+        - port: 8443
+          protocol: TCP
+{{- end }}

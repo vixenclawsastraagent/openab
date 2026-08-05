@@ -26,16 +26,53 @@ jobs:
       - name: Verify the add-on is disabled by default
         run: test -z "$(helm template test charts/openab-kubernetes-session)"
 
-      - name: Render the enabled add-on
-        run: helm template test charts/openab-kubernetes-session --set enabled=true > /dev/null
+      - name: Render the default chart
+        run: |
+          helm template test charts/openab \
+            --set-string agents.kiro.configUrl=https://example.invalid/config.toml \
+            > /dev/null
 
-      - name: Reject ambiguous controller image selection
+      - name: Render the enabled add-on
+        run: |
+          helm template test charts/openab-kubernetes-session \
+            --set enabled=true \
+            --set-string 'networkPolicy.controller.apiServerCIDRs[0]=10.96.0.1/32' \
+            > /dev/null
+
+      - name: Reject ambiguous or unsafe add-on values
         run: |
           if helm template test charts/openab-kubernetes-session \
             --set enabled=true \
+            --set-string 'networkPolicy.controller.apiServerCIDRs[0]=10.96.0.1/32' \
             --set-string image.tag=test \
             --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; then
             echo "image.tag and image.digest must not be accepted together" >&2
+            exit 1
+          fi
+          if helm template test charts/openab-kubernetes-session \
+            --set enabled=true \
+            --set-string 'networkPolicy.controller.apiServerCIDRs[0]=0.0.0.0/0'; then
+            echo "wildcard API server egress must not be accepted" >&2
+            exit 1
+          fi
+          if helm template test charts/openab-kubernetes-session \
+            --set enabled=true \
+            --set-string 'networkPolicy.controller.apiServerCIDRs[0]=10.0.0.0/24'; then
+            echo "subnet API server egress must not be accepted" >&2
+            exit 1
+          fi
+          if helm template test charts/openab-kubernetes-session \
+            --set enabled=true \
+            --set-string 'networkPolicy.controller.apiServerCIDRs[0]=10.96.0.1/32' \
+            --set networkPolicy.controller.apiServerPort=0; then
+            echo "an invalid API server port must not be accepted" >&2
+            exit 1
+          fi
+          if helm template test charts/openab-kubernetes-session \
+            --set enabled=true \
+            --set-string 'networkPolicy.controller.apiServerCIDRs[0]=10.96.0.1/32' \
+            --set-json 'networkPolicy.controller.brokerPeers=[{"namespaceLabels":{},"podLabels":{"app":"broker"}}]'; then
+            echo "an empty broker namespace selector must not be accepted" >&2
             exit 1
           fi
 

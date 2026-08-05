@@ -345,6 +345,24 @@ Worker Pods use:
 - default-deny network policy plus explicit egress where the cluster CNI
   supports enforcement.
 
+The add-on chart installs a namespace-wide worker deny-all policy before any
+session exists, plus a managed-worker policy that permits only cluster DNS and
+the authenticated controller relay. The controller still creates one exact
+per-generation policy before its Pod; that policy adds only immutable
+profile-approved service destinations. Because Kubernetes NetworkPolicies are
+additive, the chart never duplicates business-service egress shared by every
+worker. CIDR destinations in both chart values and worker profiles are exact
+IPv4 `/32` or IPv6 `/128` hosts; broader external networks terminate at an
+operator-controlled egress gateway.
+
+Installation and policy-affecting upgrades must occur while the broker runtime
+remains disabled. Active workers are suspended before policy is narrowed or
+release, namespace, or selector identity changes. Kubernetes does not publish
+a readiness signal for CNI handling of a new NetworkPolicy, so an operator must
+first prove the deny and required allow paths on the target CNI, then enable
+`[kubernetes_session]`. This sequencing closes the Pod policy-enforcement race
+for the opt-in mode.
+
 Organization-managed skills may be baked into the image or mounted read-only
 at a pinned version. Any generated state, credentials, mutable configuration,
 or behavior-affecting cache remains session-private.
@@ -457,6 +475,15 @@ public application endpoint. The add-on must expose it only through a
 namespace-local Service and a default-deny ingress policy that admits the
 selected broker and generated worker Pods. It must not create an Ingress,
 public load balancer, NodePort, or plaintext fallback.
+
+The chart's controller NetworkPolicy admits relay ingress only from exact
+operator-selected broker peers and managed worker Pods. Controller egress is
+limited to exact Kubernetes API host addresses on one bounded configured TCP
+port. Kubernetes does not standardize whether Service address and port
+translation occurs before or after policy processing, so the operator must
+select and live-test the address and port observed by the target CNI. A cluster
+that accepts NetworkPolicy objects but does not enforce them does not satisfy
+this isolation mode.
 
 Connection admission happens immediately after TCP accept and before TLS. This
 bounds slow TLS and HTTP handshakes together with active relay connections, but

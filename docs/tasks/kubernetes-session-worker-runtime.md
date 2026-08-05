@@ -354,27 +354,27 @@ terminal transition against the approved spec before packaging.
     uninstall cannot delete retained session PVCs/anchors or the CA object.
   - Verify:
     - `helm lint charts/openab-kubernetes-session`
-    - `helm template test charts/openab-kubernetes-session --set enabled=true`
+    - `helm template test charts/openab-kubernetes-session --set enabled=true --set-string 'networkPolicy.controller.apiServerCIDRs[0]=10.96.0.1/32'`
     - `helm unittest charts/openab-kubernetes-session`
-    - `helm template test charts/openab`
+    - `helm template test charts/openab --set-string agents.kiro.configUrl=https://example.invalid/config.toml`
   - Commit: `feat(kubernetes): add session controller chart`.
 
-- [ ] **Task 16 — Render default-deny and explicitly allowed networking.**
+- [x] **Task 16 — Render default-deny and explicitly allowed networking.**
   - Depends on: Task 15.
   - Test first: assert default-deny ingress/egress, DNS, worker-to-controller,
     and profile-approved service egress; assert no worker Service, public
     exposure, plaintext relay, wildcard external egress, or mutable shared
     volume.
   - Work: add controller and worker NetworkPolicies plus bounded values for
-    approved service destinations. Document that enforcement requires a
-    NetworkPolicy-capable CNI.
+    approved service destinations; restrict profile CIDRs to exact hosts.
+    Document that enforcement requires a NetworkPolicy-capable CNI.
   - Files: add-on chart NetworkPolicy templates, values/schema/docs, render
-    assertions.
+    assertions, and trusted-profile CIDR validation tests.
   - Acceptance: structural policy is deterministic and cannot be expanded by
     chat content.
   - Verify:
     - `helm lint charts/openab-kubernetes-session`
-    - `helm template test charts/openab-kubernetes-session --set enabled=true`
+    - `helm template test charts/openab-kubernetes-session --set enabled=true --set-string 'networkPolicy.controller.apiServerCIDRs[0]=10.96.0.1/32'`
     - `helm unittest charts/openab-kubernetes-session`
   - Commit: `feat(kubernetes): restrict session networking`.
 
@@ -390,14 +390,17 @@ and all default Dockerfiles against the Stage A baseline.
   - Depends on: Tasks 14–16.
   - Test first: each missing prerequisite (Docker, Kind, Helm, kubectl, usable
     CNI) exits non-zero with a specific message; no isolation assertion may be
-    silently skipped.
+    silently skipped. Require API-server rejection of a semantically invalid
+    CIDR fixture that Helm can only shape-check.
   - Work: add `scripts/test-kubernetes-session-kind.sh` to create a disposable
-    cluster, build/load pinned test images, install the chart, create the
-    operator-owned immutable CA and worker namespace, wait for probes, and
+    cluster, build/load pinned test images, install the chart while the broker
+    runtime is disabled, create the operator-owned immutable CA and worker
+    namespace, prove the static deny policy is enforced, wait for probes, and
     clean up only harness-owned resources.
   - Files: Kind script and fixed harness fixtures.
-  - Acceptance: a controller and one fake worker complete registration over
-    private-CA WSS with no public Service or worker Kubernetes token.
+  - Acceptance: deny enforcement is proven before worker creation; a controller
+    and one fake worker complete registration over private-CA WSS with no
+    public Service or worker Kubernetes token.
   - Verify: `scripts/test-kubernetes-session-kind.sh --smoke`.
   - Commit: `test(kubernetes): bootstrap Kind isolation`.
 
@@ -481,8 +484,8 @@ replacement, TTL, release, and peer-non-interference evidence.
     - `cargo test --manifest-path crates/openab-kubernetes-session/Cargo.toml --locked --all-features`
     - `cargo clippy --manifest-path crates/openab-kubernetes-session/Cargo.toml --locked --all-targets --all-features -- -D warnings`
     - `cargo build --manifest-path crates/openab-kubernetes-session/Cargo.toml --locked --release --all-features`
-    - `helm template test charts/openab`
-    - `helm template test charts/openab-kubernetes-session --set enabled=true`
+    - `helm template test charts/openab --set-string agents.kiro.configUrl=https://example.invalid/config.toml`
+    - `helm template test charts/openab-kubernetes-session --set enabled=true --set-string 'networkPolicy.controller.apiServerCIDRs[0]=10.96.0.1/32'`
     - `helm unittest charts/openab-kubernetes-session`
     - `scripts/test-kubernetes-session-kind.sh`
   - Commit: none when clean; any correction uses its own conventional commit.

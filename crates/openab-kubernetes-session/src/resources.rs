@@ -123,7 +123,7 @@ pub enum ResourceBuildError {
     InvalidEgressPort,
     #[error("trusted egress selector contains an invalid label")]
     InvalidEgressSelector,
-    #[error("trusted egress CIDR must be canonical and explicitly scoped")]
+    #[error("trusted egress CIDR must be an exact IPv4 /32 or IPv6 /128 host")]
     InvalidEgressCidr,
     #[error("invalid pinned skills ConfigMap {field}")]
     InvalidSkillsConfigMap { field: &'static str },
@@ -562,7 +562,11 @@ impl TrustedEgressRule {
         I: IntoIterator<Item = EgressPort>,
     {
         let cidr = cidr.into();
-        if !is_scoped_canonical_cidr(&cidr) {
+        // Exact hosts prevent multiple trusted-looking subnet rules from
+        // composing into an accidental wildcard Internet route. Shared
+        // in-cluster services should use the selector form; larger external
+        // ranges should terminate at a controlled egress gateway.
+        if !is_exact_host_cidr(&cidr) {
             return Err(ResourceBuildError::InvalidEgressCidr);
         }
         Self::with_target(TrustedEgressTarget::Cidr(cidr), ports)
@@ -2188,32 +2192,17 @@ fn is_label_name(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
-fn is_scoped_canonical_cidr(value: &str) -> bool {
+fn is_exact_host_cidr(value: &str) -> bool {
     let Some((address, prefix)) = value.split_once('/') else {
         return false;
     };
     let Ok(address) = address.parse::<IpAddr>() else {
         return false;
     };
-    let Ok(prefix) = prefix.parse::<u8>() else {
-        return false;
-    };
-    if prefix == 0 {
-        return false;
-    }
-    match address {
-        IpAddr::V4(address) if prefix <= 32 => {
-            let address = u32::from(address);
-            let mask = u32::MAX << (32 - prefix);
-            address & mask == address
-        }
-        IpAddr::V6(address) if prefix <= 128 => {
-            let address = u128::from(address);
-            let mask = u128::MAX << (128 - prefix);
-            address & mask == address
-        }
-        _ => false,
-    }
+    matches!(
+        (address, prefix),
+        (IpAddr::V4(_), "32") | (IpAddr::V6(_), "128")
+    )
 }
 
 fn validate_cpu_quantity(value: &str, field: &'static str) -> Result<u128, ResourceBuildError> {
