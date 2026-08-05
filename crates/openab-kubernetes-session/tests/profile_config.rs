@@ -87,6 +87,20 @@ port = 8443
 "#;
 
 const VALID_RELAY_URL: &str = "wss://openab-session-controller.openab-system.svc:8443/v1/worker";
+const KIND_SMOKE_PROFILE_FIXTURE: &str =
+    include_str!("../../../tests/fixtures/kubernetes-session-kind/profiles.toml.in");
+
+#[test]
+fn kind_smoke_fixture_matches_the_trusted_profile_contract() {
+    let source = KIND_SMOKE_PROFILE_FIXTURE.replace(
+        "__WORKER_IMAGE__",
+        "localhost/openab-session-worker-test@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    let config = TrustedControllerConfigV1::from_toml(&source).expect("valid Kind fixture");
+
+    assert!(config.profile("kind-smoke").is_some());
+    assert_eq!(config.policy().max_active_workers(), 2);
+}
 
 fn with_relay_url(url: &str) -> String {
     VALID_CONFIG.replacen(VALID_RELAY_URL, url, 1)

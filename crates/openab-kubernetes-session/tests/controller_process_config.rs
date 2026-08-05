@@ -35,6 +35,19 @@ queue_capacity = 16
 byte_budget_bytes = 134217728
 "#;
 
+const KIND_SMOKE_CONFIG: &str =
+    include_str!("../../../tests/fixtures/kubernetes-session-kind/controller.toml");
+
+#[test]
+fn kind_smoke_fixture_matches_the_controller_process_contract() {
+    let config =
+        ControllerProcessConfigV1::from_toml(KIND_SMOKE_CONFIG).expect("valid Kind fixture");
+
+    assert_eq!(config.scope_id(), ScopeId::derive("kind-smoke"));
+    assert_eq!(config.worker_namespace(), "openab-sessions");
+    assert_eq!(config.relay_address().port(), 8443);
+}
+
 #[test]
 fn parses_the_complete_strict_process_contract() {
     let config = ControllerProcessConfigV1::from_toml(VALID_CONFIG).expect("valid process config");

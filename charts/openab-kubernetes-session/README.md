@@ -54,6 +54,33 @@ Compromise of the trusted controller remains a compromise of its dedicated
 worker namespace; admission policy is the defense against privileged,
 host-mounted, or host-namespace Pod specifications.
 
+## Repository smoke test
+
+The repository includes a disposable two-node Kind harness for this add-on.
+It uses pinned Kind, Kubernetes, and container images, an isolated kubeconfig,
+and a private test CA. The harness refuses to reuse an existing cluster and
+removes only the cluster and image tags it created.
+
+Check local prerequisites without creating anything:
+
+```console
+sh scripts/test-kubernetes-session-kind.sh --check
+```
+
+Then, from the repository root, run the complete registration smoke test:
+
+```console
+sh scripts/test-kubernetes-session-kind.sh --smoke
+```
+
+The smoke test first proves managed DNS access, removes the worker labels and
+requires three consecutive DNS denials, then restores the labels and proves
+access again. It subsequently drives the real bridge and controller into one
+fake ACP worker and verifies its ready anchor, consumed registration Secret,
+private ownership chain, lack of Kubernetes credentials, and private-only
+Service shape. Cross-session writable-state and ingress isolation belong to
+the separate two-session isolation test rather than this bootstrap gate.
+
 ## Mounted controller contract
 
 The chart maps configurable keys from existing objects onto fixed paths:

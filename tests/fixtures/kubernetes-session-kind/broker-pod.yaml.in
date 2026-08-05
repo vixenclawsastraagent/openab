@@ -1,0 +1,62 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: openab-kind-smoke-broker
+  namespace: openab-system
+  labels:
+    app.kubernetes.io/name: openab-kind-smoke-broker
+    app.kubernetes.io/instance: kind-smoke
+spec:
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: broker
+      image: __BROKER_IMAGE__
+      imagePullPolicy: Never
+      command:
+        - /usr/bin/tini
+        - --
+        - /bin/sleep
+        - "3600"
+      securityContext:
+        allowPrivilegeEscalation: false
+        privileged: false
+        readOnlyRootFilesystem: true
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        capabilities:
+          drop:
+            - ALL
+      volumeMounts:
+        - name: controller-auth
+          mountPath: /var/run/openab-kind-smoke/auth
+          readOnly: true
+        - name: controller-ca
+          mountPath: /var/run/openab-kind-smoke/ca
+          readOnly: true
+  volumes:
+    - name: controller-auth
+      secret:
+        secretName: openab-kubernetes-session-controller-auth
+        optional: false
+        defaultMode: 0440
+        items:
+          - key: token
+            path: token
+    - name: controller-ca
+      configMap:
+        name: openab-kind-smoke-bridge-ca
+        optional: false
+        defaultMode: 0444
+        items:
+          - key: ca.crt
+            path: ca.crt
