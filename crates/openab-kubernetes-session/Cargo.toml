@@ -35,6 +35,7 @@ worker-runtime = [
     "dep:tokio",
     "dep:worker-tokio-rustls",
     "tokio/net",
+    "tokio/process",
     "tokio/signal",
 ]
 controller = [

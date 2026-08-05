@@ -394,6 +394,38 @@ A raw/streaming payload representation or a versioned structural-complexity
 limit is deferred until it can be applied consistently to bridge, controller,
 and worker paths.
 
+#### 4.3.2 Worker process supervision
+
+The acknowledged registration capability and retained workspace capability
+are both consumed by one supervisor call. It first polls any already-latched
+shutdown, then revalidates the workspace as the final parent-side operation
+before spawning exactly one literal absolute executable. The command uses no
+shell, clears the ambient environment, restores only fixed `HOME`, session
+paths, `PATH`, and `USER` values, pipes stdin/stdout, and inherits stderr. The
+child enters the retained workspace with
+[`fchdir`](https://docs.rs/rustix/1.1.4/rustix/process/fn.fchdir.html), so a
+pathname replacement cannot redirect its working directory.
+
+The child establishes its own process group before exec using Tokio's
+[`process_group(0)`](https://docs.rs/tokio/1.53.1/tokio/process/struct.Command.html#method.process_group).
+One scoped selection owns shutdown, child exit, and the relay future. Leaving
+that scope drops the relay and both WebSocket halves before the supervisor
+signals the process group. Cleanup positively checks group existence, sends
+TERM once, uses one non-resetting ten-second deadline, sends KILL to a survivor
+group, always reaps the direct child, and uses a bounded two-second post-KILL
+observation to prove that the group is absent before returning. A leader that
+exits first does not prove that its descendants are gone. Group signals use Rustix's
+[`kill_process_group`](https://docs.rs/rustix/1.1.4/rustix/process/fn.kill_process_group.html)
+rather than leader-only termination.
+
+`kill_on_drop` plus an owner `Drop` implementation is only an emergency KILL
+fallback for future cancellation or panic; the normal path explicitly waits
+and reaps. The worker must be awaited directly and is never restarted. A
+process group is lifecycle containment, not a security sandbox: a deliberately
+hostile selected executable can create a new session or process group. The
+worker Pod's cgroup, PID namespace, and eventual `tini` entrypoint remain the
+outer containment and orphan-reaping boundaries.
+
 ### 4.4 Controller transport boundary
 
 The controller WebSocket endpoint is cluster-internal infrastructure, not a

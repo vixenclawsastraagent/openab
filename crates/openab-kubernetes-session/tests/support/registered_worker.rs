@@ -42,6 +42,7 @@ const TOKEN_HEX: &str = "7365637265742d746f6b656e2d6d7573742d6e657665722d6170706
 
 pub type ControllerSocket = WebSocketStream<ServerTlsStream<TcpStream>>;
 
+#[allow(dead_code)]
 fn command() -> WorkerCommand {
     WorkerCommand::parse([
         OsString::from("serve"),
@@ -62,7 +63,7 @@ fn registration() -> WorkerRegistrationV1 {
     WorkerRegistrationV1::new(&binding)
 }
 
-fn bootstrap(url: String, ca_pem: String) -> WorkerBootstrap {
+fn bootstrap_with_command(command: WorkerCommand, url: String, ca_pem: String) -> WorkerBootstrap {
     let values = BTreeMap::from([
         ("OPENAB_SESSION_CONTROLLER_URL", OsString::from(url)),
         (
@@ -85,7 +86,7 @@ fn bootstrap(url: String, ca_pem: String) -> WorkerBootstrap {
     let environment =
         WorkerBootstrapEnvironment::from_lookup(|name| values.get(name).cloned()).unwrap();
     WorkerBootstrap::load_from_readers(
-        command(),
+        command,
         environment,
         Cursor::new(TOKEN),
         Cursor::new(encode_frame(&registration()).unwrap()),
@@ -137,7 +138,17 @@ impl Callback for ExactRequestCallback {
 
 /// Return the public post-ACK capability and its peer only after a real local
 /// TLS connection, exact HTTP upgrade, Registration frame, and ACK complete.
+#[allow(dead_code)]
 pub async fn registered_worker_pair() -> (RegisteredWorker<WorkerTlsStream>, ControllerSocket) {
+    registered_worker_pair_with_command(command()).await
+}
+
+/// Complete the real registration handshake while retaining a caller-chosen
+/// literal ACP command for post-ACK supervision tests.
+#[allow(dead_code)]
+pub async fn registered_worker_pair_with_command(
+    command: WorkerCommand,
+) -> (RegisteredWorker<WorkerTlsStream>, ControllerSocket) {
     let identity = tls_identity();
     let ca_pem = identity.cert.pem();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -176,7 +187,8 @@ pub async fn registered_worker_pair() -> (RegisteredWorker<WorkerTlsStream>, Con
         socket
     });
 
-    let request = build_worker_request(bootstrap(
+    let request = build_worker_request(bootstrap_with_command(
+        command,
         format!("wss://localhost:{port}/v1/worker"),
         ca_pem,
     ))

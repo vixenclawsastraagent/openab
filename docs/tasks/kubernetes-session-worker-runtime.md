@@ -262,7 +262,7 @@ deadline. Task 10 separately adds the fixed relay write deadline.
     - `cargo clippy --manifest-path crates/openab-kubernetes-session/Cargo.toml --locked --all-targets --features worker-runtime -- -D warnings`
   - Commit: `feat(kubernetes): relay bounded ACP messages`.
 
-- [ ] **Task 11 — Supervise exactly one ACP process tree.**
+- [x] **Task 11 — Supervise exactly one ACP process tree.**
   - Depends on: Tasks 8 and 10.
   - Test first: cover absolute executable enforcement, no shell, workspace
     cwd through the retained directory capability, post-ACK workspace

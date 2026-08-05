@@ -5,8 +5,11 @@
 //! hosts without touching an ACP executable or the network.
 
 pub mod bootstrap;
+#[cfg(any(target_os = "linux", all(test, unix)))]
+mod process;
 pub mod registration;
 pub mod relay;
+pub mod supervisor;
 pub mod workspace;
 
 use thiserror::Error;
