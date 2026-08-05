@@ -1,8 +1,10 @@
 #![cfg(all(feature = "worker-runtime", unix))]
 
+#[cfg(not(target_os = "linux"))]
+use openab_kubernetes_session::worker::workspace::prepare_workspace;
 use openab_kubernetes_session::worker::workspace::{
-    prepare_workspace, prepare_workspace_beneath, PreparedWorkspace, WorkspaceDirectory,
-    WorkspaceIdentity, WorkspacePreparationError,
+    prepare_workspace_beneath, PreparedWorkspace, WorkspaceDirectory, WorkspaceIdentity,
+    WorkspacePreparationError,
 };
 use std::fs::{self, File};
 use std::os::fd::OwnedFd;
