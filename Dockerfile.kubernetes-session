@@ -1,7 +1,7 @@
 # Standalone, opt-in artifacts for Kubernetes session isolation. These targets
 # do not replace or modify any default OpenAB image.
 
-ARG RUNTIME_IMAGE=debian:trixie-slim
+ARG RUNTIME_IMAGE=debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
 
 # Build the add-on from its independent locked workspace. Each artifact stage
 # selects only the features required by that runtime role.

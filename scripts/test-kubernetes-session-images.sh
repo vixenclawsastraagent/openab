@@ -22,6 +22,7 @@ static_checks() {
 
     require_exact_line 'FROM rust:1-bookworm@sha256:5e2214abe154fe26e39f64488952e5c991eeed1d6d6da7cc8381ae83927f0cfc AS session-source'
     require_exact_line 'FROM rust:1-bookworm@sha256:5e2214abe154fe26e39f64488952e5c991eeed1d6d6da7cc8381ae83927f0cfc AS openab-builder'
+    require_exact_line 'ARG RUNTIME_IMAGE=debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258'
     require_exact_line 'FROM session-runtime AS broker'
     require_exact_line 'FROM session-runtime AS controller'
     require_exact_line 'FROM session-runtime AS worker-base'
