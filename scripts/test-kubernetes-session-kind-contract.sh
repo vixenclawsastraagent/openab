@@ -154,5 +154,29 @@ grep -Fq 'API_SERVER_PORT=$(single_unique_word "$API_SERVER_PORTS"' "$TARGET" ||
 grep -Fq '      - $api_server_ip/32' "$TARGET" || {
     fail "the controller API egress must remain restricted to one exact IPv4 host"
 }
+grep -Fq 'wait_for_api_server_endpoint()' "$TARGET" || {
+    fail "the API EndpointSlice discovery must tolerate bounded publication delay"
+}
+grep -Fq 'poll_api_server_endpoint()' "$TARGET" || {
+    fail "the API EndpointSlice discovery must isolate its polling loop"
+}
+grep -Fq 'run_bounded 60 "$TEMPORARY_ROOT/api-endpoint"' "$TARGET" || {
+    fail "the API EndpointSlice discovery must use the existing bounded runner"
+}
+grep -Fq 'kubectl --request-timeout=5s -n default get endpointslice' "$TARGET" || {
+    fail "each API EndpointSlice query must have a request timeout"
+}
+grep -Fq 'address={.}' "$TARGET" || {
+    fail "the API EndpointSlice poll must capture tagged addresses"
+}
+grep -Fq 'port={.port}' "$TARGET" || {
+    fail "the API EndpointSlice poll must capture one tagged object snapshot"
+}
+grep -Fq 'Kubernetes API endpoint was unavailable after 60s' "$TARGET" || {
+    fail "the API EndpointSlice timeout must remain explicit"
+}
+grep -Fq 'diagnostic-api-endpointslices' "$TARGET" || {
+    fail "EndpointSlice failures must retain live object diagnostics"
+}
 
 printf '%s\n' 'kubernetes-session Kind contract test: all checks passed'

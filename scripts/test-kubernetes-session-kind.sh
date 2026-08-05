@@ -95,6 +95,19 @@ diagnostics() {
     run_bounded 10 "$TEMPORARY_ROOT/diagnostic-pvcs" \
         kubectl --request-timeout=5s get persistentvolumeclaims -A || true
     sed -n '1,200p' "$TEMPORARY_ROOT/diagnostic-pvcs" >&2 || true
+    run_bounded 10 "$TEMPORARY_ROOT/diagnostic-api-service" \
+        kubectl --request-timeout=5s -n default \
+        get service kubernetes -o yaml || true
+    sed -n '1,200p' "$TEMPORARY_ROOT/diagnostic-api-service" >&2 || true
+    run_bounded 10 "$TEMPORARY_ROOT/diagnostic-api-endpointslices" \
+        kubectl --request-timeout=5s -n default get endpointslice \
+        -l kubernetes.io/service-name=kubernetes -o yaml || true
+    sed -n '1,240p' \
+        "$TEMPORARY_ROOT/diagnostic-api-endpointslices" >&2 || true
+    run_bounded 10 "$TEMPORARY_ROOT/diagnostic-api-endpoints" \
+        kubectl --request-timeout=5s -n default \
+        get endpoints kubernetes -o yaml || true
+    sed -n '1,200p' "$TEMPORARY_ROOT/diagnostic-api-endpoints" >&2 || true
     run_bounded 10 "$TEMPORARY_ROOT/diagnostic-controller" \
         kubectl --request-timeout=5s -n "$SYSTEM_NAMESPACE" \
         logs deployment/"$CONTROLLER_NAME" --tail=200 || true
@@ -288,6 +301,44 @@ single_unique_word() {
     done
     [ -n "$unique" ] || fail "$description was unavailable"
     printf '%s\n' "$unique"
+}
+
+poll_api_server_endpoint() {
+    while :; do
+        if ! endpoint_snapshot=$(kubectl --request-timeout=5s -n default get endpointslice \
+            -l kubernetes.io/service-name=kubernetes \
+            -o jsonpath='{range .items[*].endpoints[*].addresses[*]}address={.}{"\n"}{end}{range .items[*].ports[*]}port={.port}{"\n"}{end}'); then
+            return 1
+        fi
+        endpoint_addresses=$(printf '%s\n' "$endpoint_snapshot" | \
+            sed -n 's/^address=//p')
+        endpoint_ports=$(printf '%s\n' "$endpoint_snapshot" | \
+            sed -n 's/^port=//p')
+        if [ -n "$endpoint_addresses" ] && [ -n "$endpoint_ports" ]; then
+            printf '%s\n' "$endpoint_snapshot"
+            return 0
+        fi
+        sleep 1
+    done
+}
+
+wait_for_api_server_endpoint() {
+    endpoint_output="$TEMPORARY_ROOT/api-endpoint"
+    if run_bounded 60 "$TEMPORARY_ROOT/api-endpoint" \
+        poll_api_server_endpoint; then
+        :
+    else
+        endpoint_status=$?
+        sed -n '1,40p' "$endpoint_output" >&2 || true
+        if [ "$endpoint_status" -eq 124 ]; then
+            fail "Kubernetes API endpoint was unavailable after 60s"
+        fi
+        fail "Kubernetes API EndpointSlice discovery failed"
+    fi
+    API_SERVER_ENDPOINTS=$(sed -n 's/^address=//p' "$endpoint_output")
+    API_SERVER_PORTS=$(sed -n 's/^port=//p' "$endpoint_output")
+    API_SERVER_IP=$(single_unique_word "$API_SERVER_ENDPOINTS" 'Kubernetes API endpoint')
+    API_SERVER_PORT=$(single_unique_word "$API_SERVER_PORTS" 'Kubernetes API endpoint port')
 }
 
 assert_anchor_owner() {
@@ -735,19 +786,12 @@ create_namespaces_and_configuration "$WORKER_DIGEST"
 
 # EndpointSlice clients must deduplicate overlapping slices. This single-node
 # control plane still rejects more than one distinct API address or port.
-API_SERVER_ENDPOINTS=$(kubectl -n default get endpointslice \
-    -l kubernetes.io/service-name=kubernetes \
-    -o jsonpath='{range .items[*].endpoints[*].addresses[*]}{.}{"\n"}{end}')
-API_SERVER_IP=$(single_unique_word "$API_SERVER_ENDPOINTS" 'Kubernetes API endpoint')
+wait_for_api_server_endpoint
 case "$API_SERVER_IP" in
     ''|*[!0-9.]*)
         fail "Kind returned an unsupported Kubernetes API endpoint address"
         ;;
 esac
-API_SERVER_PORTS=$(kubectl -n default get endpointslice \
-    -l kubernetes.io/service-name=kubernetes \
-    -o jsonpath='{range .items[*].ports[*]}{.port}{"\n"}{end}')
-API_SERVER_PORT=$(single_unique_word "$API_SERVER_PORTS" 'Kubernetes API endpoint port')
 case "$API_SERVER_PORT" in
     ''|*[!0-9]*)
         fail "Kind returned an unsupported Kubernetes API endpoint port"
