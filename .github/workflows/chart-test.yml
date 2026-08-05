@@ -18,5 +18,28 @@ jobs:
       - name: Install helm-unittest
         run: helm plugin install https://github.com/helm-unittest/helm-unittest --version v1.0.3
 
+      - name: Lint charts
+        run: |
+          helm lint charts/openab
+          helm lint charts/openab-kubernetes-session
+
+      - name: Verify the add-on is disabled by default
+        run: test -z "$(helm template test charts/openab-kubernetes-session)"
+
+      - name: Render the enabled add-on
+        run: helm template test charts/openab-kubernetes-session --set enabled=true > /dev/null
+
+      - name: Reject ambiguous controller image selection
+        run: |
+          if helm template test charts/openab-kubernetes-session \
+            --set enabled=true \
+            --set-string image.tag=test \
+            --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; then
+            echo "image.tag and image.digest must not be accepted together" >&2
+            exit 1
+          fi
+
       - name: Run chart tests
-        run: helm unittest charts/openab
+        run: |
+          helm unittest charts/openab
+          helm unittest charts/openab-kubernetes-session

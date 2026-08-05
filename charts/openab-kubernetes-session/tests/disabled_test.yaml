@@ -1,0 +1,48 @@
+suite: default-off Kubernetes session controller
+templates:
+  - templates/serviceaccount.yaml
+  - templates/role.yaml
+  - templates/rolebinding.yaml
+  - templates/deployment.yaml
+  - templates/service.yaml
+
+tests:
+  - it: renders no ServiceAccount when the add-on is disabled by default
+    template: templates/serviceaccount.yaml
+    set:
+      image.tag: test
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders no Role when the add-on is disabled by default
+    template: templates/role.yaml
+    set:
+      image.tag: test
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders no RoleBinding when the add-on is disabled by default
+    template: templates/rolebinding.yaml
+    set:
+      image.tag: test
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders no Deployment when the add-on is disabled by default
+    template: templates/deployment.yaml
+    set:
+      image.tag: test
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders no Service when the add-on is disabled by default
+    template: templates/service.yaml
+    set:
+      image.tag: test
+    asserts:
+      - hasDocuments:
+          count: 0

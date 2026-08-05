@@ -278,6 +278,17 @@ The controller:
 - reconciles intermediate states after restart; and
 - enforces active-worker and retained-storage policy.
 
+The worker namespace is the complete trust domain for exactly one controller
+scope, not a shared tenant namespace. Kubernetes RBAC cannot grant Pod creation
+and dynamic Secret reconciliation while denying access to selected Secret
+fields or name prefixes. The implementation never mounts image-pull Secrets
+into the controller or worker and never intentionally consumes their data, but
+the controller's namespaced `get`/`list` permission can retrieve complete
+Secret API objects. A controller compromise therefore compromises that worker
+namespace. Operators must keep unrelated tenant credentials out of it and use
+Restricted Pod Security Admission (or equivalent validating admission) to
+bound the Pod specifications that the trusted controller can create.
+
 Knowing another session's resource name or session digest is not authorization
 to access it.
 

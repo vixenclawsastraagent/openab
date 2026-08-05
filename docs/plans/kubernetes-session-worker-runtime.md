@@ -364,7 +364,7 @@ changes without an explicit ownership handoff.
 | Shared resource becomes a writable isolation bypass | Only immutable read-only ConfigMaps or authenticated services; never shared writable volumes |
 | Add-on changes existing deployments | Separate feature, binaries, images, chart, and absent-config regression tests |
 | Idle Pods/PVCs grow without bound | Existing compute/storage TTLs, scope capacity, quotas, explicit release, and Kind lifecycle proof |
-| Private images cannot pull without exposing credentials | Pod-level imagePullSecrets only; never mount or grant controller read access |
+| Private images cannot pull without exposing credentials | Reference imagePullSecrets only from the Pod, never mount them, and dedicate the worker namespace because the controller's Secret reconciliation RBAC cannot be restricted by field or name prefix |
 
 ## Verification checkpoints
 

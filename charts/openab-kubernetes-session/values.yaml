@@ -1,0 +1,52 @@
+# The add-on is inert unless it is explicitly enabled.
+enabled: false
+
+# Override the short chart name used in generated resource names.
+nameOverride: ""
+
+# Override the complete release name used in generated resource names.
+fullnameOverride: ""
+
+# Existing namespace in which the controller creates isolated session workers.
+# This chart deliberately does not create or own the namespace.
+workerNamespace: openab-sessions
+
+image:
+  repository: ghcr.io/openabdev/openab-kubernetes-session-controller
+  # An empty tag defaults to the chart appVersion. Set either tag or digest;
+  # when digest is set, templates select that immutable reference.
+  tag: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+
+# Existing registry credentials referenced by the controller Deployment only.
+imagePullSecrets: []
+
+# All configuration and credentials are provisioned out of band. The chart
+# mounts these existing objects but never creates or owns them.
+controllerConfig:
+  existingConfigMap: openab-kubernetes-session-controller-config
+  key: controller.toml
+
+profiles:
+  existingConfigMap: openab-kubernetes-session-worker-profiles
+  key: profiles.toml
+
+tls:
+  existingSecret: openab-kubernetes-session-controller-tls
+  certificateKey: tls.crt
+  privateKeyKey: tls.key
+
+authentication:
+  existingSecret: openab-kubernetes-session-controller-auth
+  credentialKey: token
+
+# Conservative defaults for the controller and in-memory relay. Worker
+# resources belong to immutable worker profiles, not to this chart.
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi

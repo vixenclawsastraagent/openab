@@ -179,8 +179,13 @@ it does not claim erasure of compiler, TLS-library, kernel, or network copies.
 The Secret continues to contain only `token` and `binding.json`.
 
 `image_pull_secrets` populate only `PodSpec.imagePullSecrets`. They are not
-mounted, read by the controller, copied to the per-generation ServiceAccount,
-or treated as ACP-visible credentials.
+mounted, copied to the per-generation ServiceAccount, or treated as ACP-visible
+credentials. The controller does not intentionally inspect their data, but its
+dynamic Secret reconciliation needs namespace-scoped `get`/`list` permission,
+and Kubernetes RBAC cannot restrict those responses to metadata fields or name
+prefixes. The API can therefore return complete Secret objects to the trusted
+controller. The worker namespace is one controller scope's dedicated trust
+domain and must contain no unrelated tenant credentials.
 
 ## Worker runtime contract
 

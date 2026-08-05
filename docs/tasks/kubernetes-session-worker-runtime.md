@@ -338,7 +338,7 @@ terminal transition against the approved spec before packaging.
     - `docker build -f Dockerfile.kubernetes-session --target worker-test -t openab-session-worker-test:test .`
   - Commit: `build(kubernetes): add session images`.
 
-- [ ] **Task 15 — Add a default-off controller chart with narrow RBAC.**
+- [x] **Task 15 — Add a default-off controller chart with narrow RBAC.**
   - Depends on: Task 14.
   - Test first: render `enabled=false` and require no runtime resources; render
     enabled mode and assert the Deployment, ClusterIP relay Service, probes,
