@@ -414,7 +414,7 @@ mod tests {
             Err(CredentialError::TooLarge)
         );
 
-        for invalid_byte in [b'\n', b'\r', b' ', b'!', b':'] {
+        for &invalid_byte in b"\n\r !:" {
             let mut unsafe_value = vec![b'a'; MIN_CONTROLLER_BEARER_CREDENTIAL_BYTES];
             unsafe_value[MIN_CONTROLLER_BEARER_CREDENTIAL_BYTES / 2] = invalid_byte;
             let mut input = Cursor::new(unsafe_value);

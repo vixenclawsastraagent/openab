@@ -3,8 +3,6 @@
 #[path = "support/registered_worker.rs"]
 mod registered_worker;
 
-#[cfg(target_os = "linux")]
-use futures_util::SinkExt;
 use futures_util::StreamExt;
 #[cfg(target_os = "linux")]
 use openab_kubernetes_session::wire::{decode_frame, WorkerToControllerV1};
