@@ -361,22 +361,63 @@ build_images() {
 }
 
 loaded_image_digest() {
-    node_name=$1
-    image_name=$2
-    output_name=$3
-    inspection="$TEMPORARY_ROOT/$output_name-image.json"
-    docker exec "$node_name" crictl inspecti "$image_name" > "$inspection"
-    digest=$(sed -n \
-        's/.*"\([^"]*@sha256:[0-9a-f]\{64\}\)".*/\1/p' \
-        "$inspection" | sed -n '1p')
-    case "$digest" in
-        *@sha256:????????????????????????????????????????????????????????????????)
-            printf '%s\n' "$digest"
-            ;;
-        *)
-            fail "loaded $output_name image has no exact repository digest"
-            ;;
-    esac
+    image_name=$1
+    output_name=$2
+    normalized_image="docker.io/library/$image_name"
+    repository=${normalized_image%:*}
+    expected_digest=''
+    node_names=$(kind get nodes --name "$CLUSTER_NAME")
+    [ -n "$node_names" ] || fail "Kind returned no node names"
+
+    for node_name in $node_names; do
+        image_list="$TEMPORARY_ROOT/$output_name-$node_name-images"
+        docker exec "$node_name" ctr --namespace=k8s.io images list > "$image_list"
+        node_digests=$(awk -v ref="$normalized_image" \
+            '$1 == ref { print $3 }' "$image_list")
+        node_digest=$(single_word "$node_digests" \
+            "loaded $output_name image target on $node_name")
+
+        digest_hex=${node_digest#sha256:}
+        if [ "$digest_hex" = "$node_digest" ] || \
+            [ "${#digest_hex}" -ne 64 ]; then
+            fail "loaded $output_name image has an invalid target digest on $node_name"
+        fi
+        case "$digest_hex" in
+            *[!0-9a-f]*)
+                fail "loaded $output_name image has an invalid target digest on $node_name"
+                ;;
+        esac
+
+        if [ -z "$expected_digest" ]; then
+            expected_digest=$node_digest
+        elif [ "$node_digest" != "$expected_digest" ]; then
+            fail "loaded $output_name image digest differs across Kind nodes"
+        fi
+
+        digest_reference="$repository@$node_digest"
+        docker exec "$node_name" ctr --namespace=k8s.io images tag --local --force \
+            "$normalized_image" "$digest_reference" >/dev/null
+
+        inspection="$TEMPORARY_ROOT/$output_name-$node_name-cri-image.json"
+        cri_visible=0
+        attempts=0
+        while [ "$attempts" -lt 10 ]; do
+            if docker exec "$node_name" crictl inspecti "$digest_reference" \
+                > "$inspection" 2>&1 &&
+                grep -Fq "\"$digest_reference\"" "$inspection"; then
+                cri_visible=1
+                break
+            fi
+            attempts=$((attempts + 1))
+            [ "$attempts" -ge 10 ] || sleep 1
+        done
+        [ "$cri_visible" -eq 1 ] || {
+            sed -n '1,40p' "$inspection" >&2 || true
+            fail "loaded $output_name digest reference is not visible through CRI on $node_name"
+        }
+    done
+
+    printf '%s\n' "$repository@$expected_digest"
 }
 
 generate_certificates() {
@@ -663,11 +704,9 @@ CLUSTER_CREATED=1
 
 kind load docker-image --name "$CLUSTER_NAME" \
     "$BROKER_IMAGE" "$CONTROLLER_IMAGE" "$WORKER_IMAGE"
-NODE_NAME=$(kind get nodes --name "$CLUSTER_NAME" | sed -n '1p')
-[ -n "$NODE_NAME" ] || fail "Kind returned no node name"
-BROKER_DIGEST=$(loaded_image_digest "$NODE_NAME" "$BROKER_IMAGE" broker)
-CONTROLLER_DIGEST=$(loaded_image_digest "$NODE_NAME" "$CONTROLLER_IMAGE" controller)
-WORKER_DIGEST=$(loaded_image_digest "$NODE_NAME" "$WORKER_IMAGE" worker)
+BROKER_DIGEST=$(loaded_image_digest "$BROKER_IMAGE" broker)
+CONTROLLER_DIGEST=$(loaded_image_digest "$CONTROLLER_IMAGE" controller)
+WORKER_DIGEST=$(loaded_image_digest "$WORKER_IMAGE" worker)
 
 generate_certificates
 BRIDGE_TOKEN=$(openssl rand -hex 32)

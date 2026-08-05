@@ -118,5 +118,26 @@ grep -Fq '.projected.sources[*]}{.secret.name}' "$TARGET" || {
 grep -Fq "trap 'exit 143' TERM" "$TARGET" || {
     fail "the live harness must preserve the TERM exit status"
 }
+grep -Fq 'for node_name in $node_names; do' "$TARGET" || {
+    fail "loaded image aliases must be installed on every Kind node"
+}
+grep -Fq 'ctr --namespace=k8s.io images list' "$TARGET" || {
+    fail "loaded image digests must come from containerd target descriptors"
+}
+grep -Fq '$1 == ref { print $3 }' "$TARGET" || {
+    fail "loaded image aliases must use the containerd target digest column"
+}
+grep -Fq 'images tag --local --force' "$TARGET" || {
+    fail "loaded images must receive node-local exact digest aliases"
+}
+grep -Fq 'crictl inspecti "$digest_reference"' "$TARGET" || {
+    fail "loaded image digest aliases must be verified through CRI"
+}
+grep -Fq 'loaded $output_name image digest differs across Kind nodes' "$TARGET" || {
+    fail "loaded image target digests must agree across Kind nodes"
+}
+if grep -Fq 'NODE_NAME=$(kind get nodes' "$TARGET"; then
+    fail "loaded image verification must not inspect only one Kind node"
+fi
 
 printf '%s\n' 'kubernetes-session Kind contract test: all checks passed'
