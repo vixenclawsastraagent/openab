@@ -10,6 +10,7 @@ license = "MIT"
 
 [features]
 default = []
+fake-acp = ["dep:rustix"]
 client-transport = [
     "dep:rustls",
     "dep:rustls-native-certs",
@@ -129,3 +130,8 @@ required-features = ["controller-runtime"]
 name = "openab-kubernetes-session-worker"
 path = "src/bin/openab-kubernetes-session-worker.rs"
 required-features = ["worker-runtime"]
+
+[[bin]]
+name = "openab-kubernetes-session-fake-acp"
+path = "src/bin/openab-kubernetes-session-fake-acp.rs"
+required-features = ["fake-acp"]

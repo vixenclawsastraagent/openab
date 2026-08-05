@@ -278,7 +278,7 @@ deadline. Task 10 separately adds the fixed relay write deadline.
   - Verify: `cargo test --manifest-path crates/openab-kubernetes-session/Cargo.toml --locked --features worker-runtime --test worker_supervision`.
   - Commit: `feat(kubernetes): supervise ACP process tree`.
 
-- [ ] **Task 12 — Add the deterministic fake ACP child.**
+- [x] **Task 12 — Add the deterministic fake ACP child.**
   - Depends on: Task 10.
   - Test first: assert request-ID preservation and exact responses for
     initialize, session/new, session/load, session/prompt, session/cancel, and
