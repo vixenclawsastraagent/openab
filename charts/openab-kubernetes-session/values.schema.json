@@ -100,7 +100,13 @@
     "image": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["repository", "tag", "digest", "pullPolicy"],
+      "required": [
+        "repository",
+        "tag",
+        "digest",
+        "allowMutableTag",
+        "pullPolicy"
+      ],
       "allOf": [
         {
           "not": {
@@ -129,6 +135,10 @@
           "description": "Optional immutable lowercase SHA-256 image digest.",
           "type": "string",
           "pattern": "^$|^sha256:[0-9a-f]{64}$"
+        },
+        "allowMutableTag": {
+          "description": "Development-only escape hatch allowing a mutable tag or appVersion fallback.",
+          "type": "boolean"
         },
         "pullPolicy": {
           "type": "string",

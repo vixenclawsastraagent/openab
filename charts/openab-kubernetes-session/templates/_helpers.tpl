@@ -39,8 +39,10 @@ app.kubernetes.io/component: controller
 {{- fail "image.tag and image.digest are mutually exclusive" }}
 {{- else if .Values.image.digest }}
 {{- printf "%s@%s" .Values.image.repository .Values.image.digest }}
-{{- else }}
+{{- else if .Values.image.allowMutableTag }}
 {{- printf "%s:%s" .Values.image.repository (default .Chart.AppVersion .Values.image.tag) }}
+{{- else }}
+{{- fail "image.digest is required when the add-on is enabled; set image.allowMutableTag=true only for development" }}
 {{- end }}
 {{- end }}
 

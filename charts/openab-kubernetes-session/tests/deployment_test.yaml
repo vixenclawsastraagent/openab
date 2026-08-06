@@ -3,9 +3,25 @@ templates:
   - templates/deployment.yaml
 
 tests:
-  - it: uses appVersion only when no explicit image selector is configured
+  - it: rejects an enabled controller without an immutable image digest by default
     set:
       enabled: true
+    asserts:
+      - failedTemplate:
+          errorMessage: image.digest is required when the add-on is enabled; set image.allowMutableTag=true only for development
+
+  - it: rejects a mutable tag without explicit development opt-in
+    set:
+      enabled: true
+      image.tag: test-tag
+    asserts:
+      - failedTemplate:
+          errorMessage: image.digest is required when the add-on is enabled; set image.allowMutableTag=true only for development
+
+  - it: uses appVersion only with explicit mutable-image development opt-in
+    set:
+      enabled: true
+      image.allowMutableTag: true
     asserts:
       - equal:
           path: spec.template.spec.containers[0].image
@@ -15,6 +31,7 @@ tests:
     set:
       enabled: true
       image.tag: test-tag
+      image.allowMutableTag: true
       image.pullPolicy: Always
       imagePullSecrets:
         - name: controller-pull
@@ -34,6 +51,7 @@ tests:
     set:
       enabled: true
       image.tag: test
+      image.allowMutableTag: true
     asserts:
       - equal:
           path: spec.replicas
@@ -57,6 +75,7 @@ tests:
     set:
       enabled: true
       image.tag: test
+      image.allowMutableTag: true
     asserts:
       - equal:
           path: spec.template.spec.containers[0].command
@@ -74,6 +93,7 @@ tests:
     set:
       enabled: true
       image.tag: test
+      image.allowMutableTag: true
     asserts:
       - equal:
           path: spec.template.spec.serviceAccountName
@@ -86,6 +106,7 @@ tests:
     set:
       enabled: true
       image.tag: test
+      image.allowMutableTag: true
     asserts:
       - equal:
           path: spec.template.spec.securityContext
@@ -101,6 +122,7 @@ tests:
     set:
       enabled: true
       image.tag: test
+      image.allowMutableTag: true
     asserts:
       - equal:
           path: spec.template.spec.containers[0].securityContext
@@ -119,6 +141,7 @@ tests:
     set:
       enabled: true
       image.tag: test
+      image.allowMutableTag: true
     asserts:
       - equal:
           path: spec.template.spec.containers[0].volumeMounts
@@ -181,6 +204,7 @@ tests:
     set:
       enabled: true
       image.tag: test
+      image.allowMutableTag: true
     asserts:
       - equal:
           path: spec.template.spec.containers[0].ports
@@ -196,6 +220,7 @@ tests:
     set:
       enabled: true
       image.tag: test
+      image.allowMutableTag: true
     asserts:
       - equal:
           path: spec.template.spec.containers[0].startupProbe
@@ -232,6 +257,7 @@ tests:
     set:
       enabled: true
       image.tag: test
+      image.allowMutableTag: true
       resources.requests.cpu: 100m
       resources.requests.memory: 128Mi
       resources.limits.cpu: 500m
@@ -260,6 +286,7 @@ tests:
     set:
       enabled: true
       image.tag: test
+      image.allowMutableTag: true
       controllerConfig.existingConfigMap: custom-process
       controllerConfig.key: process-v1.toml
       profiles.existingConfigMap: custom-profiles

@@ -37,10 +37,17 @@ jobs:
           helm template test charts/openab-kubernetes-session \
             --set enabled=true \
             --set-string 'networkPolicy.controller.apiServerCIDRs[0]=10.96.0.1/32' \
+            --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
             > /dev/null
 
       - name: Reject ambiguous or unsafe add-on values
         run: |
+          if helm template test charts/openab-kubernetes-session \
+            --set enabled=true \
+            --set-string 'networkPolicy.controller.apiServerCIDRs[0]=10.96.0.1/32'; then
+            echo "an enabled controller without an immutable image digest must not be accepted" >&2
+            exit 1
+          fi
           if helm template test charts/openab-kubernetes-session \
             --set enabled=true \
             --set-string 'networkPolicy.controller.apiServerCIDRs[0]=10.96.0.1/32' \
@@ -51,19 +58,22 @@ jobs:
           fi
           if helm template test charts/openab-kubernetes-session \
             --set enabled=true \
-            --set-string 'networkPolicy.controller.apiServerCIDRs[0]=0.0.0.0/0'; then
+            --set-string 'networkPolicy.controller.apiServerCIDRs[0]=0.0.0.0/0' \
+            --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; then
             echo "wildcard API server egress must not be accepted" >&2
             exit 1
           fi
           if helm template test charts/openab-kubernetes-session \
             --set enabled=true \
-            --set-string 'networkPolicy.controller.apiServerCIDRs[0]=10.0.0.0/24'; then
+            --set-string 'networkPolicy.controller.apiServerCIDRs[0]=10.0.0.0/24' \
+            --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; then
             echo "subnet API server egress must not be accepted" >&2
             exit 1
           fi
           if helm template test charts/openab-kubernetes-session \
             --set enabled=true \
             --set-string 'networkPolicy.controller.apiServerCIDRs[0]=10.96.0.1/32' \
+            --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
             --set networkPolicy.controller.apiServerPort=0; then
             echo "an invalid API server port must not be accepted" >&2
             exit 1
@@ -71,6 +81,7 @@ jobs:
           if helm template test charts/openab-kubernetes-session \
             --set enabled=true \
             --set-string 'networkPolicy.controller.apiServerCIDRs[0]=10.96.0.1/32' \
+            --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
             --set-json 'networkPolicy.controller.brokerPeers=[{"namespaceLabels":{},"podLabels":{"app":"broker"}}]'; then
             echo "an empty broker namespace selector must not be accepted" >&2
             exit 1

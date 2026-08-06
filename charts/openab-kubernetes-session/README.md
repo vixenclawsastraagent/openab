@@ -450,6 +450,11 @@ installation. The relay URL for that example is
 `wss://openab-session-controller.openab-system.svc:8443/v1/worker`. The TLS
 certificate must cover the DNS name used by worker profiles.
 
+When enabled, the chart rejects an unpinned controller image by default. For a
+disposable local development cluster only, `image.allowMutableTag=true`
+explicitly permits `image.tag` (or the chart appVersion fallback); do not use
+that escape hatch in a shared or production cluster.
+
 ## Enable one broker scope
 
 First install and validate the controller while all OpenAB agents still use

@@ -354,7 +354,7 @@ terminal transition against the approved spec before packaging.
     uninstall cannot delete retained session PVCs/anchors or the CA object.
   - Verify:
     - `helm lint charts/openab-kubernetes-session`
-    - `helm template test charts/openab-kubernetes-session --set enabled=true --set-string 'networkPolicy.controller.apiServerCIDRs[0]=10.96.0.1/32'`
+    - `helm template test charts/openab-kubernetes-session --set enabled=true --set-string 'networkPolicy.controller.apiServerCIDRs[0]=10.96.0.1/32' --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`
     - `helm unittest charts/openab-kubernetes-session`
     - `helm template test charts/openab --set-string agents.kiro.configUrl=https://example.invalid/config.toml`
   - Commit: `feat(kubernetes): add session controller chart`.
@@ -374,7 +374,7 @@ terminal transition against the approved spec before packaging.
     chat content.
   - Verify:
     - `helm lint charts/openab-kubernetes-session`
-    - `helm template test charts/openab-kubernetes-session --set enabled=true --set-string 'networkPolicy.controller.apiServerCIDRs[0]=10.96.0.1/32'`
+    - `helm template test charts/openab-kubernetes-session --set enabled=true --set-string 'networkPolicy.controller.apiServerCIDRs[0]=10.96.0.1/32' --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`
     - `helm unittest charts/openab-kubernetes-session`
   - Commit: `feat(kubernetes): restrict session networking`.
 
@@ -501,7 +501,7 @@ physical reclamation of its backing PersistentVolume or cloud disk.
     - `cargo clippy --manifest-path crates/openab-kubernetes-session/Cargo.toml --locked --all-targets --all-features -- -D warnings`
     - `cargo build --manifest-path crates/openab-kubernetes-session/Cargo.toml --locked --release --all-features`
     - `helm template test charts/openab --set-string agents.kiro.configUrl=https://example.invalid/config.toml`
-    - `helm template test charts/openab-kubernetes-session --set enabled=true --set-string 'networkPolicy.controller.apiServerCIDRs[0]=10.96.0.1/32'`
+    - `helm template test charts/openab-kubernetes-session --set enabled=true --set-string 'networkPolicy.controller.apiServerCIDRs[0]=10.96.0.1/32' --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`
     - `helm unittest charts/openab-kubernetes-session`
     - `scripts/test-kubernetes-session-kind.sh --isolation`
   - Commit: none when clean; any correction uses its own conventional commit.

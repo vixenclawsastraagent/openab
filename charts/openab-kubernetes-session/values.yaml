@@ -37,10 +37,12 @@ networkPolicy:
 
 image:
   repository: ghcr.io/openabdev/openab-kubernetes-session-controller
-  # An empty tag defaults to the chart appVersion. Set either tag or digest;
-  # when digest is set, templates select that immutable reference.
+  # Production installs must set an immutable digest. Mutable tags (including
+  # the chart appVersion fallback) are available only through the explicit
+  # development escape hatch below.
   tag: ""
   digest: ""
+  allowMutableTag: false
   pullPolicy: IfNotPresent
 
 # Existing registry credentials referenced by the controller Deployment only.
