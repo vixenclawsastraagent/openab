@@ -257,4 +257,32 @@ if grep -Fq '.items[*].endpoints[*].addresses[*]' "$TARGET" || \
     fail "EndpointSlice discovery must not return to kubectl JSONPath parsing"
 fi
 
+grep -Fq 'start_bridge()' "$TARGET" || {
+    fail "the live harness must start bridges through one reusable function"
+}
+grep -Fq 'STARTED_BRIDGE_PID=$!' "$TARGET" || {
+    fail "bridge startup must return its exact background process without a subshell"
+}
+grep -Fq 'BRIDGE_A_PID=' "$TARGET" || {
+    fail "the live harness must reserve an explicit process slot for bridge A"
+}
+grep -Fq 'BRIDGE_B_PID=' "$TARGET" || {
+    fail "the live harness must reserve an explicit process slot for bridge B"
+}
+grep -Fq 'process_id=$4' "$TARGET" || {
+    fail "bridge output waits must inspect the requested bridge process"
+}
+grep -Fq 'error_file=$5' "$TARGET" || {
+    fail "bridge output waits must report the requested bridge stderr"
+}
+grep -Fq 'exec 4>&-' "$TARGET" || {
+    fail "cleanup must be able to close bridge B's writer descriptor"
+}
+grep -Fq 'terminate_process "$BRIDGE_B_PID"' "$TARGET" || {
+    fail "cleanup must terminate bridge B independently"
+}
+grep -Fq 'terminate_process "$BRIDGE_A_PID"' "$TARGET" || {
+    fail "cleanup must terminate bridge A independently"
+}
+
 printf '%s\n' 'kubernetes-session Kind contract test: all checks passed'

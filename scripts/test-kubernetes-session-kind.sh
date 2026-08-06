@@ -80,8 +80,11 @@ WORKER_IMAGE="$WORKER_REPOSITORY:$RUN_TAG"
 CLUSTER_OWNED=0
 CLUSTER_CREATED=0
 IMAGES_OWNED=0
-BRIDGE_PID=''
-BRIDGE_WRITER_OPEN=0
+BRIDGE_A_PID=''
+BRIDGE_A_WRITER_OPEN=0
+BRIDGE_B_PID=''
+BRIDGE_B_WRITER_OPEN=0
+STARTED_BRIDGE_PID=''
 BOUNDED_PID=''
 COMPLETED=0
 
@@ -139,11 +142,25 @@ cleanup() {
     if [ "$COMPLETED" -ne 1 ]; then
         diagnostics
     fi
-    if [ "$BRIDGE_WRITER_OPEN" -eq 1 ]; then
-        exec 3>&-
+    if [ "$BRIDGE_B_WRITER_OPEN" -eq 1 ]; then
+        exec 4>&-
+        BRIDGE_B_WRITER_OPEN=0
     fi
-    if [ -n "$BRIDGE_PID" ]; then
-        terminate_process "$BRIDGE_PID"
+    if [ "$BRIDGE_A_WRITER_OPEN" -eq 1 ]; then
+        exec 3>&-
+        BRIDGE_A_WRITER_OPEN=0
+    fi
+    if [ -n "$STARTED_BRIDGE_PID" ]; then
+        terminate_process "$STARTED_BRIDGE_PID"
+        STARTED_BRIDGE_PID=''
+    fi
+    if [ -n "$BRIDGE_B_PID" ]; then
+        terminate_process "$BRIDGE_B_PID"
+        BRIDGE_B_PID=''
+    fi
+    if [ -n "$BRIDGE_A_PID" ]; then
+        terminate_process "$BRIDGE_A_PID"
+        BRIDGE_A_PID=''
     fi
     if [ "$CLUSTER_OWNED" -eq 1 ]; then
         if run_bounded 30 "$TEMPORARY_ROOT/cleanup-kind" \
@@ -252,22 +269,49 @@ wait_for_output() {
     description=$1
     pattern=$2
     output_file=$3
-    seconds=$4
+    process_id=$4
+    error_file=$5
+    seconds=$6
     elapsed=0
 
     while [ "$elapsed" -lt "$seconds" ]; do
         if grep -Fq "$pattern" "$output_file"; then
             return 0
         fi
-        if ! kill -0 "$BRIDGE_PID" >/dev/null 2>&1; then
-            sed -n '1,80p' "$TEMPORARY_ROOT/bridge.stderr" >&2 || true
+        if ! kill -0 "$process_id" >/dev/null 2>&1; then
+            sed -n '1,80p' "$error_file" >&2 || true
             fail "$description terminated before producing its result"
         fi
         sleep 1
         elapsed=$((elapsed + 1))
     done
-    sed -n '1,80p' "$TEMPORARY_ROOT/bridge.stderr" >&2 || true
+    sed -n '1,80p' "$error_file" >&2 || true
     fail "$description did not complete within ${seconds}s"
+}
+
+start_bridge() {
+    start_bridge_fifo=$1
+    start_bridge_stdout=$2
+    start_bridge_stderr=$3
+    start_bridge_session_key=$4
+    start_bridge_attempt_id=$5
+
+    kubectl -n "$SYSTEM_NAMESPACE" exec -i "$BROKER_POD" -- \
+        env \
+        OPENAB_SESSION_KEY="$start_bridge_session_key" \
+        OPENAB_SESSION_ATTEMPT_ID="$start_bridge_attempt_id" \
+        OPENAB_SESSION_MAPPING_EXPECTATION=absent \
+        /usr/local/bin/openab-kubernetes-session bridge \
+        --controller-url \
+        wss://openab-session-controller.openab-system.svc:8443/v1/bridge \
+        --profile kind-smoke \
+        --scope kind-smoke \
+        --credential-file /var/run/openab-kind-smoke/auth/token \
+        --controller-ca-file /var/run/openab-kind-smoke/ca/ca.crt \
+        < "$start_bridge_fifo" \
+        > "$start_bridge_stdout" \
+        2> "$start_bridge_stderr" &
+    STARTED_BRIDGE_PID=$!
 }
 
 single_resource_name() {
@@ -849,34 +893,29 @@ kubectl apply -f "$BROKER_MANIFEST"
 kubectl -n "$SYSTEM_NAMESPACE" wait \
     --for=condition=Ready "pod/$BROKER_POD" --timeout=120s
 
-BRIDGE_FIFO="$TEMPORARY_ROOT/bridge.stdin"
-BRIDGE_STDOUT="$TEMPORARY_ROOT/bridge.stdout"
-BRIDGE_STDERR="$TEMPORARY_ROOT/bridge.stderr"
-mkfifo "$BRIDGE_FIFO"
-kubectl -n "$SYSTEM_NAMESPACE" exec -i "$BROKER_POD" -- \
-    env \
-    OPENAB_SESSION_KEY=discord:kind-smoke:thread-1 \
-    OPENAB_SESSION_ATTEMPT_ID=00000000-0000-0000-0000-000000000064 \
-    OPENAB_SESSION_MAPPING_EXPECTATION=absent \
-    /usr/local/bin/openab-kubernetes-session bridge \
-    --controller-url \
-    wss://openab-session-controller.openab-system.svc:8443/v1/bridge \
-    --profile kind-smoke \
-    --scope kind-smoke \
-    --credential-file /var/run/openab-kind-smoke/auth/token \
-    --controller-ca-file /var/run/openab-kind-smoke/ca/ca.crt \
-    < "$BRIDGE_FIFO" > "$BRIDGE_STDOUT" 2> "$BRIDGE_STDERR" &
-BRIDGE_PID=$!
-exec 3> "$BRIDGE_FIFO"
-BRIDGE_WRITER_OPEN=1
+BRIDGE_A_FIFO="$TEMPORARY_ROOT/bridge-a.stdin"
+BRIDGE_A_STDOUT="$TEMPORARY_ROOT/bridge-a.stdout"
+BRIDGE_A_STDERR="$TEMPORARY_ROOT/bridge-a.stderr"
+mkfifo "$BRIDGE_A_FIFO"
+start_bridge \
+    "$BRIDGE_A_FIFO" \
+    "$BRIDGE_A_STDOUT" \
+    "$BRIDGE_A_STDERR" \
+    'discord:kind-smoke:thread-1' \
+    '00000000-0000-0000-0000-000000000064'
+BRIDGE_A_PID=$STARTED_BRIDGE_PID
+STARTED_BRIDGE_PID=''
+exec 3> "$BRIDGE_A_FIFO"
+BRIDGE_A_WRITER_OPEN=1
 
 INITIALIZE_LINE=$(sed -n '1p' "$FIXTURE_ROOT/smoke.ndjson")
 SESSION_NEW_LINE=$(sed -n '2p' "$FIXTURE_ROOT/smoke.ndjson")
 [ -n "$INITIALIZE_LINE" ] || fail "smoke fixture has no initialize request"
 [ -n "$SESSION_NEW_LINE" ] || fail "smoke fixture has no session/new request"
 printf '%s\n' "$INITIALIZE_LINE" >&3
-wait_for_output 'bridge initialization' '"id":1' "$BRIDGE_STDOUT" 180
-grep -Fq 'openab-kubernetes-session-fake-acp' "$BRIDGE_STDOUT" || {
+wait_for_output 'bridge initialization' '"id":1' \
+    "$BRIDGE_A_STDOUT" "$BRIDGE_A_PID" "$BRIDGE_A_STDERR" 180
+grep -Fq 'openab-kubernetes-session-fake-acp' "$BRIDGE_A_STDOUT" || {
     fail "bridge initialization did not reach the fake ACP worker"
 }
 
@@ -888,8 +927,9 @@ kubectl -n "$WORKER_NAMESPACE" wait \
     --for=condition=Ready "pod/$WORKER_POD" --timeout=120s
 
 printf '%s\n' "$SESSION_NEW_LINE" >&3
-wait_for_output 'fake ACP session creation' '"id":2' "$BRIDGE_STDOUT" 60
-grep -Fq 'openab-fake-session-v1' "$BRIDGE_STDOUT" || {
+wait_for_output 'fake ACP session creation' '"id":2' \
+    "$BRIDGE_A_STDOUT" "$BRIDGE_A_PID" "$BRIDGE_A_STDERR" 60
+grep -Fq 'openab-fake-session-v1' "$BRIDGE_A_STDOUT" || {
     fail "fake ACP did not return its fixed session identity"
 }
 
