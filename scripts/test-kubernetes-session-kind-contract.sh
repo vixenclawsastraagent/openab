@@ -5,6 +5,7 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "${0%/*}" && pwd)
 TARGET="$SCRIPT_DIR/test-kubernetes-session-kind.sh"
 PROFILE_FIXTURE="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/profiles.toml.in"
+SKILLS_FIXTURE="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/shared-skill.md"
 ENDPOINT_FILTER="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/api-server-endpoints.jq"
 ENDPOINT_FIXTURE="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/api-server-endpoints.json"
 TEMPORARY_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/openab-session-kind-contract.XXXXXX")
@@ -84,6 +85,7 @@ assert_endpoint_filter_failure() {
 
 [ -f "$TARGET" ] || fail "missing scripts/test-kubernetes-session-kind.sh"
 [ -f "$PROFILE_FIXTURE" ] || fail "missing Kind worker profile fixture"
+[ -f "$SKILLS_FIXTURE" ] || fail "missing immutable shared skills fixture"
 [ -f "$ENDPOINT_FILTER" ] || fail "missing API EndpointSlice jq filter"
 [ -f "$ENDPOINT_FIXTURE" ] || fail "missing API EndpointSlice JSON fixture"
 
@@ -140,6 +142,16 @@ grep -Fq 'cidr = "192.0.2.1/32"' "$PROFILE_FIXTURE" || {
 if grep -Fq 'port = 8443' "$PROFILE_FIXTURE"; then
     fail "Kind profile must leave relay egress to the static chart policy"
 fi
+grep -Fq '[profiles.kind-smoke.revisions.v1.skills]' "$PROFILE_FIXTURE" || {
+    fail "Kind profile must pin centrally managed skills"
+}
+grep -Fq 'config_map_name = "openab-kind-smoke-skills-v1"' \
+    "$PROFILE_FIXTURE" || {
+    fail "Kind profile must name the immutable shared skills ConfigMap"
+}
+grep -Fqx 'OPENAB_KIND_SHARED_SKILL_V1' "$SKILLS_FIXTURE" || {
+    fail "Kind shared skills fixture must expose its fixed version marker"
+}
 
 unknown_stdout="$TEMPORARY_ROOT/unknown.stdout"
 unknown_stderr="$TEMPORARY_ROOT/unknown.stderr"
@@ -283,6 +295,32 @@ grep -Fq 'terminate_process "$BRIDGE_B_PID"' "$TARGET" || {
 }
 grep -Fq 'terminate_process "$BRIDGE_A_PID"' "$TARGET" || {
     fail "cleanup must terminate bridge A independently"
+}
+grep -Fq 'openab-kind-smoke-skills-v1' "$TARGET" || {
+    fail "the live harness must create and verify pinned shared skills"
+}
+grep -Fq 'worker skills ConfigMap is mutable' "$TARGET" || {
+    fail "the live harness must reject mutable shared skills"
+}
+grep -Fq 'worker Pod does not mount the pinned skills ConfigMap' "$TARGET" || {
+    fail "the live harness must verify the exact shared skills reference"
+}
+grep -Fq 'worker skills mount is writable' "$TARGET" || {
+    fail "the live harness must require an explicitly read-only skills mount"
+}
+grep -Fq 'worker Pod skills UID pin does not match the immutable ConfigMap' \
+    "$TARGET" || {
+    fail "the live harness must verify the exact shared skills UID pin"
+}
+grep -Fq 'worker Pod skills resource-version pin does not match the immutable ConfigMap' \
+    "$TARGET" || {
+    fail "the live harness must verify the exact shared skills resource-version pin"
+}
+grep -Fq 'openab-skills-write-probe-started' "$TARGET" || {
+    fail "the live skills write probe must distinguish execution from denial"
+}
+grep -Fq 'worker could write to the shared skills mount' "$TARGET" || {
+    fail "the live harness must actively reject writable shared skills"
 }
 
 printf '%s\n' 'kubernetes-session Kind contract test: all checks passed'

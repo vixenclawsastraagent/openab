@@ -57,6 +57,7 @@ for fixture in \
     kind.yaml \
     controller.toml \
     profiles.toml.in \
+    shared-skill.md \
     api-server-endpoints.jq \
     smoke.ndjson \
     broker-pod.yaml.in \
@@ -85,6 +86,8 @@ BRIDGE_A_WRITER_OPEN=0
 BRIDGE_B_PID=''
 BRIDGE_B_WRITER_OPEN=0
 STARTED_BRIDGE_PID=''
+SHARED_SKILLS_UID=''
+SHARED_SKILLS_RESOURCE_VERSION=''
 BOUNDED_PID=''
 COMPLETED=0
 
@@ -413,6 +416,110 @@ assert_anchor_owner() {
     [ "$owner_controller" = 'true' ] || fail "$description owner is not controlling"
 }
 
+assert_shared_skills_config_map() {
+    skills_config_map_snapshot="$TEMPORARY_ROOT/shared-skills-config-map.json"
+    kubectl -n "$WORKER_NAMESPACE" get configmap \
+        openab-kind-smoke-skills-v1 -o json > "$skills_config_map_snapshot"
+    skills_immutable=$(jq -r '.immutable // false' "$skills_config_map_snapshot")
+    [ "$skills_immutable" = 'true' ] || fail "worker skills ConfigMap is mutable"
+    skills_owners=$(jq -r '.metadata.ownerReferences[]?.uid' \
+        "$skills_config_map_snapshot")
+    [ -z "$skills_owners" ] || fail "worker skills ConfigMap has a session owner"
+    skills_marker=$(jq -r '.data["SKILL.md"] // ""' "$skills_config_map_snapshot")
+    [ "$skills_marker" = 'OPENAB_KIND_SHARED_SKILL_V1' ] || {
+        fail "worker skills ConfigMap has unexpected content"
+    }
+    SHARED_SKILLS_UID=$(jq -r '.metadata.uid // ""' "$skills_config_map_snapshot")
+    [ -n "$SHARED_SKILLS_UID" ] || fail "worker skills ConfigMap has no UID"
+    SHARED_SKILLS_RESOURCE_VERSION=$(jq -r \
+        '.metadata.resourceVersion // ""' "$skills_config_map_snapshot")
+    [ -n "$SHARED_SKILLS_RESOURCE_VERSION" ] || {
+        fail "worker skills ConfigMap has no resource version"
+    }
+}
+
+assert_worker_shared_skills() {
+    skills_worker_pod=$1
+    skills_pod_snapshot="$TEMPORARY_ROOT/$skills_worker_pod-shared-skills.json"
+    kubectl -n "$WORKER_NAMESPACE" get pod "$skills_worker_pod" \
+        -o json > "$skills_pod_snapshot"
+    skills_config_map=$(jq -r \
+        '.spec.volumes[] | select(.name == "skills") | .configMap.name' \
+        "$skills_pod_snapshot")
+    [ "$skills_config_map" = 'openab-kind-smoke-skills-v1' ] || {
+        fail "worker Pod does not mount the pinned skills ConfigMap"
+    }
+    skills_mount_path=$(jq -r \
+        '.spec.containers[0].volumeMounts[] | select(.name == "skills") | .mountPath' \
+        "$skills_pod_snapshot")
+    [ "$skills_mount_path" = '/opt/openab/skills' ] || {
+        fail "worker skills mount uses an unexpected path"
+    }
+    skills_read_only=$(jq -r \
+        '.spec.containers[0].volumeMounts[] | select(.name == "skills") | .readOnly' \
+        "$skills_pod_snapshot")
+    [ "$skills_read_only" = 'true' ] || fail "worker skills mount is writable"
+    skills_pinned_name=$(jq -r \
+        '.metadata.annotations["openab.dev/skills-config-map-name"] // ""' \
+        "$skills_pod_snapshot")
+    [ "$skills_pinned_name" = "$skills_config_map" ] || {
+        fail "worker Pod skills name pin does not match its mounted ConfigMap"
+    }
+    skills_pinned_uid=$(jq -r \
+        '.metadata.annotations["openab.dev/skills-config-map-uid"] // ""' \
+        "$skills_pod_snapshot")
+    [ "$skills_pinned_uid" = "$SHARED_SKILLS_UID" ] || {
+        fail "worker Pod skills UID pin does not match the immutable ConfigMap"
+    }
+    skills_pinned_resource_version=$(jq -r \
+        '.metadata.annotations["openab.dev/skills-config-map-resource-version"] // ""' \
+        "$skills_pod_snapshot")
+    [ "$skills_pinned_resource_version" = "$SHARED_SKILLS_RESOURCE_VERSION" ] || {
+        fail "worker Pod skills resource-version pin does not match the immutable ConfigMap"
+    }
+
+    skills_read_marker=$(kubectl -n "$WORKER_NAMESPACE" exec \
+        "$skills_worker_pod" -- /bin/sh -c \
+        'IFS= read -r marker < /opt/openab/skills/SKILL.md && printf "%s\n" "$marker"')
+    [ "$skills_read_marker" = 'OPENAB_KIND_SHARED_SKILL_V1' ] || {
+        fail "worker could not read the pinned shared skill"
+    }
+
+    skills_write_output="$TEMPORARY_ROOT/$skills_worker_pod-skills-write"
+    if kubectl -n "$WORKER_NAMESPACE" exec "$skills_worker_pod" -- \
+        /bin/sh -c '
+            printf "%s\n" openab-skills-write-probe-started
+            if printf "%s\n" unexpected 2>/dev/null \
+                > /opt/openab/skills/SHOULD_NOT_WRITE; then
+                printf "%s\n" openab-skills-write-unexpectedly-succeeded
+            else
+                printf "%s\n" openab-skills-write-denied
+            fi
+        ' > "$skills_write_output" 2>&1; then
+        :
+    else
+        sed -n '1,40p' "$skills_write_output" >&2 || true
+        fail "worker skills write probe failed before reporting its result"
+    fi
+    grep -Fqx 'openab-skills-write-probe-started' "$skills_write_output" || {
+        fail "worker skills write probe did not start"
+    }
+    if grep -Fqx 'openab-skills-write-unexpectedly-succeeded' \
+        "$skills_write_output"; then
+        fail "worker could write to the shared skills mount"
+    fi
+    grep -Fqx 'openab-skills-write-denied' "$skills_write_output" || {
+        sed -n '1,40p' "$skills_write_output" >&2 || true
+        fail "worker skills write probe returned an unexpected result"
+    }
+    skills_read_marker=$(kubectl -n "$WORKER_NAMESPACE" exec \
+        "$skills_worker_pod" -- /bin/sh -c \
+        'IFS= read -r marker < /opt/openab/skills/SKILL.md && printf "%s\n" "$marker"')
+    [ "$skills_read_marker" = 'OPENAB_KIND_SHARED_SKILL_V1' ] || {
+        fail "shared skill content changed after the denied write"
+    }
+}
+
 assert_controller_off_control_plane() {
     controller_nodes=$(kubectl -n "$SYSTEM_NAMESPACE" get pods \
         -l 'app.kubernetes.io/name=openab-kubernetes-session,app.kubernetes.io/instance=openab-session-controller,app.kubernetes.io/component=controller' \
@@ -646,8 +753,15 @@ create_namespaces_and_configuration() {
     kubectl -n "$WORKER_NAMESPACE" create configmap \
         openab-kind-smoke-relay-ca \
         --from-file=ca.crt="$certificate_root/ca.crt"
+    kubectl -n "$WORKER_NAMESPACE" create configmap \
+        openab-kind-smoke-skills-v1 \
+        --from-file=SKILL.md="$FIXTURE_ROOT/shared-skill.md"
     kubectl -n "$WORKER_NAMESPACE" patch configmap \
         openab-kind-smoke-relay-ca \
+        --type=merge \
+        -p '{"immutable":true}'
+    kubectl -n "$WORKER_NAMESPACE" patch configmap \
+        openab-kind-smoke-skills-v1 \
         --type=merge \
         -p '{"immutable":true}'
 }
@@ -925,6 +1039,8 @@ WORKER_POD_RESOURCE=$(single_resource_name pod \
 WORKER_POD=${WORKER_POD_RESOURCE#pod/}
 kubectl -n "$WORKER_NAMESPACE" wait \
     --for=condition=Ready "pod/$WORKER_POD" --timeout=120s
+assert_shared_skills_config_map
+assert_worker_shared_skills "$WORKER_POD"
 
 printf '%s\n' "$SESSION_NEW_LINE" >&3
 wait_for_output 'fake ACP session creation' '"id":2' \

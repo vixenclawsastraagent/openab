@@ -15,6 +15,9 @@ image = "__WORKER_IMAGE__"
 url = "wss://openab-session-controller.openab-system.svc:8443/v1/worker"
 ca_config_map_name = "openab-kind-smoke-relay-ca"
 
+[profiles.kind-smoke.revisions.v1.skills]
+config_map_name = "openab-kind-smoke-skills-v1"
+
 [profiles.kind-smoke.revisions.v1.supervisor]
 executable = "/usr/local/bin/openab-kubernetes-session-worker"
 args = ["serve", "--", "/usr/local/bin/openab-kubernetes-session-fake-acp"]
