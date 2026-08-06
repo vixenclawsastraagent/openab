@@ -93,12 +93,22 @@ build_checks() {
     controller_image="openab-session-controller-smoke:$$"
     worker_image="openab-session-worker-smoke:$$"
     worker_test_image="openab-session-worker-test-smoke:$$"
+    images_owned=0
 
     cleanup() {
-        docker image rm -f "$broker_image" "$controller_image" "$worker_image" "$worker_test_image" >/dev/null 2>&1 || true
+        if [ "$images_owned" -eq 1 ]; then
+            docker image rm -f "$broker_image" "$controller_image" "$worker_image" "$worker_test_image" >/dev/null 2>&1 || true
+        fi
         rm -rf "$temporary_root"
     }
     trap cleanup EXIT HUP INT TERM
+
+    for image in "$broker_image" "$controller_image" "$worker_image" "$worker_test_image"; do
+        if docker image inspect "$image" >/dev/null 2>&1; then
+            fail "refusing to replace pre-existing test image $image"
+        fi
+    done
+    images_owned=1
 
     # Never send arbitrary repository or untracked content to the Docker
     # daemon. These pathspecs are the complete source inputs referenced by the
