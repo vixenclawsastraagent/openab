@@ -6,6 +6,7 @@ use crate::acp::connection::{
     AcpConnection, BrokerMappingExpectation, LifecycleHandle, SessionActivity, SessionSpawnContext,
 };
 use crate::acp::SessionContextMode;
+use crate::redact::redact_session_ids;
 use anyhow::{anyhow, Context, Result};
 use futures_util::stream::{self, StreamExt};
 use std::collections::{HashMap, HashSet};
@@ -74,7 +75,8 @@ impl StrictCapacity {
         }
         if state.resetting.contains(key) {
             return Err(anyhow!(
-                "isolated session for thread {key} is quarantined during reset"
+                "isolated session for thread {} is quarantined during reset",
+                redact_session_ids(key)
             ));
         }
         if state.occupied.contains(key) {
@@ -97,18 +99,21 @@ impl StrictCapacity {
         }
         if state.resetting.contains(to) {
             return Err(anyhow!(
-                "isolated session for thread {to} is quarantined during reset"
+                "isolated session for thread {} is quarantined during reset",
+                redact_session_ids(to)
             ));
         }
         if !state.occupied.remove(from) {
             return Err(anyhow!(
-                "isolated session {from} did not own its capacity slot"
+                "isolated session {} did not own its capacity slot",
+                redact_session_ids(from)
             ));
         }
         if !state.occupied.insert(to.to_string()) {
             state.occupied.insert(from.to_string());
             return Err(anyhow!(
-                "isolated session {to} already owns a capacity slot"
+                "isolated session {} already owns a capacity slot",
+                redact_session_ids(to)
             ));
         }
         Ok(())
@@ -132,7 +137,8 @@ impl StrictCapacity {
         }
         if state.resetting.contains(key) {
             return Err(anyhow!(
-                "isolated session for thread {key} is quarantined during reset"
+                "isolated session for thread {} is quarantined during reset",
+                redact_session_ids(key)
             ));
         }
         Ok(())
@@ -533,11 +539,12 @@ pub(super) async fn reserve_for_provisioning<'a>(
     .await?
     {
         StrictSuspendOutcome::Suspended => {
-            info!(evicted = %key, "pool full, suspended isolated session before provisioning");
+            info!(evicted = %redact_session_ids(key), "pool full, suspended isolated session before provisioning");
             Ok(StrictSlotReservation::new(&pool.strict_capacity, thread_id))
         }
         StrictSuspendOutcome::Orphaned => Err(anyhow!(
-            "pool full; isolated session {key} was orphaned for reconciliation"
+            "pool full; isolated session {} was orphaned for reconciliation",
+            redact_session_ids(key)
         )),
         StrictSuspendOutcome::Skipped => Err(anyhow!(
             "pool exhausted ({} sessions); eviction candidate became busy",
@@ -588,7 +595,8 @@ fn orphan_connection_in_state(
     }
     if !state.persisted.contains_key(key) {
         return Err(anyhow!(
-            "isolated session for thread {key} has no persisted session mapping"
+            "isolated session for thread {} has no persisted session mapping",
+            redact_session_ids(key)
         ));
     }
     state.active.remove(key);
@@ -624,11 +632,11 @@ fn try_orphan_all_active(pool: &SessionPool) {
     for (key, connection) in remaining {
         match orphan_connection_in_state(&mut state, &key, &connection) {
             Ok(true) => {
-                warn!(thread_id = %key, "isolated session orphaned at shutdown boundary")
+                warn!(thread_id = %redact_session_ids(&key), "isolated session orphaned at shutdown boundary")
             }
             Ok(false) => {}
             Err(error) => {
-                warn!(thread_id = %key, %error, "failed to mark isolated session orphaned")
+                warn!(thread_id = %redact_session_ids(&key), %error, "failed to mark isolated session orphaned")
             }
         }
     }
@@ -731,7 +739,8 @@ pub(super) async fn reset_strict_session(
     let Some(connection) = connection else {
         if pool.strict_capacity.contains(key) {
             return Err(anyhow!(
-                "isolated session for thread {key} has no active connection but still owns controller capacity; session remains quarantined and durable recovery is required by #1461"
+                "isolated session for thread {} has no active connection but still owns controller capacity; session remains quarantined and durable recovery is required by #1461",
+                redact_session_ids(key)
             ));
         }
         // Suspended/orphaned sessions must reconnect before fenced release.
@@ -740,17 +749,24 @@ pub(super) async fn reset_strict_session(
         if let Some(suspended) = persisted_state {
             let state_name = if suspended { "suspended" } else { "orphaned" };
             return Err(anyhow!(
-                "isolated session for thread {key} is {state_name}; reconnect it before requesting fenced release"
+                "isolated session for thread {} is {state_name}; reconnect it before requesting fenced release",
+                redact_session_ids(key)
             ));
         }
-        return Err(anyhow!("no isolated session for thread {key}"));
+        return Err(anyhow!(
+            "no isolated session for thread {}",
+            redact_session_ids(key)
+        ));
     };
     let Some(lifecycle) = lifecycle else {
         return Err(reset_failure_now(
             pool,
             key,
             &connection,
-            format_args!("isolated session for thread {key} has no lifecycle handle"),
+            format!(
+                "isolated session for thread {} has no lifecycle handle",
+                redact_session_ids(key)
+            ),
         ));
     };
     let Some(gate) = gate else {
@@ -758,7 +774,10 @@ pub(super) async fn reset_strict_session(
             pool,
             key,
             &connection,
-            format_args!("isolated session for thread {key} has no lifecycle gate"),
+            format!(
+                "isolated session for thread {} has no lifecycle gate",
+                redact_session_ids(key)
+            ),
         ));
     };
 
@@ -835,7 +854,10 @@ pub(super) async fn reset_strict_session(
                 return Err(anyhow!("isolated session changed before fenced release"));
             }
             let expected_session_id = state.persisted.get(key).cloned().ok_or_else(|| {
-                anyhow!("isolated session for thread {key} has no persisted session mapping")
+                anyhow!(
+                    "isolated session for thread {} has no persisted session mapping",
+                    redact_session_ids(key)
+                )
             })?;
             park_strict_session(&mut state, key, &connection, &lifecycle, false)?;
             expected_session_id
@@ -1020,27 +1042,27 @@ pub(super) async fn shutdown_strict_with_limits(
             .await
             {
                 Ok(Ok(StrictSuspendOutcome::Suspended)) => {
-                    info!(thread_id = %key, "suspended isolated session during shutdown");
+                    info!(thread_id = %redact_session_ids(&key), "suspended isolated session during shutdown");
                 }
                 Ok(Ok(StrictSuspendOutcome::Orphaned)) => {
-                    warn!(thread_id = %key, "dead isolated session orphaned during shutdown");
+                    warn!(thread_id = %redact_session_ids(&key), "dead isolated session orphaned during shutdown");
                 }
                 Ok(Ok(StrictSuspendOutcome::Skipped)) => {}
                 Ok(Err(error)) => {
-                    warn!(thread_id = %key, %error, "isolated session shutdown was not acknowledged");
+                    warn!(thread_id = %redact_session_ids(&key), %error, "isolated session shutdown was not acknowledged");
                 }
                 Err(_) => match try_orphan_connection_if_current(pool, &key, &connection) {
                     Ok(Some(true)) => warn!(
-                        thread_id = %key,
+                        thread_id = %redact_session_ids(&key),
                         "isolated session exceeded its shutdown deadline and was orphaned"
                     ),
                     Ok(Some(false)) => {}
                     Ok(None) => warn!(
-                        thread_id = %key,
+                        thread_id = %redact_session_ids(&key),
                         "isolated session exceeded its shutdown deadline; final orphan pass deferred"
                     ),
                     Err(error) => warn!(
-                        thread_id = %key,
+                        thread_id = %redact_session_ids(&key),
                         %error,
                         "isolated session exceeded its shutdown deadline and could not be orphaned"
                     ),
@@ -1149,7 +1171,10 @@ fn park_strict_session(
         ));
     }
     let session_id = state.persisted.get(key).cloned().ok_or_else(|| {
-        anyhow!("isolated session for thread {key} has no persisted session mapping")
+        anyhow!(
+            "isolated session for thread {} has no persisted session mapping",
+            redact_session_ids(key)
+        )
     })?;
 
     state.active.remove(key);
@@ -1185,30 +1210,33 @@ async fn try_suspend_strict_session(
         return Ok(StrictSuspendOutcome::Skipped);
     };
 
-    let lifecycle =
+    let lifecycle = {
+        let state = state.read().await;
+        if !state
+            .active
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, expected_connection))
         {
-            let state = state.read().await;
-            if !state
-                .active
-                .get(key)
-                .is_some_and(|current| Arc::ptr_eq(current, expected_connection))
-            {
+            return Ok(StrictSuspendOutcome::Skipped);
+        }
+        if let Some(cutoff) = idle_cutoff {
+            if connection.alive() && connection.last_active >= cutoff {
                 return Ok(StrictSuspendOutcome::Skipped);
             }
-            if let Some(cutoff) = idle_cutoff {
-                if connection.alive() && connection.last_active >= cutoff {
-                    return Ok(StrictSuspendOutcome::Skipped);
-                }
-            }
-            if !state.persisted.contains_key(key) {
-                return Err(anyhow!(
-                    "isolated session for thread {key} has no persisted session mapping"
-                ));
-            }
-            state.lifecycle_handles.get(key).cloned().ok_or_else(|| {
-                anyhow!("isolated session for thread {key} has no lifecycle handle")
-            })?
-        };
+        }
+        if !state.persisted.contains_key(key) {
+            return Err(anyhow!(
+                "isolated session for thread {} has no persisted session mapping",
+                redact_session_ids(key)
+            ));
+        }
+        state.lifecycle_handles.get(key).cloned().ok_or_else(|| {
+            anyhow!(
+                "isolated session for thread {} has no lifecycle handle",
+                redact_session_ids(key)
+            )
+        })?
+    };
 
     if !connection.alive() {
         let mut state = state.write().await;
@@ -1350,15 +1378,15 @@ impl SessionPool {
                     .await
                     {
                         Ok(StrictSuspendOutcome::Suspended) => {
-                            info!(thread_id = %key, "suspended idle isolated session");
+                            info!(thread_id = %redact_session_ids(&key), "suspended idle isolated session");
                         }
                         Ok(StrictSuspendOutcome::Orphaned) => {
-                            warn!(thread_id = %key, "dead isolated bridge detached as orphan");
+                            warn!(thread_id = %redact_session_ids(&key), "dead isolated bridge detached as orphan");
                         }
                         Ok(StrictSuspendOutcome::Skipped) => {}
                         Err(error) => {
                             warn!(
-                                thread_id = %key,
+                                thread_id = %redact_session_ids(&key),
                                 %error,
                                 "isolated session close failed during idle cleanup"
                             );
@@ -1379,7 +1407,7 @@ impl SessionPool {
                     {
                         Ok(StrictSuspendOutcome::Orphaned) => {
                             warn!(
-                                thread_id = %key,
+                                thread_id = %redact_session_ids(&key),
                                 age_secs = activity.age().as_secs(),
                                 "hung isolated bridge detached as orphan"
                             );
@@ -1391,7 +1419,7 @@ impl SessionPool {
                         Ok(_) => {}
                         Err(error) => {
                             warn!(
-                                thread_id = %key,
+                                thread_id = %redact_session_ids(&key),
                                 %error,
                                 "failed to detach hung isolated bridge"
                             );
@@ -1410,8 +1438,8 @@ mod tests {
     use super::{
         orphan_hung_strict_session, repair_absent_mapping, reset_strict_session,
         rollback_uncommitted_session, session_spawn_context, shutdown_strict_with_limits,
-        strict_session_snapshot, write_mapping_file, StrictCapacity, StrictSuspendOutcome,
-        UncommittedSessionProvenance,
+        strict_session_snapshot, try_orphan_all_active, write_mapping_file, StrictCapacity,
+        StrictSuspendOutcome, UncommittedSessionProvenance,
     };
     use crate::acp::connection::{
         AcpConnection, BrokerMappingExpectation, LifecycleCapabilities, LifecycleHandle,
@@ -1847,6 +1875,98 @@ done
         assert!(error.to_string().contains("shutting down"));
         assert!(capacity.contains("discord:thread-a"));
         assert!(!capacity.contains("discord:thread-b"));
+    }
+
+    #[test]
+    fn strict_capacity_error_redacts_acp_session_key() {
+        let uuid = "00000000-0000-0000-0000-000000000000";
+        let key = format!("acp:acp_{uuid}");
+        let capacity = StrictCapacity::new(1);
+        capacity.begin_reset(&key).unwrap();
+
+        let error = capacity
+            .ensure_session_admission_open(&key)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            !error.contains(uuid),
+            "no raw uuid may reach the error: {error}"
+        );
+        assert!(
+            !error.contains("acp_"),
+            "no raw ACP id prefix may reach the error: {error}"
+        );
+        assert!(
+            error.contains("acp:#"),
+            "the platform and redaction tag must survive: {error}"
+        );
+        assert!(
+            capacity
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .resetting
+                .contains(&key),
+            "redaction must not replace the internal session identity"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn strict_orphan_warning_redacts_acp_session_key() {
+        use std::io::Write;
+        use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+        #[derive(Clone)]
+        struct Capture(StdArc<StdMutex<Vec<u8>>>);
+
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let uuid = "00000000-0000-0000-0000-000000000000";
+        let key = format!("acp:acp_{uuid}");
+        let temp = tempfile::tempdir().unwrap();
+        let pool = strict_test_pool(temp.path(), 1);
+        assert!(pool.get_or_create(&key, None).await.unwrap());
+
+        let buffer = StdArc::new(StdMutex::new(Vec::new()));
+        let capture = Capture(StdArc::clone(&buffer));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || capture.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || try_orphan_all_active(&pool));
+
+        let output = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("isolated session orphaned"),
+            "the warning must fire: {output}"
+        );
+        assert!(
+            !output.contains(uuid),
+            "no raw uuid may reach the log: {output}"
+        );
+        assert!(
+            !output.contains("acp_"),
+            "no raw ACP id prefix may reach the log: {output}"
+        );
+        assert!(
+            output.contains("acp:#"),
+            "the platform and redaction tag must survive: {output}"
+        );
+        assert!(
+            pool.state.read().await.persisted.contains_key(&key),
+            "orphan reconciliation must retain the original durable session key"
+        );
     }
 
     #[cfg(unix)]

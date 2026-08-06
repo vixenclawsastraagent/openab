@@ -1319,7 +1319,10 @@ impl SessionPool {
                 })?;
             let gate = if self.session_context == SessionContextMode::OpenabV1 {
                 Some(state.creating.get(thread_id).cloned().ok_or_else(|| {
-                    anyhow!("isolated session for thread {thread_id} has no lifecycle gate")
+                    anyhow!(
+                        "isolated session for thread {} has no lifecycle gate",
+                        crate::redact::redact_session_ids(thread_id)
+                    )
                 })?)
             } else {
                 None
@@ -1339,7 +1342,8 @@ impl SessionPool {
                 .is_some_and(|current| Arc::ptr_eq(current, &connection));
             if !is_current {
                 return Err(anyhow!(
-                    "session for thread {thread_id} changed before prompt dispatch"
+                    "session for thread {} changed before prompt dispatch",
+                    crate::redact::redact_session_ids(thread_id)
                 ));
             }
         }
@@ -1417,7 +1421,12 @@ impl SessionPool {
                     .lifecycle_handles
                     .get(thread_id)
                     .cloned()
-                    .ok_or_else(|| anyhow!("no isolated session for thread {thread_id}"))?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "no isolated session for thread {}",
+                            crate::redact::redact_session_ids(thread_id)
+                        )
+                    })?
             };
             return lifecycle.cancel().await;
         }
@@ -1452,7 +1461,7 @@ impl SessionPool {
         if self.session_context == SessionContextMode::OpenabV1 {
             isolated::reset_strict_session(self, thread_id, isolated::STRICT_RESET_BUDGET).await?;
 
-            info!(thread_id, "isolated session released");
+            info!(thread_id = %crate::redact::redact_session_ids(thread_id), "isolated session released");
             return Ok(());
         }
 
