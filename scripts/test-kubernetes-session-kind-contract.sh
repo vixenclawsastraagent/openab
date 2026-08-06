@@ -460,6 +460,32 @@ grep -Fq 'session B workspace write changed session A state' "$TARGET" || {
 grep -Fq 'session A workspace overwrite changed session B state' "$TARGET" || {
     fail "the isolation mode must prove A cannot overwrite B"
 }
+grep -Fq 'assert_worker_network_policy_contract()' "$TARGET" || {
+    fail "the isolation mode must validate each dynamic worker NetworkPolicy"
+}
+grep -Fq 'dynamic NetworkPolicy does not exactly match its private worker and profile egress' \
+    "$TARGET" || {
+    fail "dynamic NetworkPolicy validation must fail on any selector or egress drift"
+}
+grep -Fq 'dynamic NetworkPolicy unexpectedly selects the peer worker' "$TARGET" || {
+    fail "each dynamic NetworkPolicy must reject the peer worker selector"
+}
+grep -Fq 'assert_worker_relay_network_policy_contract()' "$TARGET" || {
+    fail "the isolation mode must validate the chart-owned worker relay policy"
+}
+grep -Fq 'worker relay NetworkPolicy contains an unexpected lane' "$TARGET" || {
+    fail "the relay policy must fail on any DNS or controller lane drift"
+}
+grep -Fq 'worker namespace exposes a Service' "$TARGET" || {
+    fail "the isolation mode must reject inbound worker Services"
+}
+grep -Fq 'kubectl --request-timeout=5s -n "$WORKER_NAMESPACE" get services -o json' \
+    "$TARGET" || {
+    fail "worker Service absence must be parsed from a Kubernetes JSON snapshot"
+}
+if grep -Fq 'WORKER_SERVICES=$(kubectl' "$TARGET"; then
+    fail "worker Service absence must not use line-oriented kubectl output"
+fi
 grep -Fq 'kubernetes-session Kind test: isolation checks passed' "$TARGET" || {
     fail "the isolation mode must have its own completion signal"
 }

@@ -663,6 +663,162 @@ assert_worker_pod_isolation_contract() {
     fi
 }
 
+assert_worker_network_policy_contract() {
+    network_policy_case=$1
+    network_policy_name=$2
+    network_policy_worker_pod=$3
+    network_policy_peer_pod=$4
+    network_policy_description=$5
+    network_policy_snapshot="$TEMPORARY_ROOT/network-policy-$network_policy_case.json"
+    network_policy_worker_snapshot="$TEMPORARY_ROOT/network-policy-$network_policy_case-worker.json"
+    network_policy_peer_snapshot="$TEMPORARY_ROOT/network-policy-$network_policy_case-peer.json"
+
+    kubectl --request-timeout=5s -n "$WORKER_NAMESPACE" get networkpolicy \
+        "$network_policy_name" -o json > "$network_policy_snapshot"
+    kubectl --request-timeout=5s -n "$WORKER_NAMESPACE" get pod \
+        "$network_policy_worker_pod" -o json > "$network_policy_worker_snapshot"
+    kubectl --request-timeout=5s -n "$WORKER_NAMESPACE" get pod \
+        "$network_policy_peer_pod" -o json > "$network_policy_peer_snapshot"
+
+    if jq -e \
+        --slurpfile worker "$network_policy_worker_snapshot" '
+        def selected_by($labels; $selector):
+            (($selector.matchExpressions // []) | length == 0)
+            and all(
+                ($selector.matchLabels // {}) | to_entries[];
+                $labels[.key] == .value
+            );
+        ($worker[0].metadata.labels // {}) as $worker_labels
+        | ($worker_labels["openab.dev/session"] // "") as $session
+        | ($worker_labels["openab.dev/generation"] // "") as $generation
+        | ($session | (type == "string" and test("^[0-9a-f]{40}$")))
+        and ($generation | (type == "string" and test("^[1-9][0-9]*$")))
+        and ({
+            podSelector: .spec.podSelector,
+            policyTypes: (.spec.policyTypes | sort),
+            ingress: (.spec.ingress // []),
+            egress: .spec.egress
+        } == {
+            podSelector: {
+                matchLabels: {
+                    "openab.dev/session": $session,
+                    "openab.dev/generation": $generation,
+                    "openab.dev/resource": "worker-pod"
+                }
+            },
+            policyTypes: ["Egress", "Ingress"],
+            ingress: [],
+            egress: [{
+                to: [{ipBlock: {cidr: "192.0.2.1/32"}}],
+                ports: [{port: 443, protocol: "TCP"}]
+            }]
+        })
+        and selected_by($worker_labels; .spec.podSelector)
+    ' "$network_policy_snapshot" >/dev/null; then
+        :
+    else
+        fail "$network_policy_description dynamic NetworkPolicy does not exactly match its private worker and profile egress"
+    fi
+
+    if jq -e \
+        --slurpfile peer "$network_policy_peer_snapshot" '
+        def selected_by($labels; $selector):
+            (($selector.matchExpressions // []) | length == 0)
+            and all(
+                ($selector.matchLabels // {}) | to_entries[];
+                $labels[.key] == .value
+            );
+        selected_by(
+            ($peer[0].metadata.labels // {});
+            .spec.podSelector
+        ) | not
+    ' "$network_policy_snapshot" >/dev/null; then
+        :
+    else
+        fail "$network_policy_description dynamic NetworkPolicy unexpectedly selects the peer worker"
+    fi
+}
+
+assert_worker_relay_network_policy_contract() {
+    relay_worker_a=$1
+    relay_worker_b=$2
+    relay_policy_snapshot="$TEMPORARY_ROOT/worker-relay-network-policy.json"
+    relay_worker_a_snapshot="$TEMPORARY_ROOT/worker-relay-network-policy-a.json"
+    relay_worker_b_snapshot="$TEMPORARY_ROOT/worker-relay-network-policy-b.json"
+
+    kubectl --request-timeout=5s -n "$WORKER_NAMESPACE" get networkpolicy \
+        "$CONTROLLER_NAME-worker-net" -o json > "$relay_policy_snapshot"
+    kubectl --request-timeout=5s -n "$WORKER_NAMESPACE" get pod \
+        "$relay_worker_a" -o json > "$relay_worker_a_snapshot"
+    kubectl --request-timeout=5s -n "$WORKER_NAMESPACE" get pod \
+        "$relay_worker_b" -o json > "$relay_worker_b_snapshot"
+
+    if jq -e \
+        --arg system_namespace "$SYSTEM_NAMESPACE" \
+        --arg release_name "$RELEASE_NAME" \
+        --slurpfile worker_a "$relay_worker_a_snapshot" \
+        --slurpfile worker_b "$relay_worker_b_snapshot" '
+        def selected_by($labels; $selector):
+            (($selector.matchExpressions // []) | length == 0)
+            and all(
+                ($selector.matchLabels // {}) | to_entries[];
+                $labels[.key] == .value
+            );
+        ({
+            podSelector: .spec.podSelector,
+            policyTypes: (.spec.policyTypes | sort),
+            ingress: (.spec.ingress // []),
+            egress: .spec.egress
+        } == {
+            podSelector: {matchLabels: {
+                "app.kubernetes.io/managed-by": "openab-session-controller",
+                "openab.dev/resource": "worker-pod"
+            }},
+            policyTypes: ["Egress"],
+            ingress: [],
+            egress: [
+                {
+                    to: [{
+                        namespaceSelector: {matchLabels: {
+                            "kubernetes.io/metadata.name": "kube-system"
+                        }},
+                        podSelector: {matchLabels: {"k8s-app": "kube-dns"}}
+                    }],
+                    ports: [
+                        {port: 53, protocol: "UDP"},
+                        {port: 53, protocol: "TCP"}
+                    ]
+                },
+                {
+                    to: [{
+                        namespaceSelector: {matchLabels: {
+                            "kubernetes.io/metadata.name": $system_namespace
+                        }},
+                        podSelector: {matchLabels: {
+                            "app.kubernetes.io/name": "openab-kubernetes-session",
+                            "app.kubernetes.io/instance": $release_name,
+                            "app.kubernetes.io/component": "controller"
+                        }}
+                    }],
+                    ports: [{port: 8443, protocol: "TCP"}]
+                }
+            ]
+        })
+        and selected_by(
+            ($worker_a[0].metadata.labels // {});
+            .spec.podSelector
+        )
+        and selected_by(
+            ($worker_b[0].metadata.labels // {});
+            .spec.podSelector
+        )
+    ' "$relay_policy_snapshot" >/dev/null; then
+        :
+    else
+        fail "worker relay NetworkPolicy contains an unexpected lane"
+    fi
+}
+
 assert_shared_skills_config_map() {
     skills_config_map_snapshot="$TEMPORARY_ROOT/shared-skills-config-map.json"
     kubectl -n "$WORKER_NAMESPACE" get configmap \
@@ -1532,6 +1688,13 @@ if [ "$MODE" = '--isolation' ]; then
         "$WORKER_POD_B" "$WORKSPACE_PVC_B" "$WORKSPACE_PVC" \
         'worker Pod B' "session A's"
     assert_worker_shared_skills "$WORKER_POD_B"
+    assert_worker_network_policy_contract \
+        a "$WORKER_NETWORK_POLICY" "$WORKER_POD" "$WORKER_POD_B" \
+        'session A'
+    assert_worker_network_policy_contract \
+        b "$WORKER_NETWORK_POLICY_B" "$WORKER_POD_B" "$WORKER_POD" \
+        'session B'
+    assert_worker_relay_network_policy_contract "$WORKER_POD" "$WORKER_POD_B"
 
     WORKER_IMAGE_OBSERVED_B=$(kubectl -n "$WORKER_NAMESPACE" get pod \
         "$WORKER_POD_B" -o jsonpath='{.spec.containers[0].image}')
@@ -1660,8 +1823,15 @@ PUBLIC_INGRESS=$(kubectl -n "$SYSTEM_NAMESPACE" get service "$CONTROLLER_NAME" \
 EXTERNAL_IPS=$(kubectl -n "$SYSTEM_NAMESPACE" get service "$CONTROLLER_NAME" \
     -o jsonpath='{.spec.externalIPs}')
 [ -z "$EXTERNAL_IPS" ] || fail "controller Service has external IPs"
-WORKER_SERVICES=$(kubectl -n "$WORKER_NAMESPACE" get services -o name)
-[ -z "$WORKER_SERVICES" ] || fail "worker namespace exposes a Service"
+WORKER_SERVICES_SNAPSHOT="$TEMPORARY_ROOT/worker-services.json"
+kubectl --request-timeout=5s -n "$WORKER_NAMESPACE" get services -o json \
+    > "$WORKER_SERVICES_SNAPSHOT"
+jq -e '
+    type == "object"
+    and (.items | (type == "array" and length == 0))
+' "$WORKER_SERVICES_SNAPSHOT" >/dev/null || {
+    fail "worker namespace exposes a Service"
+}
 
 COMPLETED=1
 if [ "$MODE" = '--isolation' ]; then
