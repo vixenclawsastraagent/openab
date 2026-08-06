@@ -388,10 +388,10 @@ and all default Dockerfiles against the Stage A baseline.
 
 - [ ] **Task 17 — Bootstrap a deterministic Kind add-on smoke test.**
   - Depends on: Tasks 14–16.
-  - Test first: each missing prerequisite (Docker, Kind, Helm, kubectl, usable
-    CNI) exits non-zero with a specific message; no isolation assertion may be
-    silently skipped. Require API-server rejection of a semantically invalid
-    CIDR fixture that Helm can only shape-check.
+  - Test first: each missing prerequisite (Docker, Kind, Helm, kubectl,
+    OpenSSL, Git, jq, usable CNI) exits non-zero with a specific message; no
+    isolation assertion may be silently skipped. Require API-server rejection
+    of a semantically invalid CIDR fixture that Helm can only shape-check.
   - Work: add `scripts/test-kubernetes-session-kind.sh` to create a disposable
     cluster, build/load pinned test images, install the chart while the broker
     runtime is disabled, create the operator-owned immutable CA and worker

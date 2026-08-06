@@ -5,6 +5,8 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "${0%/*}" && pwd)
 TARGET="$SCRIPT_DIR/test-kubernetes-session-kind.sh"
 PROFILE_FIXTURE="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/profiles.toml.in"
+ENDPOINT_FILTER="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/api-server-endpoints.jq"
+ENDPOINT_FIXTURE="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/api-server-endpoints.json"
 TEMPORARY_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/openab-session-kind-contract.XXXXXX")
 
 fail() {
@@ -35,7 +37,7 @@ prepare_path() {
     missing=${2:-}
     fake_bin="$TEMPORARY_ROOT/$case_name/bin"
     mkdir -p "$fake_bin"
-    for command_name in docker kind helm kubectl openssl git; do
+    for command_name in docker kind helm kubectl openssl git jq; do
         if [ "$command_name" != "$missing" ]; then
             write_command "$fake_bin/$command_name" 0
         fi
@@ -60,8 +62,77 @@ assert_failure() {
     }
 }
 
+assert_endpoint_filter_failure() {
+    case_name=$1
+    mutation=$2
+    expected=$3
+    fixture="$TEMPORARY_ROOT/$case_name.json"
+    stdout_file="$TEMPORARY_ROOT/$case_name.stdout"
+    stderr_file="$TEMPORARY_ROOT/$case_name.stderr"
+
+    jq "$mutation" "$ENDPOINT_FIXTURE" > "$fixture"
+    if jq -r -f "$ENDPOINT_FILTER" "$fixture" \
+        > "$stdout_file" 2> "$stderr_file"; then
+        fail "$case_name unexpectedly succeeded"
+    fi
+    [ ! -s "$stdout_file" ] || fail "$case_name wrote unexpected stdout"
+    grep -Fq "$expected" "$stderr_file" || {
+        sed -n '1,20p' "$stderr_file" >&2
+        fail "$case_name did not fail with the expected parser error"
+    }
+}
+
 [ -f "$TARGET" ] || fail "missing scripts/test-kubernetes-session-kind.sh"
 [ -f "$PROFILE_FIXTURE" ] || fail "missing Kind worker profile fixture"
+[ -f "$ENDPOINT_FILTER" ] || fail "missing API EndpointSlice jq filter"
+[ -f "$ENDPOINT_FIXTURE" ] || fail "missing API EndpointSlice JSON fixture"
+
+endpoint_output=$(jq -r -f "$ENDPOINT_FILTER" "$ENDPOINT_FIXTURE")
+expected_endpoint_output='endpoint=172.18.0.2:6443'
+[ "$endpoint_output" = "$expected_endpoint_output" ] || {
+    printf '%s\n' "$endpoint_output" >&2
+    fail "the jq parser did not preserve only correlated API endpoint tuples"
+}
+printf '%s\n' '{"apiVersion":"discovery.k8s.io/v1","kind":"EndpointSliceList","items":[]}' \
+    > "$TEMPORARY_ROOT/empty-endpoints.json"
+empty_endpoint_output=$(jq -r -f \
+    "$ENDPOINT_FILTER" "$TEMPORARY_ROOT/empty-endpoints.json")
+[ -z "$empty_endpoint_output" ] || {
+    fail "an empty EndpointSlice list must remain retryable"
+}
+jq '.items[1].endpoints[0].addresses[0] = "172.18.0.3"' \
+    "$ENDPOINT_FIXTURE" > "$TEMPORARY_ROOT/conflicting-endpoints.json"
+if jq -r -f "$ENDPOINT_FILTER" \
+    "$TEMPORARY_ROOT/conflicting-endpoints.json" \
+    > "$TEMPORARY_ROOT/conflicting-endpoints.stdout" \
+    2> "$TEMPORARY_ROOT/conflicting-endpoints.stderr"; then
+    fail "different API EndpointSlice tuples unexpectedly agreed"
+fi
+[ ! -s "$TEMPORARY_ROOT/conflicting-endpoints.stdout" ] || {
+    fail "conflicting API EndpointSlice tuples wrote unexpected stdout"
+}
+grep -Fq 'Kubernetes API EndpointSlice tuples did not agree' \
+    "$TEMPORARY_ROOT/conflicting-endpoints.stderr" || {
+    fail "conflicting API EndpointSlice tuples did not fail closed"
+}
+assert_endpoint_filter_failure protocol-type \
+    '.items[0].ports[0].protocol = false' \
+    'EndpointSlice port.protocol must be a string or null'
+assert_endpoint_filter_failure ready-type \
+    '.items[0].endpoints[0].conditions.ready = "false"' \
+    'EndpointSlice endpoint.conditions.ready must be boolean or null'
+assert_endpoint_filter_failure nil-addresses \
+    '.items[0].endpoints[0].addresses = null' \
+    'ready IPv4 EndpointSlice addresses must be a non-empty array'
+assert_endpoint_filter_failure nil-port \
+    '.items[0].ports[0].port = null' \
+    'Kubernetes API https/TCP EndpointSlice port must be a number'
+assert_endpoint_filter_failure invalid-ipv4 \
+    '.items[0].endpoints[0].addresses[0] = "999.999.999.999"' \
+    'ready IPv4 EndpointSlice address must be canonical IPv4'
+assert_endpoint_filter_failure invalid-port \
+    '.items[0].ports[0].port = 70000' \
+    'Kubernetes API https/TCP EndpointSlice port must be an integer from 1 to 65535'
 
 grep -Fq 'cidr = "192.0.2.1/32"' "$PROFILE_FIXTURE" || {
     fail "Kind profile must use a non-relay documentation egress target"
@@ -79,7 +150,7 @@ fi
 grep -Fqx "kubernetes-session Kind test: usage: $TARGET [--check|--smoke]" \
     "$unknown_stderr" || fail "unknown mode did not emit the exact usage failure"
 
-for missing in docker kind helm kubectl openssl git; do
+for missing in docker kind helm kubectl openssl git jq; do
     fake_bin=$(prepare_path "missing-$missing" "$missing")
     assert_failure "missing-$missing" "$missing is required for Kind smoke tests" "$fake_bin"
 done
@@ -145,11 +216,14 @@ grep -Fq 'single_unique_word()' "$TARGET" || {
 grep -Fq 'fail "$description values did not agree"' "$TARGET" || {
     fail "different EndpointSlice values must fail closed"
 }
-grep -Fq 'API_SERVER_IP=$(single_unique_word "$API_SERVER_ENDPOINTS"' "$TARGET" || {
-    fail "the API server address must use the unique EndpointSlice value"
+grep -Fq 'API_SERVER_ENDPOINT=$(single_unique_word' "$TARGET" || {
+    fail "the API endpoint tuple must use the unique EndpointSlice value"
 }
-grep -Fq 'API_SERVER_PORT=$(single_unique_word "$API_SERVER_PORTS"' "$TARGET" || {
-    fail "the API server port must use the unique EndpointSlice value"
+grep -Fq 'API_SERVER_IP=${API_SERVER_ENDPOINT%:*}' "$TARGET" || {
+    fail "the API server address must come from the selected tuple"
+}
+grep -Fq 'API_SERVER_PORT=${API_SERVER_ENDPOINT##*:}' "$TARGET" || {
+    fail "the API server port must come from the selected tuple"
 }
 grep -Fq '      - $api_server_ip/32' "$TARGET" || {
     fail "the controller API egress must remain restricted to one exact IPv4 host"
@@ -166,11 +240,8 @@ grep -Fq 'run_bounded 60 "$TEMPORARY_ROOT/api-endpoint"' "$TARGET" || {
 grep -Fq 'kubectl --request-timeout=5s -n default get endpointslice' "$TARGET" || {
     fail "each API EndpointSlice query must have a request timeout"
 }
-grep -Fq 'address={.}' "$TARGET" || {
-    fail "the API EndpointSlice poll must capture tagged addresses"
-}
-grep -Fq 'port={.port}' "$TARGET" || {
-    fail "the API EndpointSlice poll must capture one tagged object snapshot"
+grep -Fq '\($address):\($port)' "$ENDPOINT_FILTER" || {
+    fail "the API EndpointSlice parser must preserve address-port correlation"
 }
 grep -Fq 'Kubernetes API endpoint was unavailable after 60s' "$TARGET" || {
     fail "the API EndpointSlice timeout must remain explicit"
@@ -178,5 +249,12 @@ grep -Fq 'Kubernetes API endpoint was unavailable after 60s' "$TARGET" || {
 grep -Fq 'diagnostic-api-endpointslices' "$TARGET" || {
     fail "EndpointSlice failures must retain live object diagnostics"
 }
+grep -Fq 'jq -r -f "$API_SERVER_ENDPOINT_FILTER"' "$TARGET" || {
+    fail "EndpointSlice discovery must use the fixture-tested jq parser"
+}
+if grep -Fq '.items[*].endpoints[*].addresses[*]' "$TARGET" || \
+    grep -Fq '.items[*].ports[*]' "$TARGET"; then
+    fail "EndpointSlice discovery must not return to kubectl JSONPath parsing"
+fi
 
 printf '%s\n' 'kubernetes-session Kind contract test: all checks passed'

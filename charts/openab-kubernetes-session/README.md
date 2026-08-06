@@ -60,6 +60,8 @@ The repository includes a disposable two-node Kind harness for this add-on.
 It uses pinned Kind, Kubernetes, and container images, an isolated kubeconfig,
 and a private test CA. The harness refuses to reuse an existing cluster and
 removes only the cluster and image tags it created.
+It requires Docker with a running daemon, Kind, Helm, kubectl, OpenSSL, Git,
+and jq.
 
 Check local prerequisites without creating anything:
 

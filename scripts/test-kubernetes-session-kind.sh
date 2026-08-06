@@ -6,6 +6,7 @@ SCRIPT_DIR=$(CDPATH= cd -- "${0%/*}" && pwd)
 REPOSITORY_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 FIXTURE_ROOT="$REPOSITORY_ROOT/tests/fixtures/kubernetes-session-kind"
 CHART="$REPOSITORY_ROOT/charts/openab-kubernetes-session"
+API_SERVER_ENDPOINT_FILTER="$FIXTURE_ROOT/api-server-endpoints.jq"
 MODE=${1:-}
 
 KIND_NODE_IMAGE='kindest/node:v1.32.11@sha256:5fc52d52a7b9574015299724bd68f183702956aa4a2116ae75a63cb574b35af8'
@@ -29,7 +30,7 @@ require_command() {
 }
 
 require_prerequisites() {
-    for command_name in docker kind helm kubectl openssl git; do
+    for command_name in docker kind helm kubectl openssl git jq; do
         require_command "$command_name"
     done
     docker info >/dev/null 2>&1 || {
@@ -56,6 +57,7 @@ for fixture in \
     kind.yaml \
     controller.toml \
     profiles.toml.in \
+    api-server-endpoints.jq \
     smoke.ndjson \
     broker-pod.yaml.in \
     network-probe-pod.yaml.in; do
@@ -304,17 +306,19 @@ single_unique_word() {
 }
 
 poll_api_server_endpoint() {
+    endpoint_json="$TEMPORARY_ROOT/api-endpoint-slices.json"
     while :; do
-        if ! endpoint_snapshot=$(kubectl --request-timeout=5s -n default get endpointslice \
+        # Keep address and port correlated by parsing one complete API snapshot.
+        if ! kubectl --request-timeout=5s -n default get endpointslice \
             -l kubernetes.io/service-name=kubernetes \
-            -o jsonpath='{range .items[*].endpoints[*].addresses[*]}address={.}{"\n"}{end}{range .items[*].ports[*]}port={.port}{"\n"}{end}'); then
+            -o json > "$endpoint_json"; then
             return 1
         fi
-        endpoint_addresses=$(printf '%s\n' "$endpoint_snapshot" | \
-            sed -n 's/^address=//p')
-        endpoint_ports=$(printf '%s\n' "$endpoint_snapshot" | \
-            sed -n 's/^port=//p')
-        if [ -n "$endpoint_addresses" ] && [ -n "$endpoint_ports" ]; then
+        if ! endpoint_snapshot=$(jq -r -f "$API_SERVER_ENDPOINT_FILTER" \
+            "$endpoint_json"); then
+            return 1
+        fi
+        if [ -n "$endpoint_snapshot" ]; then
             printf '%s\n' "$endpoint_snapshot"
             return 0
         fi
@@ -335,10 +339,14 @@ wait_for_api_server_endpoint() {
         fi
         fail "Kubernetes API EndpointSlice discovery failed"
     fi
-    API_SERVER_ENDPOINTS=$(sed -n 's/^address=//p' "$endpoint_output")
-    API_SERVER_PORTS=$(sed -n 's/^port=//p' "$endpoint_output")
-    API_SERVER_IP=$(single_unique_word "$API_SERVER_ENDPOINTS" 'Kubernetes API endpoint')
-    API_SERVER_PORT=$(single_unique_word "$API_SERVER_PORTS" 'Kubernetes API endpoint port')
+    API_SERVER_ENDPOINTS=$(sed -n 's/^endpoint=//p' "$endpoint_output")
+    API_SERVER_ENDPOINT=$(single_unique_word \
+        "$API_SERVER_ENDPOINTS" 'Kubernetes API endpoint')
+    API_SERVER_IP=${API_SERVER_ENDPOINT%:*}
+    API_SERVER_PORT=${API_SERVER_ENDPOINT##*:}
+    [ "$API_SERVER_IP:$API_SERVER_PORT" = "$API_SERVER_ENDPOINT" ] || {
+        fail "Kubernetes API endpoint tuple was malformed"
+    }
 }
 
 assert_anchor_owner() {
