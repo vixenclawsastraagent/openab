@@ -12,6 +12,7 @@ LIFECYCLE_FIXTURE="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/session
 ENDPOINT_FILTER="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/api-server-endpoints.jq"
 ENDPOINT_FIXTURE="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/api-server-endpoints.json"
 DEADLINE_FILTER="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/session-compute-deadline.jq"
+RELEASE_INVENTORY_FILTER="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/released-session-inventory.jq"
 PROCESS_CONFIG_SOURCE="$SCRIPT_DIR/../crates/openab-kubernetes-session/src/controller_process_config.rs"
 TEMPORARY_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/openab-session-kind-contract.XXXXXX")
 
@@ -109,6 +110,17 @@ assert_deadline_filter_failure() {
     }
 }
 
+run_release_inventory_filter() {
+    release_inventory_input=$1
+    release_inventory_output=$2
+
+    jq -e \
+        --slurpfile expected "$RELEASE_TARGETS" \
+        --arg session_id "$RELEASE_SESSION_ID" \
+        -f "$RELEASE_INVENTORY_FILTER" "$release_inventory_input" \
+        > "$release_inventory_output"
+}
+
 [ -f "$TARGET" ] || fail "missing scripts/test-kubernetes-session-kind.sh"
 [ -f "$WORKFLOW" ] || fail "missing Kubernetes Session Images workflow"
 [ -f "$PROFILE_FIXTURE" ] || fail "missing Kind worker profile fixture"
@@ -118,6 +130,9 @@ assert_deadline_filter_failure() {
 [ -f "$ENDPOINT_FILTER" ] || fail "missing API EndpointSlice jq filter"
 [ -f "$ENDPOINT_FIXTURE" ] || fail "missing API EndpointSlice JSON fixture"
 [ -f "$DEADLINE_FILTER" ] || fail "missing session compute deadline jq filter"
+[ -f "$RELEASE_INVENTORY_FILTER" ] || {
+    fail "missing released-session inventory jq filter"
+}
 [ -f "$PROCESS_CONFIG_SOURCE" ] || fail "missing controller process config source"
 
 endpoint_output=$(jq -r -f "$ENDPOINT_FILTER" "$ENDPOINT_FIXTURE")
@@ -249,10 +264,11 @@ lifecycle_fixture_bytes=$(wc -c < "$LIFECYCLE_FIXTURE")
     fail "session lifecycle fixture exceeds its bounded input size"
 }
 jq -s -e '
-    length == 15
+    length == 23
     and ([.[].id] | sort == [
-        301, 310, 311, 312, 401, 402, 403, 404, 405, 406, 407, 408,
-        409, 498, 499
+        301, 310, 311, 312, 313, 314, 315,
+        401, 402, 403, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413,
+        497, 498, 499
     ])
     and all(.[];
         type == "object"
@@ -277,6 +293,11 @@ jq -s -e '
                     type == "object"
                     and keys == ["sessionId"]
                 ))
+            elif .method == "_openab/session/release" then
+                (.params | (
+                    type == "object"
+                    and keys == ["sessionId"]
+                ))
             else
                 false
             end
@@ -289,6 +310,9 @@ jq -s -e '
         [310, "session/load"],
         [311, "_openab/test/workspace/read"],
         [312, "session/prompt"],
+        [313, "session/load"],
+        [314, "_openab/test/workspace/read"],
+        [315, "_openab/session/release"],
         [401, "session/prompt"],
         [402, "session/prompt"],
         [403, "session/prompt"],
@@ -298,11 +322,186 @@ jq -s -e '
         [407, "session/prompt"],
         [408, "session/prompt"],
         [409, "session/prompt"],
+        [410, "session/prompt"],
+        [411, "session/prompt"],
+        [412, "session/prompt"],
+        [413, "session/prompt"],
+        [497, "_openab/test/workspace/read"],
         [498, "_openab/test/workspace/read"],
         [499, "_openab/test/workspace/read"]
     ]
 ' "$LIFECYCLE_FIXTURE" >/dev/null || {
     fail "session lifecycle fixture is not a closed replacement sequence"
+}
+
+RELEASE_SESSION_ID='release-session-a'
+RELEASE_TARGETS="$TEMPORARY_ROOT/release-targets.json"
+RELEASE_INVENTORY="$TEMPORARY_ROOT/release-inventory.json"
+RELEASE_PIVOT="$TEMPORARY_ROOT/release-pivot.json"
+jq -n '[
+    {kind: "ConfigMap", name: "anchor-a", uid: "anchor-uid-a"},
+    {
+        kind: "PersistentVolumeClaim",
+        name: "workspace-a",
+        uid: "pvc-uid-a"
+    },
+    {kind: "Pod", name: "worker-a", uid: "pod-uid-a"},
+    {
+        kind: "ServiceAccount",
+        name: "worker-a",
+        uid: "service-account-uid-a"
+    },
+    {
+        kind: "NetworkPolicy",
+        name: "worker-a",
+        uid: "network-policy-uid-a"
+    }
+]' > "$RELEASE_TARGETS"
+jq -n --arg session_id "$RELEASE_SESSION_ID" '
+    def resource($kind; $name; $uid; $owner):
+        {
+            kind: $kind,
+            metadata: {
+                name: $name,
+                uid: $uid,
+                annotations: (
+                    if $owner == "" then
+                        {}
+                    else
+                        {"openab.dev/session-id": $owner}
+                    end
+                )
+            }
+        };
+    {
+        items: [
+            resource("ConfigMap"; "platform"; "platform-uid"; ""),
+            resource("ConfigMap"; "anchor-a"; "anchor-uid-a"; $session_id),
+            resource("NetworkPolicy"; "worker-a"; "network-policy-uid-a"; $session_id),
+            resource("PersistentVolumeClaim"; "workspace-a"; "pvc-uid-a"; $session_id),
+            resource("Pod"; "worker-a"; "pod-uid-a"; $session_id),
+            resource("ServiceAccount"; "worker-a"; "service-account-uid-a"; $session_id),
+            resource("Pod"; "worker-b"; "pod-uid-b"; "release-session-b")
+        ]
+    }
+' > "$RELEASE_INVENTORY"
+run_release_inventory_filter "$RELEASE_INVENTORY" "$RELEASE_PIVOT"
+jq -e '
+    [.exactMatches[].kind] == [
+        "ConfigMap",
+        "NetworkPolicy",
+        "PersistentVolumeClaim",
+        "Pod",
+        "ServiceAccount"
+    ]
+    and [.annotatedChildren[].kind] == [
+        "NetworkPolicy",
+        "PersistentVolumeClaim",
+        "Pod",
+        "ServiceAccount"
+    ]
+' "$RELEASE_PIVOT" >/dev/null || {
+    fail "released-session jq pivot lost exact resources or annotated children"
+}
+RELEASED_INVENTORY="$TEMPORARY_ROOT/released-inventory.json"
+jq --arg session_id "$RELEASE_SESSION_ID" '
+    .items |= map(select(
+        (.metadata.annotations["openab.dev/session-id"] // "")
+            != $session_id
+    ))
+' "$RELEASE_INVENTORY" > "$RELEASED_INVENTORY"
+run_release_inventory_filter "$RELEASED_INVENTORY" "$RELEASE_PIVOT"
+jq -e '.exactMatches == [] and .annotatedChildren == []' \
+    "$RELEASE_PIVOT" >/dev/null || {
+    fail "released-session jq pivot did not prove a complete release"
+}
+ORPHANED_CHILDREN_INVENTORY="$TEMPORARY_ROOT/orphaned-children-inventory.json"
+jq --arg session_id "$RELEASE_SESSION_ID" '
+    .items += [
+        {
+            kind: "ConfigMap",
+            metadata: {
+                name: "unexpected-session-config",
+                uid: "unexpected-config-uid",
+                annotations: {"openab.dev/session-id": $session_id}
+            }
+        },
+        {
+            kind: "Secret",
+            metadata: {
+                name: "orphaned-registration",
+                uid: "orphaned-registration-uid",
+                annotations: {"openab.dev/session-id": $session_id}
+            }
+        }
+    ]
+' "$RELEASED_INVENTORY" > "$ORPHANED_CHILDREN_INVENTORY"
+run_release_inventory_filter "$ORPHANED_CHILDREN_INVENTORY" "$RELEASE_PIVOT"
+jq -e '
+    .exactMatches == []
+    and [.annotatedChildren[] | [.kind, .name, .uid]] == [
+        ["ConfigMap", "unexpected-session-config", "unexpected-config-uid"],
+        ["Secret", "orphaned-registration", "orphaned-registration-uid"]
+    ]
+' "$RELEASE_PIVOT" >/dev/null || {
+    fail "released-session jq pivot ignored session-annotated orphan resources"
+}
+REPLACED_ANCHOR_INVENTORY="$TEMPORARY_ROOT/replaced-anchor-inventory.json"
+jq --arg session_id "$RELEASE_SESSION_ID" '
+    .items += [{
+        kind: "ConfigMap",
+        metadata: {
+            name: "anchor-a",
+            uid: "replacement-anchor-uid",
+            annotations: {"openab.dev/session-id": $session_id}
+        }
+    }]
+' "$RELEASED_INVENTORY" > "$REPLACED_ANCHOR_INVENTORY"
+run_release_inventory_filter "$REPLACED_ANCHOR_INVENTORY" "$RELEASE_PIVOT"
+jq -e '
+    [.exactMatches[] | [.kind, .name, .uid]]
+        == [["ConfigMap", "anchor-a", "replacement-anchor-uid"]]
+    and .annotatedChildren == []
+' "$RELEASE_PIVOT" >/dev/null || {
+    fail "released-session jq pivot did not detect a deterministic name collision"
+}
+REPLACED_PVC_INVENTORY="$TEMPORARY_ROOT/replaced-pvc-inventory.json"
+jq --arg session_id "$RELEASE_SESSION_ID" '
+    .items += [{
+        kind: "PersistentVolumeClaim",
+        metadata: {
+            name: "renamed-workspace-a",
+            uid: "pvc-uid-a",
+            annotations: {"openab.dev/session-id": $session_id}
+        }
+    }]
+' "$RELEASED_INVENTORY" > "$REPLACED_PVC_INVENTORY"
+run_release_inventory_filter "$REPLACED_PVC_INVENTORY" "$RELEASE_PIVOT"
+jq -e '
+    [.exactMatches[] | [.kind, .name, .uid]]
+        == [["PersistentVolumeClaim", "renamed-workspace-a", "pvc-uid-a"]]
+    and [.annotatedChildren[] | [.kind, .name, .uid]]
+        == [["PersistentVolumeClaim", "renamed-workspace-a", "pvc-uid-a"]]
+' "$RELEASE_PIVOT" >/dev/null || {
+    fail "released-session jq pivot did not detect an exact UID collision"
+}
+MALFORMED_RELEASE_INVENTORY="$TEMPORARY_ROOT/malformed-release-inventory.json"
+jq '.items[1].metadata.annotations["openab.dev/session-id"] = false' \
+    "$RELEASE_INVENTORY" > "$MALFORMED_RELEASE_INVENTORY"
+if jq -e \
+    --slurpfile expected "$RELEASE_TARGETS" \
+    --arg session_id "$RELEASE_SESSION_ID" \
+    -f "$RELEASE_INVENTORY_FILTER" "$MALFORMED_RELEASE_INVENTORY" \
+    > "$TEMPORARY_ROOT/malformed-release.stdout" \
+    2> "$TEMPORARY_ROOT/malformed-release.stderr"; then
+    fail "malformed released-session inventory unexpectedly succeeded"
+fi
+[ ! -s "$TEMPORARY_ROOT/malformed-release.stdout" ] || {
+    fail "malformed released-session inventory wrote unexpected stdout"
+}
+grep -Fq 'released-session inventory item is malformed' \
+    "$TEMPORARY_ROOT/malformed-release.stderr" || {
+    fail "malformed released-session inventory did not fail closed"
 }
 
 DEADLINE_SNAPSHOT="$TEMPORARY_ROOT/deadline-snapshot.json"
@@ -736,6 +935,49 @@ grep -Fq 'compute suspension affected session B' "$TARGET" || {
 }
 grep -Fq 'capture_controller_fingerprint()' "$TARGET" || {
     fail "compute TTL must rule out a controller restart"
+}
+grep -Fq 'assert_initialize_release_capability()' "$TARGET" || {
+    fail "explicit release must require the advertised bridge capability"
+}
+grep -Fq 'rpc_response_is_present()' "$TARGET" || {
+    fail "terminal responses must have a reusable correlated lookup"
+}
+rpc_response_lookup_count=$(grep -Fc 'rpc_response_is_present' "$TARGET")
+[ "$rpc_response_lookup_count" -ge 3 ] || {
+    fail "terminal response waits must recheck output after process exit"
+}
+grep -Fq 'wait_for_released_session_absent()' "$TARGET" || {
+    fail "explicit release must prove exact names, UIDs, and session children absent"
+}
+grep -Fq 'configmaps,pods,persistentvolumeclaims,secrets,serviceaccounts,networkpolicies.networking.k8s.io' \
+    "$TARGET" || {
+    fail "explicit release must inspect one correlated Kubernetes inventory"
+}
+grep -Fq '$targets[] as $target' "$RELEASE_INVENTORY_FILTER" || {
+    fail "explicit release must pivot its expected resources through jq"
+}
+grep -Fq 'exactMatches:' "$RELEASE_INVENTORY_FILTER" || {
+    fail "explicit release must report matching deterministic names or UIDs"
+}
+grep -Fq 'annotatedChildren:' "$RELEASE_INVENTORY_FILTER" || {
+    fail "explicit release must report remaining session-annotated children"
+}
+grep -Fq 'session A resume did not retain its workspace state' "$TARGET" || {
+    fail "explicit release must first prove suspended storage can resume"
+}
+grep -Fq 'session A release did not receive correlated acknowledgement' \
+    "$TARGET" || {
+    fail "explicit release must receive the correlated controller result"
+}
+grep -Fq 'session A release bridge did not exit cleanly' "$TARGET" || {
+    fail "explicit release must terminate its bridge only after a clean result"
+}
+grep -Fq 'session A release did not remove its exact Kubernetes API objects' \
+    "$TARGET" || {
+    fail "explicit release must prove the anchor and private PVC API objects absent"
+}
+grep -Fq 'session A release affected session B' "$TARGET" || {
+    fail "explicit release must prove peer non-interference"
 }
 grep -Fq 'kubernetes-session Kind test: isolation checks passed' "$TARGET" || {
     fail "the isolation mode must have its own completion signal"

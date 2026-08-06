@@ -8,6 +8,7 @@ FIXTURE_ROOT="$REPOSITORY_ROOT/tests/fixtures/kubernetes-session-kind"
 CHART="$REPOSITORY_ROOT/charts/openab-kubernetes-session"
 API_SERVER_ENDPOINT_FILTER="$FIXTURE_ROOT/api-server-endpoints.jq"
 COMPUTE_DEADLINE_FILTER="$FIXTURE_ROOT/session-compute-deadline.jq"
+RELEASED_SESSION_INVENTORY_FILTER="$FIXTURE_ROOT/released-session-inventory.jq"
 MODE=${1:-}
 
 KIND_NODE_IMAGE='kindest/node:v1.32.11@sha256:5fc52d52a7b9574015299724bd68f183702956aa4a2116ae75a63cb574b35af8'
@@ -63,6 +64,7 @@ for fixture in \
     shared-skill.md \
     api-server-endpoints.jq \
     session-compute-deadline.jq \
+    released-session-inventory.jq \
     smoke.ndjson \
     workspace-isolation.ndjson \
     session-lifecycle.ndjson \
@@ -361,6 +363,18 @@ send_bridge_request() {
     fail "$bridge_request_description input closed before request was accepted"
 }
 
+rpc_response_is_present() {
+    rpc_lookup_output_file=$1
+    rpc_lookup_request_id=$2
+
+    jq -s -e --argjson request_id "$rpc_lookup_request_id" '
+        any(.[];
+            type == "object"
+            and .id == $request_id
+        )
+    ' "$rpc_lookup_output_file" >/dev/null 2>&1
+}
+
 wait_for_rpc_response() {
     rpc_wait_description=$1
     rpc_wait_request_id=$2
@@ -371,15 +385,15 @@ wait_for_rpc_response() {
     rpc_wait_elapsed=0
 
     while [ "$rpc_wait_elapsed" -lt "$rpc_wait_seconds" ]; do
-        if jq -s -e --argjson request_id "$rpc_wait_request_id" '
-            any(.[];
-                type == "object"
-                and .id == $request_id
-            )
-        ' "$rpc_wait_output_file" >/dev/null 2>&1; then
+        if rpc_response_is_present \
+            "$rpc_wait_output_file" "$rpc_wait_request_id"; then
             return 0
         fi
         if ! kill -0 "$rpc_wait_process_id" >/dev/null 2>&1; then
+            if rpc_response_is_present \
+                "$rpc_wait_output_file" "$rpc_wait_request_id"; then
+                return 0
+            fi
             sed -n '1,80p' "$rpc_wait_error_file" >&2 || true
             fail "$rpc_wait_description terminated before producing its response"
         fi
@@ -408,6 +422,28 @@ assert_rpc_empty_result() {
     else
         fail "$rpc_result_description"
     fi
+}
+
+assert_initialize_release_capability() {
+    initialize_output_file=$1
+    initialize_description=$2
+
+    jq -s -e '
+        [
+            .[]
+            | select(type == "object" and .id == 1)
+        ] as $responses
+        | ($responses | length) == 1
+        and $responses[0].jsonrpc == "2.0"
+        and ($responses[0].result | type) == "object"
+        and ($responses[0] | has("error") | not)
+        and (
+            $responses[0].result.agentCapabilities.sessionCapabilities
+                ._meta["openab.dev"].sessionRelease.version == 1
+        )
+    ' "$initialize_output_file" >/dev/null || {
+        fail "$initialize_description"
+    }
 }
 
 assert_rpc_prompt_result() {
@@ -771,6 +807,42 @@ wait_for_exact_uid_absent() {
         sleep 1
     done
     fail "$absence_case exact Kubernetes UID remained after ${absence_seconds}s"
+}
+
+wait_for_released_session_absent() {
+    release_targets=$1
+    release_session_id=$2
+    release_destination=$3
+    release_seconds=$4
+    release_raw="$release_destination.raw"
+    release_candidate="$release_destination.candidate"
+    release_deadline=$(($(date +%s) + release_seconds))
+
+    while [ "$(date +%s)" -lt "$release_deadline" ]; do
+        # The controller ACK is authoritative. This aggregated post-ACK read
+        # independently corroborates the exact names, UIDs, and annotations;
+        # Kubernetes does not make a mixed-GVK list transactionally atomic.
+        if kubectl --request-timeout=5s -n "$WORKER_NAMESPACE" get \
+            configmaps,pods,persistentvolumeclaims,secrets,serviceaccounts,networkpolicies.networking.k8s.io \
+            -o json > "$release_raw"; then
+            jq -e \
+                --slurpfile expected "$release_targets" \
+                --arg session_id "$release_session_id" \
+                -f "$RELEASED_SESSION_INVENTORY_FILTER" \
+                "$release_raw" > "$release_candidate" || {
+                fail "session A release Kubernetes inventory was malformed"
+            }
+            if jq -e '
+                .exactMatches == [] and .annotatedChildren == []
+            ' "$release_candidate" >/dev/null; then
+                cp "$release_candidate" "$release_destination"
+                return 0
+            fi
+        fi
+        sleep 1
+    done
+    sed -n '1,80p' "$release_candidate" >&2 || true
+    fail "session A release did not remove its exact Kubernetes API objects"
 }
 
 snapshot_session_children() {
@@ -2330,6 +2402,10 @@ if [ "$MODE" = '--isolation' ]; then
     A_REPLACEMENT_LOAD=$(lifecycle_request 310)
     A_REPLACEMENT_WORKSPACE_READ=$(lifecycle_request 311)
     A_REPLACEMENT_PROMPT=$(lifecycle_request 312)
+    A_RELEASE_LOAD=$(lifecycle_request 313)
+    A_RELEASE_WORKSPACE_READ=$(lifecycle_request 314)
+    A_RELEASE_REQUEST=$(lifecycle_request 315)
+    B_POST_RELEASE_WORKSPACE_READ=$(lifecycle_request 497)
     B_POST_TTL_WORKSPACE_READ=$(lifecycle_request 498)
     B_POST_REPLACEMENT_WORKSPACE_READ=$(lifecycle_request 499)
 
@@ -2705,6 +2781,205 @@ if [ "$MODE" = '--isolation' ]; then
         --for=condition=Ready "pod/$WORKER_POD_B" --timeout=30s
     if ! kill -0 "$BRIDGE_B_PID" >/dev/null 2>&1; then
         fail "compute suspension affected session B"
+    fi
+
+    refresh_session_b 410 'session B keepalive before session A release'
+    ANCHOR_RELEASE_BASELINE_B="$TEMPORARY_ROOT/anchor-release-baseline-b.json"
+    wait_for_anchor_state \
+        "$ANCHOR_NAME_B" "$ANCHOR_UID_B" ready "$WORKER_POD_UID_B" \
+        "$ANCHOR_RELEASE_BASELINE_B" 30
+    assert_anchor_stable_identity \
+        "$ANCHOR_RELEASE_BASELINE_B" "$ANCHOR_BASELINE_B" \
+        'session A release affected session B'
+    CHILDREN_RELEASE_BASELINE_B="$TEMPORARY_ROOT/children-release-baseline-b.json"
+    snapshot_session_children \
+        "$SESSION_ID_B" "$CHILDREN_RELEASE_BASELINE_B"
+    assert_session_children_unchanged \
+        "$CHILDREN_RELEASE_BASELINE_B" "$CHILDREN_POST_TTL_B" \
+        'session A release affected session B'
+    CONTROLLER_FINGERPRINT_BEFORE_RELEASE="$TEMPORARY_ROOT/controller-before-release.json"
+    capture_controller_fingerprint "$CONTROLLER_FINGERPRINT_BEFORE_RELEASE"
+
+    BRIDGE_A_FIFO="$TEMPORARY_ROOT/bridge-a-generation-3.stdin"
+    BRIDGE_A_STDOUT="$TEMPORARY_ROOT/bridge-a-generation-3.stdout"
+    BRIDGE_A_STDERR="$TEMPORARY_ROOT/bridge-a-generation-3.stderr"
+    mkfifo "$BRIDGE_A_FIFO"
+    start_bridge \
+        "$BRIDGE_A_FIFO" \
+        "$BRIDGE_A_STDOUT" \
+        "$BRIDGE_A_STDERR" \
+        'discord:kind-smoke:thread-1' \
+        '00000000-0000-0000-0000-000000000067' \
+        present
+    BRIDGE_A_PID=$STARTED_BRIDGE_PID
+    STARTED_BRIDGE_PID=''
+    exec 3> "$BRIDGE_A_FIFO"
+    BRIDGE_A_WRITER_OPEN=1
+
+    send_bridge_request a 'session A release initialization' \
+        "$INITIALIZE_LINE"
+    wait_for_rpc_response 'session A release initialization' 1 \
+        "$BRIDGE_A_STDOUT" "$BRIDGE_A_PID" "$BRIDGE_A_STDERR" 180
+    assert_initialize_release_capability \
+        "$BRIDGE_A_STDOUT" \
+        'session A release capability was not advertised'
+    refresh_session_b 411 'session B keepalive after worker A3 initialized'
+
+    send_bridge_request a 'session A release load' "$A_RELEASE_LOAD"
+    wait_for_rpc_response 'session A release load' 313 \
+        "$BRIDGE_A_STDOUT" "$BRIDGE_A_PID" "$BRIDGE_A_STDERR" 60
+    assert_rpc_empty_result \
+        'session A release could not load the retained ACP session' \
+        "$BRIDGE_A_STDOUT" 313
+    send_bridge_request a 'session A release workspace read' \
+        "$A_RELEASE_WORKSPACE_READ"
+    wait_for_rpc_response 'session A release workspace read' 314 \
+        "$BRIDGE_A_STDOUT" "$BRIDGE_A_PID" "$BRIDGE_A_STDERR" 60
+    assert_rpc_content_result \
+        'session A resume did not retain its workspace state' \
+        "$BRIDGE_A_STDOUT" 314 "$WORKSPACE_A_MARKER_V2"
+
+    WORKER_POD_A3=$(single_owned_resource_name pod \
+        'app.kubernetes.io/managed-by=openab-session-controller,openab.dev/resource=worker-pod' \
+        "$ANCHOR_UID" 'session A release worker Pod')
+    WORKSPACE_PVC_A3=$(single_owned_resource_name persistentvolumeclaim \
+        'app.kubernetes.io/managed-by=openab-session-controller,openab.dev/resource=workspace-pvc' \
+        "$ANCHOR_UID" 'session A release workspace PVC')
+    WORKER_SERVICE_ACCOUNT_A3=$(single_owned_resource_name serviceaccount \
+        'app.kubernetes.io/managed-by=openab-session-controller,openab.dev/resource=worker-service-account' \
+        "$ANCHOR_UID" 'session A release worker ServiceAccount')
+    WORKER_NETWORK_POLICY_A3=$(single_owned_resource_name networkpolicy \
+        'app.kubernetes.io/managed-by=openab-session-controller,openab.dev/resource=worker-network-policy' \
+        "$ANCHOR_UID" 'session A release worker NetworkPolicy')
+    kubectl -n "$WORKER_NAMESPACE" wait \
+        --for=condition=Ready "pod/$WORKER_POD_A3" --timeout=120s
+    WORKER_POD_UID_A3=$(kubernetes_resource_uid pod \
+        "$WORKER_POD_A3" 'session A release worker Pod')
+    WORKSPACE_PVC_UID_A3=$(kubernetes_resource_uid persistentvolumeclaim \
+        "$WORKSPACE_PVC_A3" 'session A release workspace PVC')
+    WORKER_SERVICE_ACCOUNT_UID_A3=$(kubernetes_resource_uid serviceaccount \
+        "$WORKER_SERVICE_ACCOUNT_A3" 'session A release ServiceAccount')
+    WORKER_NETWORK_POLICY_UID_A3=$(kubernetes_resource_uid networkpolicy \
+        "$WORKER_NETWORK_POLICY_A3" 'session A release NetworkPolicy')
+
+    ANCHOR_RELEASE_A="$TEMPORARY_ROOT/anchor-release-a.json"
+    wait_for_anchor_state \
+        "$ANCHOR_NAME" "$ANCHOR_UID" ready "$WORKER_POD_UID_A3" \
+        "$ANCHOR_RELEASE_A" 60
+    jq -e \
+        --slurpfile baseline "$ANCHOR_SUSPENDED_A" \
+        --arg attempt_id '00000000-0000-0000-0000-000000000067' \
+        --arg pod_uid "$WORKER_POD_UID_A3" '
+        .uid == $baseline[0].uid
+        and .state.sessionId == $baseline[0].state.sessionId
+        and .state.scopeId == $baseline[0].state.scopeId
+        and .state.profile == $baseline[0].state.profile
+        and .state.incarnationId == $baseline[0].state.incarnationId
+        and .state.fence.generation
+            == ($baseline[0].state.fence.generation + 1)
+        and .state.fence.attemptId == $attempt_id
+        and .state.fence.attemptId
+            != $baseline[0].state.fence.attemptId
+        and .state.phase == "ready"
+        and .state.podUid == $pod_uid
+    ' "$ANCHOR_RELEASE_A" >/dev/null || {
+        fail "session A release resume did not advance exactly one generation"
+    }
+    if [ "$WORKSPACE_PVC_A3" != "$WORKSPACE_PVC_A2" ] || \
+        [ "$WORKSPACE_PVC_UID_A3" != "$WORKSPACE_PVC_UID_A2" ] || \
+        [ "$WORKER_POD_UID_A3" = "$WORKER_POD_UID_A2" ] || \
+        [ "$WORKER_SERVICE_ACCOUNT_UID_A3" = "$WORKER_SERVICE_ACCOUNT_UID_A2" ] || \
+        [ "$WORKER_NETWORK_POLICY_UID_A3" = "$WORKER_NETWORK_POLICY_UID_A2" ]; then
+        fail "session A release resume changed its logical identity or PVC"
+    fi
+    assert_anchor_owner pod "$WORKER_POD_A3" \
+        "$ANCHOR_NAME" "$ANCHOR_UID" 'release worker Pod A'
+    assert_anchor_owner serviceaccount "$WORKER_SERVICE_ACCOUNT_A3" \
+        "$ANCHOR_NAME" "$ANCHOR_UID" 'release worker ServiceAccount A'
+    assert_anchor_owner networkpolicy "$WORKER_NETWORK_POLICY_A3" \
+        "$ANCHOR_NAME" "$ANCHOR_UID" 'release worker NetworkPolicy A'
+    assert_worker_pod_isolation_contract \
+        "$WORKER_POD_A3" "$WORKSPACE_PVC_A3" "$WORKSPACE_PVC_B" \
+        'release worker Pod A' "session B's"
+    assert_worker_shared_skills "$WORKER_POD_A3"
+    assert_worker_network_policy_contract \
+        a3 "$WORKER_NETWORK_POLICY_A3" "$WORKER_POD_A3" "$WORKER_POD_B" \
+        'session A release'
+    RELEASE_CHILDREN_A="$TEMPORARY_ROOT/release-children-a.json"
+    assert_active_session_children \
+        "$SESSION_ID_A" "$RELEASE_CHILDREN_A" \
+        "$WORKER_NETWORK_POLICY_A3" "$WORKER_NETWORK_POLICY_UID_A3" \
+        "$WORKSPACE_PVC_A3" "$WORKSPACE_PVC_UID_A3" \
+        "$WORKER_POD_A3" "$WORKER_POD_UID_A3" \
+        "$WORKER_SERVICE_ACCOUNT_A3" "$WORKER_SERVICE_ACCOUNT_UID_A3" \
+        'session A release resume retained an unexpected child resource'
+    refresh_session_b 412 'session B keepalive before session A release request'
+
+    send_bridge_request a 'session A release request' "$A_RELEASE_REQUEST"
+    wait_for_rpc_response \
+        'session A release did not receive correlated acknowledgement' 315 \
+        "$BRIDGE_A_STDOUT" "$BRIDGE_A_PID" "$BRIDGE_A_STDERR" 120
+    assert_rpc_empty_result \
+        'session A release did not receive correlated acknowledgement' \
+        "$BRIDGE_A_STDOUT" 315
+    if wait_for_process_exit "$BRIDGE_A_PID" 30; then
+        :
+    else
+        sed -n '1,80p' "$BRIDGE_A_STDERR" >&2 || true
+        fail "session A release bridge did not exit cleanly"
+    fi
+    BRIDGE_A_RELEASE_EXIT_STATUS=$BRIDGE_EXIT_STATUS
+    [ "$BRIDGE_A_RELEASE_EXIT_STATUS" -eq 0 ] || {
+        fail "session A release bridge did not exit cleanly"
+    }
+    exec 3>&-
+    BRIDGE_A_WRITER_OPEN=0
+    BRIDGE_A_PID=''
+    refresh_session_b 413 'session B keepalive after session A release'
+
+    RELEASE_TARGETS_A="$TEMPORARY_ROOT/release-targets-a.json"
+    jq -n -e \
+        --slurpfile children "$RELEASE_CHILDREN_A" \
+        --arg anchor_name "$ANCHOR_NAME" \
+        --arg anchor_uid "$ANCHOR_UID" '
+        [{kind: "ConfigMap", name: $anchor_name, uid: $anchor_uid}]
+        + ($children[0] | map({kind, name, uid}))
+    ' > "$RELEASE_TARGETS_A"
+    RELEASE_ABSENCE_A="$TEMPORARY_ROOT/release-absence-a.json"
+    wait_for_released_session_absent \
+        "$RELEASE_TARGETS_A" "$SESSION_ID_A" "$RELEASE_ABSENCE_A" 120
+
+    CONTROLLER_FINGERPRINT_AFTER_RELEASE="$TEMPORARY_ROOT/controller-after-release.json"
+    capture_controller_fingerprint "$CONTROLLER_FINGERPRINT_AFTER_RELEASE"
+    jq -e \
+        --slurpfile baseline "$CONTROLLER_FINGERPRINT_BEFORE_RELEASE" \
+        '. == $baseline[0]' "$CONTROLLER_FINGERPRINT_AFTER_RELEASE" \
+        >/dev/null || {
+        fail "session controller restarted during explicit release verification"
+    }
+    send_bridge_request b 'session B post-release workspace read' \
+        "$B_POST_RELEASE_WORKSPACE_READ"
+    wait_for_rpc_response 'session B post-release workspace read' 497 \
+        "$BRIDGE_B_STDOUT" "$BRIDGE_B_PID" "$BRIDGE_B_STDERR" 60
+    assert_rpc_content_result \
+        'session A release affected session B' \
+        "$BRIDGE_B_STDOUT" 497 "$WORKSPACE_B_MARKER_V1"
+    ANCHOR_POST_RELEASE_B="$TEMPORARY_ROOT/anchor-post-release-b.json"
+    wait_for_anchor_state \
+        "$ANCHOR_NAME_B" "$ANCHOR_UID_B" ready "$WORKER_POD_UID_B" \
+        "$ANCHOR_POST_RELEASE_B" 30
+    assert_anchor_stable_identity \
+        "$ANCHOR_POST_RELEASE_B" "$ANCHOR_RELEASE_BASELINE_B" \
+        'session A release affected session B'
+    CHILDREN_POST_RELEASE_B="$TEMPORARY_ROOT/children-post-release-b.json"
+    snapshot_session_children "$SESSION_ID_B" "$CHILDREN_POST_RELEASE_B"
+    assert_session_children_unchanged \
+        "$CHILDREN_POST_RELEASE_B" "$CHILDREN_RELEASE_BASELINE_B" \
+        'session A release affected session B'
+    kubectl -n "$WORKER_NAMESPACE" wait \
+        --for=condition=Ready "pod/$WORKER_POD_B" --timeout=30s
+    if ! kill -0 "$BRIDGE_B_PID" >/dev/null 2>&1; then
+        fail "session A release affected session B"
     fi
 
 fi
