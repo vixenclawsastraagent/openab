@@ -36,7 +36,7 @@ change.
 
 ## Stage A: integrate the current upstream baseline
 
-- [ ] **Task 1 — Merge `upstream/main` and compose the two runtime modes.**
+- [x] **Task 1 — Merge `upstream/main` and compose the two runtime modes.**
   - Depends on: approved plan.
   - Work: fetch `upstream/main`; merge it with a conventional merge message;
     resolve only `crates/openab-core/src/acp/pool.rs` and `src/main.rs`; audit
@@ -319,7 +319,7 @@ terminal transition against the approved spec before packaging.
 
 ## Stage D: package the opt-in add-on
 
-- [ ] **Task 14 — Build separate broker, controller, and worker images.**
+- [x] **Task 14 — Build separate broker, controller, and worker images.**
   - Depends on: Task 13.
   - Test first: define clean-context build and binary-inventory smoke checks
     for four named targets: `broker`, `controller`, `worker-base`, and
@@ -386,7 +386,7 @@ and all default Dockerfiles against the Stage A baseline.
 
 ## Stage E: prove isolation and lifecycle in Kind
 
-- [ ] **Task 17 — Bootstrap a deterministic Kind add-on smoke test.**
+- [x] **Task 17 — Bootstrap a deterministic Kind add-on smoke test.**
   - Depends on: Tasks 14–16.
   - Test first: each missing prerequisite (Docker, Kind, Helm, kubectl,
     OpenSSL, Git, jq, usable CNI) exits non-zero with a specific message; no
@@ -404,15 +404,17 @@ and all default Dockerfiles against the Stage A baseline.
   - Verify: `scripts/test-kubernetes-session-kind.sh --smoke`.
   - Commit: `test(kubernetes): bootstrap Kind isolation`.
 
-- [ ] **Task 18 — Prove two-session writable-state isolation.**
+- [x] **Task 18 — Prove two-session writable-state isolation.**
   - Depends on: Task 17.
   - Test first: define deterministic failures for same Pod/PVC/SA, visible peer
     marker, writable shared skills, unexpected egress, missing resource limits,
     or an inbound worker Service.
   - Work: drive two logical thread fixtures through separate bridges; capture
-    object names/UIDs; write distinct HOME/workspace/Git markers; prove each
-    worker cannot discover or mutate the peer while both read the pinned skills
-    and CA and call only harness-approved services.
+    object names/UIDs; write distinct markers through the fake ACP's fixed,
+    path-confined workspace probe; prove each worker cannot discover or mutate
+    the peer while both read the pinned skills and CA and call only
+    harness-approved services. A production agent/Git-worktree end-to-end test
+    remains part of the deferred worker-flavour work in Task 20.
   - Files: Kind script and constrained fixture endpoints.
   - Acceptance: Pods, PVCs, ServiceAccounts, process/resource boundaries, and
     writable state are distinct; shared platform data is read-only or a
@@ -420,17 +422,19 @@ and all default Dockerfiles against the Stage A baseline.
   - Verify: `scripts/test-kubernetes-session-kind.sh --isolation`.
   - Commit: `test(kubernetes): prove thread Pod isolation`.
 
-- [ ] **Task 19 — Prove replacement, TTL suspension, and explicit release.**
+- [x] **Task 19 — Prove replacement, TTL suspension, and explicit release.**
   - Depends on: Task 18.
   - Test first: require logical identity and PVC marker retention across one
     failed-Pod replacement, then require bounded compute suspension and final
-    deletion of only the released session's anchor/private PVC.
+    Kubernetes API-object absence for only the released session's anchor and
+    private PVC.
   - Work: extend the harness through replacement, idle compute TTL, storage
     retention, explicit close/release, and peer-session non-interference.
   - Files: Kind script and lifecycle fixtures.
   - Acceptance: there is at most one active Pod per logical session; storage
-    persists until explicit release/retention policy and never leaks across
-    sessions.
+    never leaks across sessions and its PVC API object persists until explicit
+    release. The MVP storage-retention deadline is advisory and does not grant
+    deletion authority.
   - Verify: `scripts/test-kubernetes-session-kind.sh`.
   - Commit: `test(kubernetes): verify session lifecycle`.
 
@@ -439,6 +443,17 @@ and all default Dockerfiles against the Stage A baseline.
 Archive the deterministic Kind output and Kubernetes object identifiers. A
 passing test must include negative filesystem and network assertions plus
 replacement, TTL, release, and peer-non-interference evidence.
+
+Live evidence (2026-08-06 UTC): `Kubernetes Session Images`
+[run 31103234684](https://github.com/vixenclawsastraagent/openab/actions/runs/31103234684)
+and `smoke-test`
+[job 92621780179](https://github.com/vixenclawsastraagent/openab/actions/runs/31103234684/job/92621780179)
+passed at `4e8f72cb914413d6f77508b01fb1eefb80ecfde4`. The correlated
+release acknowledgement and clean bridge exit are authoritative. The later
+mixed-GVK inventory independently corroborates absence by deterministic names,
+captured UIDs, and session annotations; it is not an atomic Kubernetes
+snapshot. The test proves absence of the PVC Kubernetes API object, not
+physical reclamation of its backing PersistentVolume or cloud disk.
 
 ## Stage F: contribution readiness
 
