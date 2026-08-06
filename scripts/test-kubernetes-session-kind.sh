@@ -60,10 +60,13 @@ for fixture in \
     shared-skill.md \
     api-server-endpoints.jq \
     smoke.ndjson \
+    workspace-isolation.ndjson \
     broker-pod.yaml.in \
     network-probe-pod.yaml.in; do
     [ -f "$FIXTURE_ROOT/$fixture" ] || fail "missing fixture $fixture"
 done
+
+WORKSPACE_ISOLATION_FIXTURE="$FIXTURE_ROOT/workspace-isolation.ndjson"
 
 TEMPORARY_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/openab-session-kind.XXXXXX")
 KUBECONFIG="$TEMPORARY_ROOT/kubeconfig"
@@ -290,6 +293,124 @@ wait_for_output() {
     done
     sed -n '1,80p' "$error_file" >&2 || true
     fail "$description did not complete within ${seconds}s"
+}
+
+fixture_request() {
+    fixture_request_id=$1
+    fixture_request_value=$(jq -s -c --argjson request_id "$fixture_request_id" '
+        [.[] | select(
+            type == "object"
+            and .id == $request_id
+        )]
+        | if length == 1 then
+            .[0]
+        else
+            error("workspace fixture request ID must be unique")
+        end
+    ' "$WORKSPACE_ISOLATION_FIXTURE") || {
+        fail "workspace fixture request ID $fixture_request_id is not unique"
+    }
+    printf '%s\n' "$fixture_request_value"
+}
+
+wait_for_rpc_response() {
+    rpc_wait_description=$1
+    rpc_wait_request_id=$2
+    rpc_wait_output_file=$3
+    rpc_wait_process_id=$4
+    rpc_wait_error_file=$5
+    rpc_wait_seconds=$6
+    rpc_wait_elapsed=0
+
+    while [ "$rpc_wait_elapsed" -lt "$rpc_wait_seconds" ]; do
+        if jq -s -e --argjson request_id "$rpc_wait_request_id" '
+            any(.[];
+                type == "object"
+                and .id == $request_id
+            )
+        ' "$rpc_wait_output_file" >/dev/null 2>&1; then
+            return 0
+        fi
+        if ! kill -0 "$rpc_wait_process_id" >/dev/null 2>&1; then
+            sed -n '1,80p' "$rpc_wait_error_file" >&2 || true
+            fail "$rpc_wait_description terminated before producing its response"
+        fi
+        sleep 1
+        rpc_wait_elapsed=$((rpc_wait_elapsed + 1))
+    done
+    sed -n '1,80p' "$rpc_wait_error_file" >&2 || true
+    fail "$rpc_wait_description did not complete within ${rpc_wait_seconds}s"
+}
+
+assert_rpc_empty_result() {
+    rpc_result_description=$1
+    rpc_result_output_file=$2
+    rpc_result_request_id=$3
+    if jq -s -e --argjson request_id "$rpc_result_request_id" '
+        [.[] | select(
+            type == "object"
+            and .id == $request_id
+        )] == [{
+            "jsonrpc": "2.0",
+            "id": $request_id,
+            "result": {}
+        }]
+    ' "$rpc_result_output_file" >/dev/null; then
+        :
+    else
+        fail "$rpc_result_description"
+    fi
+}
+
+assert_rpc_error() {
+    rpc_error_description=$1
+    rpc_error_output_file=$2
+    rpc_error_request_id=$3
+    rpc_error_code=$4
+    rpc_error_message=$5
+    if jq -s -e \
+        --argjson request_id "$rpc_error_request_id" \
+        --argjson expected_code "$rpc_error_code" \
+        --arg expected_message "$rpc_error_message" '
+        [.[] | select(
+            type == "object"
+            and .id == $request_id
+        )] == [{
+            "jsonrpc": "2.0",
+            "id": $request_id,
+            "error": {
+                "code": $expected_code,
+                "message": $expected_message
+            }
+        }]
+    ' "$rpc_error_output_file" >/dev/null; then
+        :
+    else
+        fail "$rpc_error_description"
+    fi
+}
+
+assert_rpc_content_result() {
+    rpc_content_description=$1
+    rpc_content_output_file=$2
+    rpc_content_request_id=$3
+    rpc_content_expected=$4
+    if jq -s -e \
+        --argjson request_id "$rpc_content_request_id" \
+        --arg expected_content "$rpc_content_expected" '
+        [.[] | select(
+            type == "object"
+            and .id == $request_id
+        )] == [{
+            "jsonrpc": "2.0",
+            "id": $request_id,
+            "result": {"content": $expected_content}
+        }]
+    ' "$rpc_content_output_file" >/dev/null; then
+        :
+    else
+        fail "$rpc_content_description"
+    fi
 }
 
 start_bridge() {
@@ -1450,6 +1571,80 @@ if [ "$MODE" = '--isolation' ]; then
         -o name)
     [ -z "$REGISTRATION_SECRETS_AFTER_B" ] || {
         fail "a managed registration Secret remains after both workers registered"
+    }
+
+    WORKSPACE_A_WRITE_V1=$(fixture_request 101)
+    WORKSPACE_B_READ_BEFORE_WRITE=$(fixture_request 201)
+    WORKSPACE_B_WRITE_V1=$(fixture_request 202)
+    WORKSPACE_A_READ_V1=$(fixture_request 102)
+    WORKSPACE_A_WRITE_V2=$(fixture_request 103)
+    WORKSPACE_B_READ_V1=$(fixture_request 203)
+    WORKSPACE_A_MARKER_V1=$(printf '%s\n' "$WORKSPACE_A_WRITE_V1" | \
+        jq -r '.params.content')
+    WORKSPACE_B_MARKER_V1=$(printf '%s\n' "$WORKSPACE_B_WRITE_V1" | \
+        jq -r '.params.content')
+
+    printf '%s\n' "$WORKSPACE_A_WRITE_V1" >&3
+    wait_for_rpc_response 'session A initial workspace write' 101 \
+        "$BRIDGE_A_STDOUT" "$BRIDGE_A_PID" "$BRIDGE_A_STDERR" 60
+    assert_rpc_empty_result \
+        'session A could not write its private workspace state' \
+        "$BRIDGE_A_STDOUT" 101
+
+    printf '%s\n' "$WORKSPACE_B_READ_BEFORE_WRITE" >&4
+    wait_for_rpc_response 'session B pre-write workspace read' 201 \
+        "$BRIDGE_B_STDOUT" "$BRIDGE_B_PID" "$BRIDGE_B_STDERR" 60
+    assert_rpc_error \
+        'session B unexpectedly observed session A workspace state before its own write' \
+        "$BRIDGE_B_STDOUT" 201 -32001 'Workspace probe failed'
+
+    printf '%s\n' "$WORKSPACE_B_WRITE_V1" >&4
+    wait_for_rpc_response 'session B initial workspace write' 202 \
+        "$BRIDGE_B_STDOUT" "$BRIDGE_B_PID" "$BRIDGE_B_STDERR" 60
+    assert_rpc_empty_result \
+        'session B could not write its private workspace state' \
+        "$BRIDGE_B_STDOUT" 202
+
+    printf '%s\n' "$WORKSPACE_A_READ_V1" >&3
+    wait_for_rpc_response 'session A workspace read after B write' 102 \
+        "$BRIDGE_A_STDOUT" "$BRIDGE_A_PID" "$BRIDGE_A_STDERR" 60
+    assert_rpc_content_result \
+        'session B workspace write changed session A state' \
+        "$BRIDGE_A_STDOUT" 102 "$WORKSPACE_A_MARKER_V1"
+
+    printf '%s\n' "$WORKSPACE_A_WRITE_V2" >&3
+    wait_for_rpc_response 'session A workspace overwrite' 103 \
+        "$BRIDGE_A_STDOUT" "$BRIDGE_A_PID" "$BRIDGE_A_STDERR" 60
+    assert_rpc_empty_result \
+        'session A could not overwrite its private workspace state' \
+        "$BRIDGE_A_STDOUT" 103
+
+    printf '%s\n' "$WORKSPACE_B_READ_V1" >&4
+    wait_for_rpc_response 'session B workspace read after A overwrite' 203 \
+        "$BRIDGE_B_STDOUT" "$BRIDGE_B_PID" "$BRIDGE_B_STDERR" 60
+    assert_rpc_content_result \
+        'session A workspace overwrite changed session B state' \
+        "$BRIDGE_B_STDOUT" 203 "$WORKSPACE_B_MARKER_V1"
+
+    if ! kill -0 "$BRIDGE_A_PID" >/dev/null 2>&1; then
+        fail "session A bridge stopped during workspace isolation probes"
+    fi
+    if ! kill -0 "$BRIDGE_B_PID" >/dev/null 2>&1; then
+        fail "session B bridge stopped during workspace isolation probes"
+    fi
+    kubectl -n "$WORKER_NAMESPACE" wait \
+        --for=condition=Ready "pod/$WORKER_POD" --timeout=30s
+    kubectl -n "$WORKER_NAMESPACE" wait \
+        --for=condition=Ready "pod/$WORKER_POD_B" --timeout=30s
+    FINAL_WORKER_POD_UID=$(kubectl -n "$WORKER_NAMESPACE" get pod \
+        "$WORKER_POD" -o jsonpath='{.metadata.uid}')
+    FINAL_WORKER_POD_UID_B=$(kubectl -n "$WORKER_NAMESPACE" get pod \
+        "$WORKER_POD_B" -o jsonpath='{.metadata.uid}')
+    [ "$FINAL_WORKER_POD_UID" = "$WORKER_POD_UID" ] || {
+        fail "session A worker was replaced during workspace isolation probes"
+    }
+    [ "$FINAL_WORKER_POD_UID_B" = "$WORKER_POD_UID_B" ] || {
+        fail "session B worker was replaced during workspace isolation probes"
     }
 fi
 

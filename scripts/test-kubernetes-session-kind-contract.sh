@@ -7,6 +7,7 @@ TARGET="$SCRIPT_DIR/test-kubernetes-session-kind.sh"
 WORKFLOW="$SCRIPT_DIR/../.github/workflows/kubernetes-session-images.yml"
 PROFILE_FIXTURE="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/profiles.toml.in"
 SKILLS_FIXTURE="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/shared-skill.md"
+WORKSPACE_FIXTURE="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/workspace-isolation.ndjson"
 ENDPOINT_FILTER="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/api-server-endpoints.jq"
 ENDPOINT_FIXTURE="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/api-server-endpoints.json"
 TEMPORARY_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/openab-session-kind-contract.XXXXXX")
@@ -88,6 +89,7 @@ assert_endpoint_filter_failure() {
 [ -f "$WORKFLOW" ] || fail "missing Kubernetes Session Images workflow"
 [ -f "$PROFILE_FIXTURE" ] || fail "missing Kind worker profile fixture"
 [ -f "$SKILLS_FIXTURE" ] || fail "missing immutable shared skills fixture"
+[ -f "$WORKSPACE_FIXTURE" ] || fail "missing workspace isolation fixture"
 [ -f "$ENDPOINT_FILTER" ] || fail "missing API EndpointSlice jq filter"
 [ -f "$ENDPOINT_FIXTURE" ] || fail "missing API EndpointSlice JSON fixture"
 
@@ -153,6 +155,55 @@ grep -Fq 'config_map_name = "openab-kind-smoke-skills-v1"' \
 }
 grep -Fqx 'OPENAB_KIND_SHARED_SKILL_V1' "$SKILLS_FIXTURE" || {
     fail "Kind shared skills fixture must expose its fixed version marker"
+}
+
+workspace_fixture_bytes=$(wc -c < "$WORKSPACE_FIXTURE")
+[ "$workspace_fixture_bytes" -gt 0 ] || fail "workspace isolation fixture is empty"
+[ "$workspace_fixture_bytes" -le 4096 ] || {
+    fail "workspace isolation fixture exceeds its bounded input size"
+}
+jq -s -e '
+    length == 6
+    and ([.[].id] | sort == [101, 102, 103, 201, 202, 203])
+    and all(.[];
+        type == "object"
+        and (keys == ["id", "jsonrpc", "method", "params"])
+        and .jsonrpc == "2.0"
+        and (.id | type) == "number"
+        and .params.sessionId == "openab-fake-session-v1"
+        and (
+            if .method == "_openab/test/workspace/read" then
+                (.params | (
+                    type == "object"
+                    and keys == ["sessionId"]
+                ))
+            elif .method == "_openab/test/workspace/write" then
+                (.params | (
+                    type == "object"
+                    and keys == ["content", "sessionId"]
+                    and (.content | (
+                        type == "string"
+                        and utf8bytelength <= 4096
+                    ))
+                ))
+            else
+                false
+            end
+        )
+    )
+    and (
+        [.[] | [.id, .method, (.params.content // null)]]
+        | sort_by(.[0])
+    ) == [
+        [101, "_openab/test/workspace/write", "OPENAB_KIND_WORKSPACE_A_V1"],
+        [102, "_openab/test/workspace/read", null],
+        [103, "_openab/test/workspace/write", "OPENAB_KIND_WORKSPACE_A_V2"],
+        [201, "_openab/test/workspace/read", null],
+        [202, "_openab/test/workspace/write", "OPENAB_KIND_WORKSPACE_B_V1"],
+        [203, "_openab/test/workspace/read", null]
+    ]
+' "$WORKSPACE_FIXTURE" >/dev/null || {
+    fail "workspace isolation fixture is not a closed deterministic probe sequence"
 }
 
 unknown_stdout="$TEMPORARY_ROOT/unknown.stdout"
@@ -383,6 +434,31 @@ grep -Fq 'fail "$isolation_pod_description does not mount its private workspace 
 grep -Fq 'fail "$isolation_pod_description resource requests or limits drifted from the profile"' \
     "$TARGET" || {
     fail "the isolation mode must verify the second worker resource cgroup contract"
+}
+grep -Fq 'fixture_request()' "$TARGET" || {
+    fail "workspace requests must be selected by exact JSON-RPC ID"
+}
+grep -Fq 'wait_for_rpc_response()' "$TARGET" || {
+    fail "workspace probes must wait for a parsed JSON-RPC response"
+}
+grep -Fq 'assert_rpc_empty_result()' "$TARGET" || {
+    fail "workspace writes must require an exact empty JSON-RPC result"
+}
+grep -Fq 'assert_rpc_error()' "$TARGET" || {
+    fail "workspace visibility denial must require an exact JSON-RPC error"
+}
+grep -Fq 'assert_rpc_content_result()' "$TARGET" || {
+    fail "workspace reads must require an exact JSON-RPC marker result"
+}
+grep -Fq 'session B unexpectedly observed session A workspace state before its own write' \
+    "$TARGET" || {
+    fail "the isolation mode must prove the peer marker starts invisible"
+}
+grep -Fq 'session B workspace write changed session A state' "$TARGET" || {
+    fail "the isolation mode must prove B cannot overwrite A"
+}
+grep -Fq 'session A workspace overwrite changed session B state' "$TARGET" || {
+    fail "the isolation mode must prove A cannot overwrite B"
 }
 grep -Fq 'kubernetes-session Kind test: isolation checks passed' "$TARGET" || {
     fail "the isolation mode must have its own completion signal"
