@@ -1958,7 +1958,7 @@ fn normalized_pvc_metadata(
             "volume.kubernetes.io/selected-node" => is_dns_subdomain(value),
             "volume.kubernetes.io/storage-provisioner"
             | "volume.beta.kubernetes.io/storage-provisioner"
-            | "volume.kubernetes.io/storage-resizer" => is_dns_subdomain(value),
+            | "volume.kubernetes.io/storage-resizer" => is_storage_driver_name(value),
             _ => false,
         };
         if !valid {
@@ -2172,6 +2172,14 @@ fn is_label_key(value: &str) -> bool {
         Some(name) => is_dns_subdomain(first) && is_label_name(name),
         None => is_label_name(first),
     }
+}
+
+// Kubernetes validates StorageClass provisioners as qualified names after
+// ASCII lowercasing. The controller copies that value verbatim into PVC
+// provisioner annotations, so valid in-tree and external names may contain
+// one slash (for example, `rancher.io/local-path`).
+pub(crate) fn is_storage_driver_name(value: &str) -> bool {
+    is_label_key(&value.to_ascii_lowercase())
 }
 
 fn is_label_value(value: &str) -> bool {

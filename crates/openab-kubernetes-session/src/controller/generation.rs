@@ -7,7 +7,9 @@ use super::{
 };
 use crate::bridge::SessionBinding;
 use crate::identity::{ResourceNames, ScopeId, SessionId};
-use crate::resources::{DesiredGeneration, GenerationContext, MvpWorkerProfile};
+use crate::resources::{
+    is_storage_driver_name, DesiredGeneration, GenerationContext, MvpWorkerProfile,
+};
 use crate::state::{Fence, SessionPhase};
 use crate::store::StoredAnchor;
 use async_trait::async_trait;
@@ -928,10 +930,10 @@ impl KubernetesGenerationProvisioner {
                 "pv.kubernetes.io/bind-completed" | "pv.kubernetes.io/bound-by-controller" => {
                     value == "yes"
                 }
-                "volume.kubernetes.io/selected-node"
-                | "volume.kubernetes.io/storage-provisioner"
+                "volume.kubernetes.io/selected-node" => is_dns_subdomain(value),
+                "volume.kubernetes.io/storage-provisioner"
                 | "volume.beta.kubernetes.io/storage-provisioner"
-                | "volume.kubernetes.io/storage-resizer" => is_dns_subdomain(value),
+                | "volume.kubernetes.io/storage-resizer" => is_storage_driver_name(value),
                 _ => false,
             };
             if !allowed {

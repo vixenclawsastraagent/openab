@@ -1678,7 +1678,15 @@ fn pvc_validation_allows_only_known_binding_metadata() {
         ),
         (
             "volume.kubernetes.io/storage-provisioner".into(),
-            "csi.example.com".into(),
+            "rancher.io/local-path".into(),
+        ),
+        (
+            "volume.beta.kubernetes.io/storage-provisioner".into(),
+            "rancher.io/local-path".into(),
+        ),
+        (
+            "volume.kubernetes.io/storage-resizer".into(),
+            "kubernetes.io/aws-ebs".into(),
         ),
     ]);
     desired.validate_persistent_volume_claim(&bound).unwrap();
@@ -1706,6 +1714,33 @@ fn pvc_validation_allows_only_known_binding_metadata() {
         desired.validate_persistent_volume_claim(&foreign_annotation),
         Err(ResourceValidationError::MetadataMismatch { .. })
     ));
+}
+
+#[test]
+fn pvc_validation_rejects_malformed_storage_driver_names() {
+    let desired = desired();
+
+    for invalid in [
+        "rancher.io/local/path",
+        "/local-path",
+        "rancher.io/",
+        "rancher..io/local-path",
+    ] {
+        let mut observed = desired.persistent_volume_claim().clone();
+        mark_observed(&mut observed.metadata, "pvc-uid");
+        observed.metadata.annotations.as_mut().unwrap().insert(
+            "volume.kubernetes.io/storage-provisioner".into(),
+            invalid.into(),
+        );
+
+        assert!(matches!(
+            desired.validate_persistent_volume_claim(&observed),
+            Err(ResourceValidationError::MetadataMismatch {
+                field: "metadata.annotations",
+                ..
+            })
+        ));
+    }
 }
 
 #[test]

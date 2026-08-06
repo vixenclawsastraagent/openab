@@ -2463,10 +2463,14 @@ async fn release_deletes_exact_pvc_then_proves_every_child_and_anchor_absent() {
     let session_id = session_id("discord:release-happy");
     let anchor = deleting_anchor(session_id);
     let request = release_request(&anchor);
-    let pvc = observed_value(
+    let mut pvc = observed_value(
         desired_for(&anchor, profile(), [0x5a; 32]).persistent_volume_claim(),
         "pvc-uid",
     );
+    pvc["metadata"]["annotations"]["volume.kubernetes.io/storage-provisioner"] =
+        json!("rancher.io/local-path");
+    pvc["metadata"]["annotations"]["volume.beta.kubernetes.io/storage-provisioner"] =
+        json!("rancher.io/local-path");
     let coordinator = real_release_coordinator(client).unwrap();
     let task = tokio::spawn(async move { coordinator.release(&request).await });
     let mut handle = std::pin::pin!(handle);
