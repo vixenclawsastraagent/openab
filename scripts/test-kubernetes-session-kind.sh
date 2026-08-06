@@ -1803,6 +1803,8 @@ assert_invalid_cidr_rejected_by_api() {
     helm template invalid-cidr "$CHART" \
         --namespace "$SYSTEM_NAMESPACE" \
         --set enabled=true \
+        --set-string image.repository="${CONTROLLER_DIGEST%@*}" \
+        --set-string image.digest="${CONTROLLER_DIGEST#*@}" \
         --set-string 'networkPolicy.controller.apiServerCIDRs[0]=999.999.999.999/32' \
         > "$invalid_manifest"
     if kubectl create --dry-run=server -f "$invalid_manifest" \

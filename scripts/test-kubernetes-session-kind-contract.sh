@@ -861,6 +861,12 @@ grep -Fq 'worker relay NetworkPolicy contains an unexpected lane' "$TARGET" || {
 grep -Fq 'worker namespace exposes a Service' "$TARGET" || {
     fail "the isolation mode must reject inbound worker Services"
 }
+grep -Fq -- '--set-string image.repository="${CONTROLLER_DIGEST%@*}"' "$TARGET" || {
+    fail "the semantic CIDR API probe must render with the controller repository"
+}
+grep -Fq -- '--set-string image.digest="${CONTROLLER_DIGEST#*@}"' "$TARGET" || {
+    fail "the semantic CIDR API probe must render with the pinned controller image"
+}
 grep -Fq 'kubectl --request-timeout=5s -n "$WORKER_NAMESPACE" get services -o json' \
     "$TARGET" || {
     fail "worker Service absence must be parsed from a Kubernetes JSON snapshot"
