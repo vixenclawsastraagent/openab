@@ -39,10 +39,10 @@ require_prerequisites() {
 }
 
 case "$MODE" in
-    --check|--smoke)
+    --check|--smoke|--isolation)
         ;;
     *)
-        fail "usage: $0 [--check|--smoke]"
+        fail "usage: $0 [--check|--smoke|--isolation]"
         ;;
 esac
 
@@ -313,7 +313,8 @@ start_bridge() {
         --controller-ca-file /var/run/openab-kind-smoke/ca/ca.crt \
         < "$start_bridge_fifo" \
         > "$start_bridge_stdout" \
-        2> "$start_bridge_stderr" &
+        2> "$start_bridge_stderr" \
+        3>&- 4>&- &
     STARTED_BRIDGE_PID=$!
 }
 
@@ -323,6 +324,47 @@ single_resource_name() {
     description=$3
     resource_names=$(kubectl -n "$WORKER_NAMESPACE" get "$resource_type" \
         -l "$selector" -o name)
+    set -- $resource_names
+    [ "$#" -eq 1 ] || fail "$description count was not exactly one"
+    printf '%s\n' "$1"
+}
+
+other_resource_name() {
+    resource_type=$1
+    selector=$2
+    excluded_name=$3
+    description=$4
+    resource_names=$(kubectl -n "$WORKER_NAMESPACE" get "$resource_type" \
+        -l "$selector" -o name)
+    set -- $resource_names
+    [ "$#" -eq 2 ] || fail "$description count was not exactly two"
+    other_name=''
+    for candidate in $resource_names; do
+        if [ "$candidate" != "$excluded_name" ]; then
+            [ -z "$other_name" ] || fail "$description had more than one peer"
+            other_name=$candidate
+        fi
+    done
+    [ -n "$other_name" ] || fail "$description did not contain an independent peer"
+    printf '%s\n' "$other_name"
+}
+
+single_owned_resource_name() {
+    resource_type=$1
+    selector=$2
+    controlling_owner_uid=$3
+    description=$4
+    resource_snapshot="$TEMPORARY_ROOT/owned-$resource_type.json"
+    kubectl -n "$WORKER_NAMESPACE" get "$resource_type" \
+        -l "$selector" -o json > "$resource_snapshot"
+    resource_names=$(jq -r --arg owner_uid "$controlling_owner_uid" '
+        .items[]
+        | select(any(
+            .metadata.ownerReferences[]?;
+            .uid == $owner_uid and .controller == true
+        ))
+        | .metadata.name
+    ' "$resource_snapshot")
     set -- $resource_names
     [ "$#" -eq 1 ] || fail "$description count was not exactly one"
     printf '%s\n' "$1"
@@ -399,10 +441,12 @@ wait_for_api_server_endpoint() {
 assert_anchor_owner() {
     resource_type=$1
     resource_name=$2
-    description=$3
+    expected_anchor_name=$3
+    expected_anchor_uid=$4
+    description=$5
     owner_uids=$(kubectl -n "$WORKER_NAMESPACE" get "$resource_type" \
         "$resource_name" -o jsonpath='{.metadata.ownerReferences[*].uid}')
-    [ "$owner_uids" = "$ANCHOR_UID" ] || {
+    [ "$owner_uids" = "$expected_anchor_uid" ] || {
         fail "$description is not owned only by the session anchor"
     }
     owner_name=$(kubectl -n "$WORKER_NAMESPACE" get "$resource_type" \
@@ -411,9 +455,91 @@ assert_anchor_owner() {
         "$resource_name" -o jsonpath='{.metadata.ownerReferences[0].kind}')
     owner_controller=$(kubectl -n "$WORKER_NAMESPACE" get "$resource_type" \
         "$resource_name" -o jsonpath='{.metadata.ownerReferences[0].controller}')
-    [ "$owner_name" = "$ANCHOR_NAME" ] || fail "$description names an unexpected owner"
+    [ "$owner_name" = "$expected_anchor_name" ] || {
+        fail "$description names an unexpected owner"
+    }
     [ "$owner_kind" = 'ConfigMap' ] || fail "$description owner is not a ConfigMap"
     [ "$owner_controller" = 'true' ] || fail "$description owner is not controlling"
+}
+
+assert_worker_pod_isolation_contract() {
+    isolation_worker_pod=$1
+    isolation_private_pvc=$2
+    isolation_peer_pvc=$3
+    isolation_pod_description=$4
+    isolation_peer_description=$5
+    isolation_pod_snapshot="$TEMPORARY_ROOT/$isolation_worker_pod-isolation.json"
+    kubectl -n "$WORKER_NAMESPACE" get pod "$isolation_worker_pod" \
+        -o json > "$isolation_pod_snapshot"
+
+    isolation_session_claim=$(jq -r '
+        .spec.volumes[]
+        | select(.name == "session")
+        | .persistentVolumeClaim.claimName
+    ' "$isolation_pod_snapshot")
+    [ "$isolation_session_claim" = "$isolation_private_pvc" ] || {
+        fail "$isolation_pod_description does not mount its private workspace PVC"
+    }
+    if jq -e '
+        ([
+            .spec.containers[0].volumeMounts[]?
+            | select(.name == "session")
+        ] | length == 1)
+        and any(
+            .spec.containers[0].volumeMounts[]?;
+            .name == "session"
+            and .mountPath == "/session"
+            and ((.readOnly // false) == false)
+        )
+    ' "$isolation_pod_snapshot" >/dev/null; then
+        :
+    else
+        fail "$isolation_pod_description does not mount its private workspace read-write at /session"
+    fi
+    if jq -e --arg peer "$isolation_peer_pvc" '
+        [.spec.volumes[] | .persistentVolumeClaim.claimName // empty]
+        | index($peer) != null
+    ' "$isolation_pod_snapshot" >/dev/null; then
+        fail "$isolation_pod_description mounts $isolation_peer_description workspace PVC"
+    fi
+    if jq -e --arg private "$isolation_private_pvc" '
+        [.spec.volumes[] | .persistentVolumeClaim.claimName // empty]
+        == [$private]
+    ' "$isolation_pod_snapshot" >/dev/null; then
+        :
+    else
+        fail "$isolation_pod_description mounts a PVC outside its private workspace"
+    fi
+
+    if jq -e '
+        (.spec.containers | length == 1)
+        and (.spec.containers[0].resources.requests.cpu == "10m")
+        and (.spec.containers[0].resources.requests.memory == "64Mi")
+        and (.spec.containers[0].resources.requests["ephemeral-storage"] == "64Mi")
+        and (.spec.containers[0].resources.limits.cpu == "250m")
+        and (.spec.containers[0].resources.limits.memory == "256Mi")
+        and (.spec.containers[0].resources.limits["ephemeral-storage"] == "256Mi")
+    ' "$isolation_pod_snapshot" >/dev/null; then
+        :
+    else
+        fail "$isolation_pod_description resource requests or limits drifted from the profile"
+    fi
+
+    if jq -e '
+        (.spec.automountServiceAccountToken == false)
+        and ((.spec.hostNetwork // false) == false)
+        and ((.spec.hostPID // false) == false)
+        and ((.spec.hostIPC // false) == false)
+        and ((.spec.shareProcessNamespace // false) == false)
+        and ([.spec.volumes[] | select(.hostPath != null)] | length == 0)
+        and ([
+            .spec.volumes[]?.projected.sources[]?.serviceAccountToken
+        ] | length == 0)
+    ' "$isolation_pod_snapshot" >/dev/null; then
+        :
+    else
+        fail "$isolation_pod_description weakens the worker isolation boundary"
+    fi
 }
 
 assert_shared_skills_config_map() {
@@ -1132,10 +1258,24 @@ WORKER_NETWORK_POLICY_RESOURCE=$(single_resource_name networkpolicy \
     'app.kubernetes.io/managed-by=openab-session-controller,openab.dev/resource=worker-network-policy' \
     'smoke-session worker NetworkPolicy')
 WORKER_NETWORK_POLICY=${WORKER_NETWORK_POLICY_RESOURCE#*/}
-assert_anchor_owner pod "$WORKER_POD" 'worker Pod'
-assert_anchor_owner persistentvolumeclaim "$WORKSPACE_PVC" 'workspace PVC'
-assert_anchor_owner serviceaccount "$WORKER_SERVICE_ACCOUNT" 'worker ServiceAccount'
-assert_anchor_owner networkpolicy "$WORKER_NETWORK_POLICY" 'worker NetworkPolicy'
+WORKER_POD_UID=$(kubectl -n "$WORKER_NAMESPACE" get pod "$WORKER_POD" \
+    -o jsonpath='{.metadata.uid}')
+WORKSPACE_PVC_UID=$(kubectl -n "$WORKER_NAMESPACE" get persistentvolumeclaim \
+    "$WORKSPACE_PVC" -o jsonpath='{.metadata.uid}')
+WORKER_SERVICE_ACCOUNT_UID=$(kubectl -n "$WORKER_NAMESPACE" get serviceaccount \
+    "$WORKER_SERVICE_ACCOUNT" -o jsonpath='{.metadata.uid}')
+[ -n "$WORKER_POD_UID" ] || fail "worker Pod has no Kubernetes UID"
+[ -n "$WORKSPACE_PVC_UID" ] || fail "workspace PVC has no Kubernetes UID"
+[ -n "$WORKER_SERVICE_ACCOUNT_UID" ] || {
+    fail "worker ServiceAccount has no Kubernetes UID"
+}
+assert_anchor_owner pod "$WORKER_POD" "$ANCHOR_NAME" "$ANCHOR_UID" 'worker Pod'
+assert_anchor_owner persistentvolumeclaim "$WORKSPACE_PVC" \
+    "$ANCHOR_NAME" "$ANCHOR_UID" 'workspace PVC'
+assert_anchor_owner serviceaccount "$WORKER_SERVICE_ACCOUNT" \
+    "$ANCHOR_NAME" "$ANCHOR_UID" 'worker ServiceAccount'
+assert_anchor_owner networkpolicy "$WORKER_NETWORK_POLICY" \
+    "$ANCHOR_NAME" "$ANCHOR_UID" 'worker NetworkPolicy'
 
 RELAY_CA_IMMUTABLE=$(kubectl -n "$WORKER_NAMESPACE" get configmap \
     openab-kind-smoke-relay-ca -o jsonpath='{.immutable}')
@@ -1148,6 +1288,170 @@ WORKER_RELAY_CA_NAME=$(kubectl -n "$WORKER_NAMESPACE" get pod "$WORKER_POD" \
 RELAY_CA_OWNERS=$(kubectl -n "$WORKER_NAMESPACE" get configmap \
     openab-kind-smoke-relay-ca -o jsonpath='{.metadata.ownerReferences[*].uid}')
 [ -z "$RELAY_CA_OWNERS" ] || fail "operator-owned worker relay CA has a session owner"
+
+if [ "$MODE" = '--isolation' ]; then
+    BRIDGE_B_FIFO="$TEMPORARY_ROOT/bridge-b.stdin"
+    BRIDGE_B_STDOUT="$TEMPORARY_ROOT/bridge-b.stdout"
+    BRIDGE_B_STDERR="$TEMPORARY_ROOT/bridge-b.stderr"
+    mkfifo "$BRIDGE_B_FIFO"
+    start_bridge \
+        "$BRIDGE_B_FIFO" \
+        "$BRIDGE_B_STDOUT" \
+        "$BRIDGE_B_STDERR" \
+        'discord:kind-smoke:thread-2' \
+        '00000000-0000-0000-0000-000000000065'
+    BRIDGE_B_PID=$STARTED_BRIDGE_PID
+    STARTED_BRIDGE_PID=''
+    exec 4> "$BRIDGE_B_FIFO"
+    BRIDGE_B_WRITER_OPEN=1
+
+    printf '%s\n' "$INITIALIZE_LINE" >&4
+    wait_for_output 'bridge B initialization' '"id":1' \
+        "$BRIDGE_B_STDOUT" "$BRIDGE_B_PID" "$BRIDGE_B_STDERR" 180
+    grep -Fq 'openab-kubernetes-session-fake-acp' "$BRIDGE_B_STDOUT" || {
+        fail "bridge B initialization did not reach the fake ACP worker"
+    }
+    printf '%s\n' "$SESSION_NEW_LINE" >&4
+    wait_for_output 'fake ACP session B creation' '"id":2' \
+        "$BRIDGE_B_STDOUT" "$BRIDGE_B_PID" "$BRIDGE_B_STDERR" 60
+    grep -Fq 'openab-fake-session-v1' "$BRIDGE_B_STDOUT" || {
+        fail "fake ACP session B did not return its fixed identity"
+    }
+
+    ANCHOR_B_RESOURCE=$(other_resource_name configmap \
+        'app.kubernetes.io/managed-by=openab-session-controller,openab.dev/resource=session-anchor' \
+        "configmap/$ANCHOR_NAME" 'isolation-session anchors')
+    ANCHOR_NAME_B=${ANCHOR_B_RESOURCE#configmap/}
+    ANCHOR_UID_B=$(kubectl -n "$WORKER_NAMESPACE" get configmap "$ANCHOR_NAME_B" \
+        -o jsonpath='{.metadata.uid}')
+    [ -n "$ANCHOR_UID_B" ] || fail "session B anchor has no Kubernetes UID"
+    ANCHOR_STATE_B=$(kubectl -n "$WORKER_NAMESPACE" get configmap "$ANCHOR_NAME_B" \
+        -o jsonpath='{.data.anchor\.json}')
+    printf '%s\n' "$ANCHOR_STATE_B" | grep -Eq \
+        '"phase"[[:space:]]*:[[:space:]]*"ready"' || {
+        fail "session B anchor did not persist the ready phase"
+    }
+
+    WORKER_POD_B=$(single_owned_resource_name pod \
+        'app.kubernetes.io/managed-by=openab-session-controller,openab.dev/resource=worker-pod' \
+        "$ANCHOR_UID_B" 'session B worker Pod')
+    WORKSPACE_PVC_B=$(single_owned_resource_name persistentvolumeclaim \
+        'app.kubernetes.io/managed-by=openab-session-controller,openab.dev/resource=workspace-pvc' \
+        "$ANCHOR_UID_B" 'session B workspace PVC')
+    WORKER_SERVICE_ACCOUNT_B=$(single_owned_resource_name serviceaccount \
+        'app.kubernetes.io/managed-by=openab-session-controller,openab.dev/resource=worker-service-account' \
+        "$ANCHOR_UID_B" 'session B worker ServiceAccount')
+    WORKER_NETWORK_POLICY_B=$(single_owned_resource_name networkpolicy \
+        'app.kubernetes.io/managed-by=openab-session-controller,openab.dev/resource=worker-network-policy' \
+        "$ANCHOR_UID_B" 'session B worker NetworkPolicy')
+    kubectl -n "$WORKER_NAMESPACE" wait \
+        --for=condition=Ready "pod/$WORKER_POD_B" --timeout=120s
+    if ! kill -0 "$BRIDGE_A_PID" >/dev/null 2>&1; then
+        fail "session A bridge did not remain active while session B started"
+    fi
+    if ! kill -0 "$BRIDGE_B_PID" >/dev/null 2>&1; then
+        fail "session B bridge did not remain active after session creation"
+    fi
+    kubectl -n "$WORKER_NAMESPACE" wait \
+        --for=condition=Ready "pod/$WORKER_POD" --timeout=30s
+    CURRENT_WORKER_POD_UID=$(kubectl -n "$WORKER_NAMESPACE" get pod \
+        "$WORKER_POD" -o jsonpath='{.metadata.uid}')
+    [ "$CURRENT_WORKER_POD_UID" = "$WORKER_POD_UID" ] || {
+        fail "session A worker Pod was replaced while session B started"
+    }
+    CURRENT_ANCHOR_STATE=$(kubectl -n "$WORKER_NAMESPACE" get configmap \
+        "$ANCHOR_NAME" -o jsonpath='{.data.anchor\.json}')
+    printf '%s\n' "$CURRENT_ANCHOR_STATE" | grep -Eq \
+        '"phase"[[:space:]]*:[[:space:]]*"ready"' || {
+        fail "session A did not remain ready while session B started"
+    }
+
+    WORKER_POD_UID_B=$(kubectl -n "$WORKER_NAMESPACE" get pod "$WORKER_POD_B" \
+        -o jsonpath='{.metadata.uid}')
+    WORKSPACE_PVC_UID_B=$(kubectl -n "$WORKER_NAMESPACE" get persistentvolumeclaim \
+        "$WORKSPACE_PVC_B" -o jsonpath='{.metadata.uid}')
+    WORKER_SERVICE_ACCOUNT_UID_B=$(kubectl -n "$WORKER_NAMESPACE" get serviceaccount \
+        "$WORKER_SERVICE_ACCOUNT_B" -o jsonpath='{.metadata.uid}')
+    [ -n "$WORKER_POD_UID_B" ] || fail "session B worker Pod has no Kubernetes UID"
+    [ -n "$WORKSPACE_PVC_UID_B" ] || fail "session B workspace PVC has no Kubernetes UID"
+    [ -n "$WORKER_SERVICE_ACCOUNT_UID_B" ] || {
+        fail "session B worker ServiceAccount has no Kubernetes UID"
+    }
+    POD_SERVICE_ACCOUNT_B=$(kubectl -n "$WORKER_NAMESPACE" get pod \
+        "$WORKER_POD_B" -o jsonpath='{.spec.serviceAccountName}')
+    [ "$POD_SERVICE_ACCOUNT_B" = "$WORKER_SERVICE_ACCOUNT_B" ] || {
+        fail "worker Pod B does not use its anchor-owned ServiceAccount"
+    }
+
+    if [ "$WORKER_POD" = "$WORKER_POD_B" ] || \
+        [ "$WORKER_POD_UID" = "$WORKER_POD_UID_B" ]; then
+        fail "two sessions unexpectedly share a worker Pod"
+    fi
+    if [ "$WORKSPACE_PVC" = "$WORKSPACE_PVC_B" ] || \
+        [ "$WORKSPACE_PVC_UID" = "$WORKSPACE_PVC_UID_B" ]; then
+        fail "two sessions unexpectedly share a workspace PVC"
+    fi
+    if [ "$WORKER_SERVICE_ACCOUNT" = "$WORKER_SERVICE_ACCOUNT_B" ] || \
+        [ "$WORKER_SERVICE_ACCOUNT_UID" = "$WORKER_SERVICE_ACCOUNT_UID_B" ]; then
+        fail "two sessions unexpectedly share a ServiceAccount"
+    fi
+
+    assert_anchor_owner pod "$WORKER_POD_B" \
+        "$ANCHOR_NAME_B" "$ANCHOR_UID_B" 'worker Pod B'
+    assert_anchor_owner persistentvolumeclaim "$WORKSPACE_PVC_B" \
+        "$ANCHOR_NAME_B" "$ANCHOR_UID_B" 'workspace PVC B'
+    assert_anchor_owner serviceaccount "$WORKER_SERVICE_ACCOUNT_B" \
+        "$ANCHOR_NAME_B" "$ANCHOR_UID_B" 'worker ServiceAccount B'
+    assert_anchor_owner networkpolicy "$WORKER_NETWORK_POLICY_B" \
+        "$ANCHOR_NAME_B" "$ANCHOR_UID_B" 'worker NetworkPolicy B'
+    assert_worker_pod_isolation_contract \
+        "$WORKER_POD" "$WORKSPACE_PVC" "$WORKSPACE_PVC_B" \
+        'worker Pod A' "session B's"
+    assert_worker_pod_isolation_contract \
+        "$WORKER_POD_B" "$WORKSPACE_PVC_B" "$WORKSPACE_PVC" \
+        'worker Pod B' "session A's"
+    assert_worker_shared_skills "$WORKER_POD_B"
+
+    WORKER_IMAGE_OBSERVED_B=$(kubectl -n "$WORKER_NAMESPACE" get pod \
+        "$WORKER_POD_B" -o jsonpath='{.spec.containers[0].image}')
+    [ "$WORKER_IMAGE_OBSERVED_B" = "$WORKER_DIGEST" ] || {
+        fail "worker Pod B does not use the loaded digest-qualified image"
+    }
+    SA_AUTOMOUNT_B=$(kubectl -n "$WORKER_NAMESPACE" get serviceaccount \
+        "$WORKER_SERVICE_ACCOUNT_B" \
+        -o jsonpath='{.automountServiceAccountToken}')
+    [ "$SA_AUTOMOUNT_B" = 'false' ] || {
+        fail "worker ServiceAccount B can automount a Kubernetes token"
+    }
+    kubectl -n "$WORKER_NAMESPACE" exec "$WORKER_POD_B" -- \
+        /bin/sh -c 'test ! -e /var/run/secrets/kubernetes.io/serviceaccount/token' || {
+        fail "worker B filesystem contains a Kubernetes API token"
+    }
+    REGISTRATION_SECRET_B=$(kubectl -n "$WORKER_NAMESPACE" get pod \
+        "$WORKER_POD_B" \
+        -o jsonpath='{.spec.volumes[?(@.name=="registration")].secret.secretName}')
+    [ -n "$REGISTRATION_SECRET_B" ] || {
+        fail "worker Pod B has no registration Secret reference"
+    }
+    [ "$REGISTRATION_SECRET" != "$REGISTRATION_SECRET_B" ] || {
+        fail "two sessions unexpectedly reuse a registration Secret name"
+    }
+    REGISTRATION_LOOKUP_B="$TEMPORARY_ROOT/registration-secret-b-lookup"
+    if kubectl -n "$WORKER_NAMESPACE" get secret "$REGISTRATION_SECRET_B" \
+        > "$REGISTRATION_LOOKUP_B" 2>&1; then
+        fail "session B one-shot registration Secret still exists"
+    fi
+    grep -Fq '(NotFound)' "$REGISTRATION_LOOKUP_B" || {
+        sed -n '1,20p' "$REGISTRATION_LOOKUP_B" >&2 || true
+        fail "session B registration Secret lookup failed unexpectedly"
+    }
+    REGISTRATION_SECRETS_AFTER_B=$(kubectl -n "$WORKER_NAMESPACE" get secrets \
+        -l 'app.kubernetes.io/managed-by=openab-session-controller,openab.dev/resource=registration-secret' \
+        -o name)
+    [ -z "$REGISTRATION_SECRETS_AFTER_B" ] || {
+        fail "a managed registration Secret remains after both workers registered"
+    }
+fi
 
 SERVICE_TYPE=$(kubectl -n "$SYSTEM_NAMESPACE" get service "$CONTROLLER_NAME" \
     -o jsonpath='{.spec.type}')
@@ -1165,4 +1469,8 @@ WORKER_SERVICES=$(kubectl -n "$WORKER_NAMESPACE" get services -o name)
 [ -z "$WORKER_SERVICES" ] || fail "worker namespace exposes a Service"
 
 COMPLETED=1
-printf '%s\n' 'kubernetes-session Kind test: smoke checks passed'
+if [ "$MODE" = '--isolation' ]; then
+    printf '%s\n' 'kubernetes-session Kind test: isolation checks passed'
+else
+    printf '%s\n' 'kubernetes-session Kind test: smoke checks passed'
+fi

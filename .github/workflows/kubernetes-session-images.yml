@@ -65,5 +65,5 @@ jobs:
       - name: Build and verify isolated-session images
         run: sh scripts/test-kubernetes-session-images.sh --build
 
-      - name: Verify controller and worker registration in Kind
-        run: sh scripts/test-kubernetes-session-kind.sh --smoke
+      - name: Verify two isolated sessions in Kind
+        run: sh scripts/test-kubernetes-session-kind.sh --isolation

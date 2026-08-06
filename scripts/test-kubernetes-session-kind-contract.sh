@@ -4,6 +4,7 @@ set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "${0%/*}" && pwd)
 TARGET="$SCRIPT_DIR/test-kubernetes-session-kind.sh"
+WORKFLOW="$SCRIPT_DIR/../.github/workflows/kubernetes-session-images.yml"
 PROFILE_FIXTURE="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/profiles.toml.in"
 SKILLS_FIXTURE="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/shared-skill.md"
 ENDPOINT_FILTER="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/api-server-endpoints.jq"
@@ -84,6 +85,7 @@ assert_endpoint_filter_failure() {
 }
 
 [ -f "$TARGET" ] || fail "missing scripts/test-kubernetes-session-kind.sh"
+[ -f "$WORKFLOW" ] || fail "missing Kubernetes Session Images workflow"
 [ -f "$PROFILE_FIXTURE" ] || fail "missing Kind worker profile fixture"
 [ -f "$SKILLS_FIXTURE" ] || fail "missing immutable shared skills fixture"
 [ -f "$ENDPOINT_FILTER" ] || fail "missing API EndpointSlice jq filter"
@@ -159,7 +161,7 @@ if "$TARGET" --unknown >"$unknown_stdout" 2>"$unknown_stderr"; then
     fail "unknown mode unexpectedly succeeded"
 fi
 [ ! -s "$unknown_stdout" ] || fail "unknown mode wrote unexpected stdout"
-grep -Fqx "kubernetes-session Kind test: usage: $TARGET [--check|--smoke]" \
+grep -Fqx "kubernetes-session Kind test: usage: $TARGET [--check|--smoke|--isolation]" \
     "$unknown_stderr" || fail "unknown mode did not emit the exact usage failure"
 
 for missing in docker kind helm kubectl openssl git jq; do
@@ -321,6 +323,73 @@ grep -Fq 'openab-skills-write-probe-started' "$TARGET" || {
 }
 grep -Fq 'worker could write to the shared skills mount' "$TARGET" || {
     fail "the live harness must actively reject writable shared skills"
+}
+grep -Fq -- '--check|--smoke|--isolation)' "$TARGET" || {
+    fail "the live harness must expose a distinct isolation mode"
+}
+grep -Fq 'discord:kind-smoke:thread-2' "$TARGET" || {
+    fail "the isolation mode must activate a second logical thread"
+}
+grep -Fq '00000000-0000-0000-0000-000000000065' "$TARGET" || {
+    fail "the second logical thread must use an independent activation attempt"
+}
+grep -Fq 'session A bridge did not remain active while session B started' \
+    "$TARGET" || {
+    fail "the isolation mode must prove both bridge lanes remain concurrent"
+}
+grep -Fq 'session B bridge did not remain active after session creation' \
+    "$TARGET" || {
+    fail "the isolation mode must prove bridge B remains live at the checkpoint"
+}
+grep -Fq 'session A worker Pod was replaced while session B started' \
+    "$TARGET" || {
+    fail "the isolation mode must keep the first worker generation stable"
+}
+grep -Fq 'exec 4> "$BRIDGE_B_FIFO"' "$TARGET" || {
+    fail "the isolation mode must keep bridge B input open independently"
+}
+grep -Fq 'assert_worker_shared_skills "$WORKER_POD_B"' "$TARGET" || {
+    fail "both isolated workers must consume the pinned read-only skills"
+}
+grep -Fq 'two sessions unexpectedly share a worker Pod' "$TARGET" || {
+    fail "the isolation mode must reject a shared worker Pod"
+}
+grep -Fq 'two sessions unexpectedly share a workspace PVC' "$TARGET" || {
+    fail "the isolation mode must reject a shared workspace PVC"
+}
+grep -Fq 'two sessions unexpectedly share a ServiceAccount' "$TARGET" || {
+    fail "the isolation mode must reject a shared worker identity"
+}
+grep -Fq 'two sessions unexpectedly reuse a registration Secret name' \
+    "$TARGET" || {
+    fail "the isolation mode must keep bootstrap credentials session-private"
+}
+grep -Fq 'worker Pod B does not use its anchor-owned ServiceAccount' \
+    "$TARGET" || {
+    fail "the isolation mode must bind worker B to its private ServiceAccount"
+}
+grep -Fq 'fail "$isolation_pod_description mounts $isolation_peer_description workspace PVC"' \
+    "$TARGET" || {
+    fail "the isolation mode must reject a peer workspace mount"
+}
+grep -Fq 'fail "$isolation_pod_description mounts a PVC outside its private workspace"' \
+    "$TARGET" || {
+    fail "the isolation mode must reject every additional PVC mount"
+}
+grep -Fq 'fail "$isolation_pod_description does not mount its private workspace read-write at /session"' \
+    "$TARGET" || {
+    fail "the isolation mode must mount each private workspace into its worker"
+}
+grep -Fq 'fail "$isolation_pod_description resource requests or limits drifted from the profile"' \
+    "$TARGET" || {
+    fail "the isolation mode must verify the second worker resource cgroup contract"
+}
+grep -Fq 'kubernetes-session Kind test: isolation checks passed' "$TARGET" || {
+    fail "the isolation mode must have its own completion signal"
+}
+grep -Fq 'run: sh scripts/test-kubernetes-session-kind.sh --isolation' \
+    "$WORKFLOW" || {
+    fail "the image workflow must execute the two-session isolation gate"
 }
 
 printf '%s\n' 'kubernetes-session Kind contract test: all checks passed'
