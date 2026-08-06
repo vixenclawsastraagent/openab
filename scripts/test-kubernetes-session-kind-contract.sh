@@ -8,6 +8,7 @@ WORKFLOW="$SCRIPT_DIR/../.github/workflows/kubernetes-session-images.yml"
 PROFILE_FIXTURE="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/profiles.toml.in"
 SKILLS_FIXTURE="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/shared-skill.md"
 WORKSPACE_FIXTURE="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/workspace-isolation.ndjson"
+LIFECYCLE_FIXTURE="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/session-lifecycle.ndjson"
 ENDPOINT_FILTER="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/api-server-endpoints.jq"
 ENDPOINT_FIXTURE="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/api-server-endpoints.json"
 TEMPORARY_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/openab-session-kind-contract.XXXXXX")
@@ -90,6 +91,7 @@ assert_endpoint_filter_failure() {
 [ -f "$PROFILE_FIXTURE" ] || fail "missing Kind worker profile fixture"
 [ -f "$SKILLS_FIXTURE" ] || fail "missing immutable shared skills fixture"
 [ -f "$WORKSPACE_FIXTURE" ] || fail "missing workspace isolation fixture"
+[ -f "$LIFECYCLE_FIXTURE" ] || fail "missing session lifecycle fixture"
 [ -f "$ENDPOINT_FILTER" ] || fail "missing API EndpointSlice jq filter"
 [ -f "$ENDPOINT_FIXTURE" ] || fail "missing API EndpointSlice JSON fixture"
 
@@ -204,6 +206,63 @@ jq -s -e '
     ]
 ' "$WORKSPACE_FIXTURE" >/dev/null || {
     fail "workspace isolation fixture is not a closed deterministic probe sequence"
+}
+
+lifecycle_fixture_bytes=$(wc -c < "$LIFECYCLE_FIXTURE")
+[ "$lifecycle_fixture_bytes" -gt 0 ] || fail "session lifecycle fixture is empty"
+[ "$lifecycle_fixture_bytes" -le 4096 ] || {
+    fail "session lifecycle fixture exceeds its bounded input size"
+}
+jq -s -e '
+    length == 11
+    and ([.[].id] | sort == [
+        301, 310, 311, 312, 401, 402, 403, 404, 405, 406, 499
+    ])
+    and all(.[];
+        type == "object"
+        and (keys == ["id", "jsonrpc", "method", "params"])
+        and .jsonrpc == "2.0"
+        and (.id | type) == "number"
+        and .params.sessionId == "openab-fake-session-v1"
+        and (
+            if .method == "session/prompt" then
+                (.params | (
+                    type == "object"
+                    and keys == ["prompt", "sessionId"]
+                    and .prompt == []
+                ))
+            elif .method == "session/load" then
+                (.params | (
+                    type == "object"
+                    and keys == ["sessionId"]
+                ))
+            elif .method == "_openab/test/workspace/read" then
+                (.params | (
+                    type == "object"
+                    and keys == ["sessionId"]
+                ))
+            else
+                false
+            end
+        )
+    )
+    and (
+        [.[] | [.id, .method]] | sort_by(.[0])
+    ) == [
+        [301, "session/prompt"],
+        [310, "session/load"],
+        [311, "_openab/test/workspace/read"],
+        [312, "session/prompt"],
+        [401, "session/prompt"],
+        [402, "session/prompt"],
+        [403, "session/prompt"],
+        [404, "session/prompt"],
+        [405, "session/prompt"],
+        [406, "session/prompt"],
+        [499, "_openab/test/workspace/read"]
+    ]
+' "$LIFECYCLE_FIXTURE" >/dev/null || {
+    fail "session lifecycle fixture is not a closed replacement sequence"
 }
 
 unknown_stdout="$TEMPORARY_ROOT/unknown.stdout"
@@ -486,6 +545,51 @@ grep -Fq 'kubectl --request-timeout=5s -n "$WORKER_NAMESPACE" get services -o js
 if grep -Fq 'WORKER_SERVICES=$(kubectl' "$TARGET"; then
     fail "worker Service absence must not use line-oriented kubectl output"
 fi
+grep -Fq 'lifecycle_request()' "$TARGET" || {
+    fail "lifecycle requests must be selected by exact JSON-RPC ID"
+}
+grep -Fq 'send_bridge_request()' "$TARGET" || {
+    fail "bridge writes must contain FIFO SIGPIPE without killing the harness"
+}
+grep -Fq 'OPENAB_SESSION_MAPPING_EXPECTATION="$start_bridge_mapping_expectation"' \
+    "$TARGET" || {
+    fail "bridge restarts must supply an explicit mapping expectation"
+}
+grep -Fq 'capture_anchor_snapshot()' "$TARGET" || {
+    fail "lifecycle checks must parse the durable anchor with jq"
+}
+grep -Fq 'wait_for_anchor_state()' "$TARGET" || {
+    fail "lifecycle checks must wait for an exact anchor UID, phase, and Pod UID"
+}
+grep -Fq 'wait_for_exact_uid_absent()' "$TARGET" || {
+    fail "lifecycle cleanup must prove exact Kubernetes UIDs absent"
+}
+grep -Fq 'snapshot_session_children()' "$TARGET" || {
+    fail "lifecycle cleanup must inventory children by full session annotation"
+}
+grep -Fq 'session A bridge did not exit after its worker Pod was deleted' \
+    "$TARGET" || {
+    fail "failed-Pod recovery must require the old bridge to terminate"
+}
+grep -Fq 'session A blocked cleanup retained generation-scoped compute' \
+    "$TARGET" || {
+    fail "failed-Pod recovery must prove generation compute is absent"
+}
+grep -Fq 'session A replacement did not advance exactly one generation' \
+    "$TARGET" || {
+    fail "failed-Pod recovery must advance exactly one generation"
+}
+grep -Fq 'session A replacement changed its logical identity or PVC' \
+    "$TARGET" || {
+    fail "failed-Pod recovery must retain logical identity and private storage"
+}
+grep -Fq 'session A replacement did not retain its workspace state' \
+    "$TARGET" || {
+    fail "failed-Pod recovery must retain the private workspace marker"
+}
+grep -Fq 'session A replacement affected session B' "$TARGET" || {
+    fail "failed-Pod recovery must prove peer non-interference"
+}
 grep -Fq 'kubernetes-session Kind test: isolation checks passed' "$TARGET" || {
     fail "the isolation mode must have its own completion signal"
 }

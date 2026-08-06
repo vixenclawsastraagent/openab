@@ -61,12 +61,14 @@ for fixture in \
     api-server-endpoints.jq \
     smoke.ndjson \
     workspace-isolation.ndjson \
+    session-lifecycle.ndjson \
     broker-pod.yaml.in \
     network-probe-pod.yaml.in; do
     [ -f "$FIXTURE_ROOT/$fixture" ] || fail "missing fixture $fixture"
 done
 
 WORKSPACE_ISOLATION_FIXTURE="$FIXTURE_ROOT/workspace-isolation.ndjson"
+SESSION_LIFECYCLE_FIXTURE="$FIXTURE_ROOT/session-lifecycle.ndjson"
 
 TEMPORARY_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/openab-session-kind.XXXXXX")
 KUBECONFIG="$TEMPORARY_ROOT/kubeconfig"
@@ -313,6 +315,48 @@ fixture_request() {
     printf '%s\n' "$fixture_request_value"
 }
 
+lifecycle_request() {
+    lifecycle_request_id=$1
+    lifecycle_request_value=$(jq -s -c --argjson request_id "$lifecycle_request_id" '
+        [.[] | select(
+            type == "object"
+            and .id == $request_id
+        )]
+        | if length == 1 then
+            .[0]
+        else
+            error("lifecycle fixture request ID must be unique")
+        end
+    ' "$SESSION_LIFECYCLE_FIXTURE") || {
+        fail "lifecycle fixture request ID $lifecycle_request_id is not unique"
+    }
+    printf '%s\n' "$lifecycle_request_value"
+}
+
+send_bridge_request() {
+    bridge_channel=$1
+    bridge_request_description=$2
+    bridge_request_line=$3
+    case "$bridge_channel" in
+        a)
+            if (trap '' PIPE; printf '%s\n' "$bridge_request_line" >&3) \
+                2>/dev/null; then
+                return 0
+            fi
+            ;;
+        b)
+            if (trap '' PIPE; printf '%s\n' "$bridge_request_line" >&4) \
+                2>/dev/null; then
+                return 0
+            fi
+            ;;
+        *)
+            fail "unknown bridge request channel $bridge_channel"
+            ;;
+    esac
+    fail "$bridge_request_description input closed before request was accepted"
+}
+
 wait_for_rpc_response() {
     rpc_wait_description=$1
     rpc_wait_request_id=$2
@@ -360,6 +404,39 @@ assert_rpc_empty_result() {
     else
         fail "$rpc_result_description"
     fi
+}
+
+assert_rpc_prompt_result() {
+    rpc_prompt_description=$1
+    rpc_prompt_output_file=$2
+    rpc_prompt_request_id=$3
+    if jq -s -e --argjson request_id "$rpc_prompt_request_id" '
+        [.[] | select(
+            type == "object"
+            and .id == $request_id
+        )] == [{
+            "jsonrpc": "2.0",
+            "id": $request_id,
+            "result": {"stopReason": "end_turn"}
+        }]
+    ' "$rpc_prompt_output_file" >/dev/null; then
+        :
+    else
+        fail "$rpc_prompt_description"
+    fi
+}
+
+refresh_session_b() {
+    peer_refresh_request_id=$1
+    peer_refresh_description=$2
+    peer_refresh_request=$(lifecycle_request "$peer_refresh_request_id")
+    send_bridge_request b "$peer_refresh_description" "$peer_refresh_request"
+    wait_for_rpc_response "$peer_refresh_description" \
+        "$peer_refresh_request_id" \
+        "$BRIDGE_B_STDOUT" "$BRIDGE_B_PID" "$BRIDGE_B_STDERR" 60
+    assert_rpc_prompt_result \
+        "$peer_refresh_description returned an unexpected result" \
+        "$BRIDGE_B_STDOUT" "$peer_refresh_request_id"
 }
 
 assert_rpc_error() {
@@ -419,12 +496,21 @@ start_bridge() {
     start_bridge_stderr=$3
     start_bridge_session_key=$4
     start_bridge_attempt_id=$5
+    start_bridge_mapping_expectation=$6
+
+    case "$start_bridge_mapping_expectation" in
+        absent|present)
+            ;;
+        *)
+            fail "invalid bridge mapping expectation $start_bridge_mapping_expectation"
+            ;;
+    esac
 
     kubectl -n "$SYSTEM_NAMESPACE" exec -i "$BROKER_POD" -- \
         env \
         OPENAB_SESSION_KEY="$start_bridge_session_key" \
         OPENAB_SESSION_ATTEMPT_ID="$start_bridge_attempt_id" \
-        OPENAB_SESSION_MAPPING_EXPECTATION=absent \
+        OPENAB_SESSION_MAPPING_EXPECTATION="$start_bridge_mapping_expectation" \
         /usr/local/bin/openab-kubernetes-session bridge \
         --controller-url \
         wss://openab-session-controller.openab-system.svc:8443/v1/bridge \
@@ -448,6 +534,17 @@ single_resource_name() {
     set -- $resource_names
     [ "$#" -eq 1 ] || fail "$description count was not exactly one"
     printf '%s\n' "$1"
+}
+
+kubernetes_resource_uid() {
+    uid_resource_type=$1
+    uid_resource_name=$2
+    uid_description=$3
+    uid_snapshot="$TEMPORARY_ROOT/uid-$uid_resource_name.json"
+    kubectl --request-timeout=5s -n "$WORKER_NAMESPACE" get \
+        "$uid_resource_type" "$uid_resource_name" -o json > "$uid_snapshot"
+    jq -er '.metadata.uid | select(type == "string" and length > 0)' \
+        "$uid_snapshot" || fail "$uid_description has no Kubernetes UID"
 }
 
 other_resource_name() {
@@ -513,6 +610,296 @@ single_unique_word() {
     done
     [ -n "$unique" ] || fail "$description was unavailable"
     printf '%s\n' "$unique"
+}
+
+capture_anchor_snapshot() {
+    anchor_snapshot_name=$1
+    anchor_snapshot_destination=$2
+    anchor_snapshot_raw="$anchor_snapshot_destination.raw"
+    anchor_snapshot_error="$anchor_snapshot_destination.stderr"
+
+    if ! kubectl --request-timeout=5s -n "$WORKER_NAMESPACE" get configmap \
+        "$anchor_snapshot_name" -o json \
+        > "$anchor_snapshot_raw" 2> "$anchor_snapshot_error"; then
+        return 1
+    fi
+    if jq -e --arg expected_name "$anchor_snapshot_name" '
+        . as $config_map
+        | ($config_map.data["anchor.json"] | fromjson) as $state
+        | if (
+            $config_map.metadata.name == $expected_name
+            and ($config_map.metadata.uid | (
+                type == "string" and length > 0
+            ))
+            and ($config_map.metadata.resourceVersion | (
+                type == "string" and length > 0
+            ))
+            and ($state | type == "object")
+            and ($state.sessionId | (
+                type == "string" and test("^[0-9a-f]{64}$")
+            ))
+            and ($state.scopeId | (
+                type == "string" and test("^[0-9a-f]{64}$")
+            ))
+            and ($state.incarnationId | (
+                type == "string" and length > 0
+            ))
+            and ($state.fence.generation | (
+                type == "number" and . >= 1 and floor == .
+            ))
+            and ($state.fence.attemptId | (
+                type == "string" and length > 0
+            ))
+            and ([
+                "provisioning", "ready", "busy", "suspending",
+                "suspended", "deleting", "blocked"
+            ] | index($state.phase) != null)
+            and (
+                ($state.podUid == null)
+                or ($state.podUid | (type == "string" and length > 0))
+            )
+          ) then
+            {
+                name: $config_map.metadata.name,
+                uid: $config_map.metadata.uid,
+                state: $state
+            }
+          else
+            error("malformed session anchor snapshot")
+          end
+    ' "$anchor_snapshot_raw" > "$anchor_snapshot_destination"; then
+        return 0
+    fi
+    return 2
+}
+
+wait_for_anchor_state() {
+    anchor_wait_name=$1
+    anchor_wait_uid=$2
+    anchor_wait_phase=$3
+    anchor_wait_pod_uid=$4
+    anchor_wait_destination=$5
+    anchor_wait_seconds=$6
+    anchor_wait_deadline=$(($(date +%s) + anchor_wait_seconds))
+
+    while [ "$(date +%s)" -lt "$anchor_wait_deadline" ]; do
+        if capture_anchor_snapshot \
+            "$anchor_wait_name" "$anchor_wait_destination"; then
+            observed_anchor_uid=$(jq -r '.uid' "$anchor_wait_destination")
+            [ "$observed_anchor_uid" = "$anchor_wait_uid" ] || {
+                fail "session anchor name was replaced with another UID"
+            }
+            if jq -e \
+                --arg phase "$anchor_wait_phase" \
+                --arg pod_uid "$anchor_wait_pod_uid" '
+                .state.phase == $phase
+                and (
+                    if $pod_uid == "" then
+                        .state.podUid == null
+                    else
+                        .state.podUid == $pod_uid
+                    end
+                )
+            ' "$anchor_wait_destination" >/dev/null; then
+                return 0
+            fi
+        else
+            anchor_capture_status=$?
+            if [ "$anchor_capture_status" -eq 2 ]; then
+                fail "session anchor snapshot was malformed"
+            fi
+        fi
+        sleep 1
+    done
+    sed -n '1,20p' "$anchor_wait_destination.stderr" >&2 || true
+    fail "session anchor did not reach $anchor_wait_phase within ${anchor_wait_seconds}s"
+}
+
+assert_anchor_stable_identity() {
+    stable_anchor_current=$1
+    stable_anchor_baseline=$2
+    stable_anchor_description=$3
+    if jq -e --slurpfile baseline "$stable_anchor_baseline" '
+        def stable_identity:
+            {
+                uid,
+                sessionId: .state.sessionId,
+                scopeId: .state.scopeId,
+                profile: .state.profile,
+                incarnationId: .state.incarnationId,
+                generation: .state.fence.generation,
+                attemptId: .state.fence.attemptId,
+                phase: .state.phase,
+                podUid: .state.podUid
+            };
+        stable_identity == ($baseline[0] | stable_identity)
+    ' "$stable_anchor_current" >/dev/null; then
+        return 0
+    fi
+    fail "$stable_anchor_description"
+}
+
+wait_for_exact_uid_absent() {
+    absence_resource_type=$1
+    absence_uid=$2
+    absence_case=$3
+    absence_seconds=$4
+    absence_snapshot="$TEMPORARY_ROOT/absence-$absence_case.json"
+    absence_deadline=$(($(date +%s) + absence_seconds))
+
+    while [ "$(date +%s)" -lt "$absence_deadline" ]; do
+        if kubectl --request-timeout=5s -n "$WORKER_NAMESPACE" get \
+            "$absence_resource_type" -o json > "$absence_snapshot"; then
+            jq -e '
+                type == "object"
+                and (.items | type == "array")
+            ' "$absence_snapshot" >/dev/null || {
+                fail "$absence_case Kubernetes list was malformed"
+            }
+            if jq -e --arg uid "$absence_uid" '
+                all(.items[]; (.metadata.uid // "") != $uid)
+            ' "$absence_snapshot" >/dev/null; then
+                return 0
+            fi
+        fi
+        sleep 1
+    done
+    fail "$absence_case exact Kubernetes UID remained after ${absence_seconds}s"
+}
+
+snapshot_session_children() {
+    children_session_id=$1
+    children_destination=$2
+    children_raw="$children_destination.raw"
+
+    kubectl --request-timeout=5s -n "$WORKER_NAMESPACE" get \
+        pods,persistentvolumeclaims,secrets,serviceaccounts,networkpolicies.networking.k8s.io \
+        -o json > "$children_raw"
+    jq -e --arg session_id "$children_session_id" '
+        if (type == "object" and (.items | type == "array")) then
+            [
+                .items[]
+                | select(
+                    (.metadata.annotations["openab.dev/session-id"] // "")
+                    == $session_id
+                )
+                | {
+                    kind,
+                    name: .metadata.name,
+                    uid: .metadata.uid,
+                    resource: (
+                        .metadata.labels["openab.dev/resource"] // ""
+                    )
+                }
+            ] | sort_by([.kind, .name, .uid])
+        else
+            error("malformed session child inventory")
+        end
+    ' "$children_raw" > "$children_destination" || {
+        fail "session child inventory was malformed"
+    }
+}
+
+assert_retained_session_children() {
+    retained_session_id=$1
+    retained_destination=$2
+    retained_pvc_name=$3
+    retained_pvc_uid=$4
+    retained_description=$5
+
+    snapshot_session_children "$retained_session_id" "$retained_destination"
+    jq -e \
+        --arg pvc_name "$retained_pvc_name" \
+        --arg pvc_uid "$retained_pvc_uid" '
+        . == [{
+            kind: "PersistentVolumeClaim",
+            name: $pvc_name,
+            uid: $pvc_uid,
+            resource: "workspace-pvc"
+        }]
+    ' "$retained_destination" >/dev/null || fail "$retained_description"
+}
+
+assert_active_session_children() {
+    active_session_id=$1
+    active_destination=$2
+    active_network_policy_name=$3
+    active_network_policy_uid=$4
+    active_pvc_name=$5
+    active_pvc_uid=$6
+    active_pod_name=$7
+    active_pod_uid=$8
+    active_service_account_name=$9
+    shift 9
+    active_service_account_uid=$1
+    active_description=$2
+
+    snapshot_session_children "$active_session_id" "$active_destination"
+    jq -e \
+        --arg network_policy_name "$active_network_policy_name" \
+        --arg network_policy_uid "$active_network_policy_uid" \
+        --arg pvc_name "$active_pvc_name" \
+        --arg pvc_uid "$active_pvc_uid" \
+        --arg pod_name "$active_pod_name" \
+        --arg pod_uid "$active_pod_uid" \
+        --arg service_account_name "$active_service_account_name" \
+        --arg service_account_uid "$active_service_account_uid" '
+        . == [
+            {
+                kind: "NetworkPolicy",
+                name: $network_policy_name,
+                uid: $network_policy_uid,
+                resource: "worker-network-policy"
+            },
+            {
+                kind: "PersistentVolumeClaim",
+                name: $pvc_name,
+                uid: $pvc_uid,
+                resource: "workspace-pvc"
+            },
+            {
+                kind: "Pod",
+                name: $pod_name,
+                uid: $pod_uid,
+                resource: "worker-pod"
+            },
+            {
+                kind: "ServiceAccount",
+                name: $service_account_name,
+                uid: $service_account_uid,
+                resource: "worker-service-account"
+            }
+        ]
+    ' "$active_destination" >/dev/null || fail "$active_description"
+}
+
+assert_session_children_unchanged() {
+    children_current=$1
+    children_baseline=$2
+    children_description=$3
+    jq -e --slurpfile baseline "$children_baseline" \
+        '. == $baseline[0]' "$children_current" >/dev/null || {
+        fail "$children_description"
+    }
+}
+
+wait_for_process_exit() {
+    process_wait_pid=$1
+    process_wait_seconds=$2
+    process_wait_deadline=$(($(date +%s) + process_wait_seconds))
+
+    while [ "$(date +%s)" -lt "$process_wait_deadline" ]; do
+        if ! kill -0 "$process_wait_pid" >/dev/null 2>&1; then
+            if wait "$process_wait_pid"; then
+                BRIDGE_EXIT_STATUS=0
+            else
+                BRIDGE_EXIT_STATUS=$?
+            fi
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
 }
 
 poll_api_server_endpoint() {
@@ -1419,7 +1806,8 @@ start_bridge \
     "$BRIDGE_A_STDOUT" \
     "$BRIDGE_A_STDERR" \
     'discord:kind-smoke:thread-1' \
-    '00000000-0000-0000-0000-000000000064'
+    '00000000-0000-0000-0000-000000000064' \
+    absent
 BRIDGE_A_PID=$STARTED_BRIDGE_PID
 STARTED_BRIDGE_PID=''
 exec 3> "$BRIDGE_A_FIFO"
@@ -1429,7 +1817,7 @@ INITIALIZE_LINE=$(sed -n '1p' "$FIXTURE_ROOT/smoke.ndjson")
 SESSION_NEW_LINE=$(sed -n '2p' "$FIXTURE_ROOT/smoke.ndjson")
 [ -n "$INITIALIZE_LINE" ] || fail "smoke fixture has no initialize request"
 [ -n "$SESSION_NEW_LINE" ] || fail "smoke fixture has no session/new request"
-printf '%s\n' "$INITIALIZE_LINE" >&3
+send_bridge_request a 'bridge initialization' "$INITIALIZE_LINE"
 wait_for_output 'bridge initialization' '"id":1' \
     "$BRIDGE_A_STDOUT" "$BRIDGE_A_PID" "$BRIDGE_A_STDERR" 180
 grep -Fq 'openab-kubernetes-session-fake-acp' "$BRIDGE_A_STDOUT" || {
@@ -1445,7 +1833,7 @@ kubectl -n "$WORKER_NAMESPACE" wait \
 assert_shared_skills_config_map
 assert_worker_shared_skills "$WORKER_POD"
 
-printf '%s\n' "$SESSION_NEW_LINE" >&3
+send_bridge_request a 'fake ACP session creation' "$SESSION_NEW_LINE"
 wait_for_output 'fake ACP session creation' '"id":2' \
     "$BRIDGE_A_STDOUT" "$BRIDGE_A_PID" "$BRIDGE_A_STDERR" 60
 grep -Fq 'openab-fake-session-v1' "$BRIDGE_A_STDOUT" || {
@@ -1535,6 +1923,8 @@ WORKER_NETWORK_POLICY_RESOURCE=$(single_resource_name networkpolicy \
     'app.kubernetes.io/managed-by=openab-session-controller,openab.dev/resource=worker-network-policy' \
     'smoke-session worker NetworkPolicy')
 WORKER_NETWORK_POLICY=${WORKER_NETWORK_POLICY_RESOURCE#*/}
+WORKER_NETWORK_POLICY_UID=$(kubernetes_resource_uid networkpolicy \
+    "$WORKER_NETWORK_POLICY" 'worker NetworkPolicy')
 WORKER_POD_UID=$(kubectl -n "$WORKER_NAMESPACE" get pod "$WORKER_POD" \
     -o jsonpath='{.metadata.uid}')
 WORKSPACE_PVC_UID=$(kubectl -n "$WORKER_NAMESPACE" get persistentvolumeclaim \
@@ -1576,19 +1966,20 @@ if [ "$MODE" = '--isolation' ]; then
         "$BRIDGE_B_STDOUT" \
         "$BRIDGE_B_STDERR" \
         'discord:kind-smoke:thread-2' \
-        '00000000-0000-0000-0000-000000000065'
+        '00000000-0000-0000-0000-000000000065' \
+        absent
     BRIDGE_B_PID=$STARTED_BRIDGE_PID
     STARTED_BRIDGE_PID=''
     exec 4> "$BRIDGE_B_FIFO"
     BRIDGE_B_WRITER_OPEN=1
 
-    printf '%s\n' "$INITIALIZE_LINE" >&4
+    send_bridge_request b 'bridge B initialization' "$INITIALIZE_LINE"
     wait_for_output 'bridge B initialization' '"id":1' \
         "$BRIDGE_B_STDOUT" "$BRIDGE_B_PID" "$BRIDGE_B_STDERR" 180
     grep -Fq 'openab-kubernetes-session-fake-acp' "$BRIDGE_B_STDOUT" || {
         fail "bridge B initialization did not reach the fake ACP worker"
     }
-    printf '%s\n' "$SESSION_NEW_LINE" >&4
+    send_bridge_request b 'fake ACP session B creation' "$SESSION_NEW_LINE"
     wait_for_output 'fake ACP session B creation' '"id":2' \
         "$BRIDGE_B_STDOUT" "$BRIDGE_B_PID" "$BRIDGE_B_STDERR" 60
     grep -Fq 'openab-fake-session-v1' "$BRIDGE_B_STDOUT" || {
@@ -1621,6 +2012,8 @@ if [ "$MODE" = '--isolation' ]; then
     WORKER_NETWORK_POLICY_B=$(single_owned_resource_name networkpolicy \
         'app.kubernetes.io/managed-by=openab-session-controller,openab.dev/resource=worker-network-policy' \
         "$ANCHOR_UID_B" 'session B worker NetworkPolicy')
+    WORKER_NETWORK_POLICY_UID_B=$(kubernetes_resource_uid networkpolicy \
+        "$WORKER_NETWORK_POLICY_B" 'worker NetworkPolicy B')
     kubectl -n "$WORKER_NAMESPACE" wait \
         --for=condition=Ready "pod/$WORKER_POD_B" --timeout=120s
     if ! kill -0 "$BRIDGE_A_PID" >/dev/null 2>&1; then
@@ -1744,45 +2137,53 @@ if [ "$MODE" = '--isolation' ]; then
     WORKSPACE_B_READ_V1=$(fixture_request 203)
     WORKSPACE_A_MARKER_V1=$(printf '%s\n' "$WORKSPACE_A_WRITE_V1" | \
         jq -r '.params.content')
+    WORKSPACE_A_MARKER_V2=$(printf '%s\n' "$WORKSPACE_A_WRITE_V2" | \
+        jq -r '.params.content')
     WORKSPACE_B_MARKER_V1=$(printf '%s\n' "$WORKSPACE_B_WRITE_V1" | \
         jq -r '.params.content')
 
-    printf '%s\n' "$WORKSPACE_A_WRITE_V1" >&3
+    send_bridge_request a 'session A initial workspace write' \
+        "$WORKSPACE_A_WRITE_V1"
     wait_for_rpc_response 'session A initial workspace write' 101 \
         "$BRIDGE_A_STDOUT" "$BRIDGE_A_PID" "$BRIDGE_A_STDERR" 60
     assert_rpc_empty_result \
         'session A could not write its private workspace state' \
         "$BRIDGE_A_STDOUT" 101
 
-    printf '%s\n' "$WORKSPACE_B_READ_BEFORE_WRITE" >&4
+    send_bridge_request b 'session B pre-write workspace read' \
+        "$WORKSPACE_B_READ_BEFORE_WRITE"
     wait_for_rpc_response 'session B pre-write workspace read' 201 \
         "$BRIDGE_B_STDOUT" "$BRIDGE_B_PID" "$BRIDGE_B_STDERR" 60
     assert_rpc_error \
         'session B unexpectedly observed session A workspace state before its own write' \
         "$BRIDGE_B_STDOUT" 201 -32001 'Workspace probe failed'
 
-    printf '%s\n' "$WORKSPACE_B_WRITE_V1" >&4
+    send_bridge_request b 'session B initial workspace write' \
+        "$WORKSPACE_B_WRITE_V1"
     wait_for_rpc_response 'session B initial workspace write' 202 \
         "$BRIDGE_B_STDOUT" "$BRIDGE_B_PID" "$BRIDGE_B_STDERR" 60
     assert_rpc_empty_result \
         'session B could not write its private workspace state' \
         "$BRIDGE_B_STDOUT" 202
 
-    printf '%s\n' "$WORKSPACE_A_READ_V1" >&3
+    send_bridge_request a 'session A workspace read after B write' \
+        "$WORKSPACE_A_READ_V1"
     wait_for_rpc_response 'session A workspace read after B write' 102 \
         "$BRIDGE_A_STDOUT" "$BRIDGE_A_PID" "$BRIDGE_A_STDERR" 60
     assert_rpc_content_result \
         'session B workspace write changed session A state' \
         "$BRIDGE_A_STDOUT" 102 "$WORKSPACE_A_MARKER_V1"
 
-    printf '%s\n' "$WORKSPACE_A_WRITE_V2" >&3
+    send_bridge_request a 'session A workspace overwrite' \
+        "$WORKSPACE_A_WRITE_V2"
     wait_for_rpc_response 'session A workspace overwrite' 103 \
         "$BRIDGE_A_STDOUT" "$BRIDGE_A_PID" "$BRIDGE_A_STDERR" 60
     assert_rpc_empty_result \
         'session A could not overwrite its private workspace state' \
         "$BRIDGE_A_STDOUT" 103
 
-    printf '%s\n' "$WORKSPACE_B_READ_V1" >&4
+    send_bridge_request b 'session B workspace read after A overwrite' \
+        "$WORKSPACE_B_READ_V1"
     wait_for_rpc_response 'session B workspace read after A overwrite' 203 \
         "$BRIDGE_B_STDOUT" "$BRIDGE_B_PID" "$BRIDGE_B_STDERR" 60
     assert_rpc_content_result \
@@ -1809,6 +2210,252 @@ if [ "$MODE" = '--isolation' ]; then
     [ "$FINAL_WORKER_POD_UID_B" = "$WORKER_POD_UID_B" ] || {
         fail "session B worker was replaced during workspace isolation probes"
     }
+
+    A_PRE_FAILURE_PROMPT=$(lifecycle_request 301)
+    A_REPLACEMENT_LOAD=$(lifecycle_request 310)
+    A_REPLACEMENT_WORKSPACE_READ=$(lifecycle_request 311)
+    A_REPLACEMENT_PROMPT=$(lifecycle_request 312)
+    B_POST_REPLACEMENT_WORKSPACE_READ=$(lifecycle_request 499)
+
+    send_bridge_request a 'session A pre-failure prompt' \
+        "$A_PRE_FAILURE_PROMPT"
+    wait_for_rpc_response 'session A pre-failure prompt' 301 \
+        "$BRIDGE_A_STDOUT" "$BRIDGE_A_PID" "$BRIDGE_A_STDERR" 60
+    assert_rpc_prompt_result \
+        'session A pre-failure prompt returned an unexpected result' \
+        "$BRIDGE_A_STDOUT" 301
+    refresh_session_b 401 'session B pre-failure prompt'
+
+    ANCHOR_BASELINE_A="$TEMPORARY_ROOT/anchor-baseline-a.json"
+    ANCHOR_BASELINE_B="$TEMPORARY_ROOT/anchor-baseline-b.json"
+    wait_for_anchor_state \
+        "$ANCHOR_NAME" "$ANCHOR_UID" ready "$WORKER_POD_UID" \
+        "$ANCHOR_BASELINE_A" 30
+    wait_for_anchor_state \
+        "$ANCHOR_NAME_B" "$ANCHOR_UID_B" ready "$WORKER_POD_UID_B" \
+        "$ANCHOR_BASELINE_B" 30
+    SESSION_ID_A=$(jq -r '.state.sessionId' "$ANCHOR_BASELINE_A")
+    SESSION_ID_B=$(jq -r '.state.sessionId' "$ANCHOR_BASELINE_B")
+    [ "$SESSION_ID_A" != "$SESSION_ID_B" ] || {
+        fail "two thread mappings unexpectedly share a logical session identity"
+    }
+    CHILDREN_BASELINE_B="$TEMPORARY_ROOT/children-baseline-b.json"
+    assert_active_session_children \
+        "$SESSION_ID_B" "$CHILDREN_BASELINE_B" \
+        "$WORKER_NETWORK_POLICY_B" "$WORKER_NETWORK_POLICY_UID_B" \
+        "$WORKSPACE_PVC_B" "$WORKSPACE_PVC_UID_B" \
+        "$WORKER_POD_B" "$WORKER_POD_UID_B" \
+        "$WORKER_SERVICE_ACCOUNT_B" "$WORKER_SERVICE_ACCOUNT_UID_B" \
+        'session B baseline children did not match its private generation'
+
+    if ! kill -0 "$BRIDGE_A_PID" >/dev/null 2>&1; then
+        fail "session A bridge died before its worker Pod failure was injected"
+    fi
+    POD_BEFORE_FAILURE_A="$TEMPORARY_ROOT/pod-before-failure-a.json"
+    kubectl --request-timeout=5s -n "$WORKER_NAMESPACE" get pod \
+        "$WORKER_POD" -o json > "$POD_BEFORE_FAILURE_A"
+    jq -e --arg pod_uid "$WORKER_POD_UID" '
+        .metadata.uid == $pod_uid
+        and .metadata.deletionTimestamp == null
+        and any(
+            .status.conditions[]?;
+            .type == "Ready" and .status == "True"
+        )
+    ' "$POD_BEFORE_FAILURE_A" >/dev/null || {
+        fail "session A worker Pod was not live before failure injection"
+    }
+    kubectl --request-timeout=70s -n "$WORKER_NAMESPACE" delete pod \
+        "$WORKER_POD" --wait=true --timeout=60s
+    if wait_for_process_exit "$BRIDGE_A_PID" 60; then
+        :
+    else
+        sed -n '1,80p' "$BRIDGE_A_STDERR" >&2 || true
+        fail "session A bridge did not exit after its worker Pod was deleted"
+    fi
+    BRIDGE_A_FAILURE_EXIT_STATUS=$BRIDGE_EXIT_STATUS
+    exec 3>&-
+    BRIDGE_A_WRITER_OPEN=0
+    BRIDGE_A_PID=''
+    [ "$BRIDGE_A_FAILURE_EXIT_STATUS" -ne 0 ] || {
+        fail "session A bridge did not exit after its worker Pod was deleted"
+    }
+    refresh_session_b 402 'session B keepalive after worker A failed'
+
+    ANCHOR_BLOCKED_A="$TEMPORARY_ROOT/anchor-blocked-a.json"
+    wait_for_anchor_state \
+        "$ANCHOR_NAME" "$ANCHOR_UID" blocked '' \
+        "$ANCHOR_BLOCKED_A" 120
+    refresh_session_b 403 'session B keepalive after worker A was blocked'
+    wait_for_exact_uid_absent pods "$WORKER_POD_UID" \
+        a-generation-1-pod 60
+    wait_for_exact_uid_absent serviceaccounts "$WORKER_SERVICE_ACCOUNT_UID" \
+        a-generation-1-service-account 60
+    wait_for_exact_uid_absent networkpolicies.networking.k8s.io \
+        "$WORKER_NETWORK_POLICY_UID" a-generation-1-network-policy 60
+    BLOCKED_CHILDREN_A="$TEMPORARY_ROOT/blocked-children-a.json"
+    assert_retained_session_children \
+        "$SESSION_ID_A" "$BLOCKED_CHILDREN_A" \
+        "$WORKSPACE_PVC" "$WORKSPACE_PVC_UID" \
+        'session A blocked cleanup retained generation-scoped compute'
+    refresh_session_b 404 'session B keepalive after worker A cleanup'
+
+    ANCHOR_AFTER_BLOCK_B="$TEMPORARY_ROOT/anchor-after-block-b.json"
+    wait_for_anchor_state \
+        "$ANCHOR_NAME_B" "$ANCHOR_UID_B" ready "$WORKER_POD_UID_B" \
+        "$ANCHOR_AFTER_BLOCK_B" 30
+    if ! kill -0 "$BRIDGE_B_PID" >/dev/null 2>&1; then
+        fail "session A replacement affected session B"
+    fi
+    assert_anchor_stable_identity \
+        "$ANCHOR_AFTER_BLOCK_B" "$ANCHOR_BASELINE_B" \
+        'session A replacement affected session B'
+
+    BRIDGE_A_FIFO="$TEMPORARY_ROOT/bridge-a-generation-2.stdin"
+    BRIDGE_A_STDOUT="$TEMPORARY_ROOT/bridge-a-generation-2.stdout"
+    BRIDGE_A_STDERR="$TEMPORARY_ROOT/bridge-a-generation-2.stderr"
+    mkfifo "$BRIDGE_A_FIFO"
+    start_bridge \
+        "$BRIDGE_A_FIFO" \
+        "$BRIDGE_A_STDOUT" \
+        "$BRIDGE_A_STDERR" \
+        'discord:kind-smoke:thread-1' \
+        '00000000-0000-0000-0000-000000000066' \
+        present
+    BRIDGE_A_PID=$STARTED_BRIDGE_PID
+    STARTED_BRIDGE_PID=''
+    exec 3> "$BRIDGE_A_FIFO"
+    BRIDGE_A_WRITER_OPEN=1
+
+    send_bridge_request a 'session A replacement initialization' \
+        "$INITIALIZE_LINE"
+    wait_for_output 'session A replacement initialization' '"id":1' \
+        "$BRIDGE_A_STDOUT" "$BRIDGE_A_PID" "$BRIDGE_A_STDERR" 180
+    refresh_session_b 405 'session B keepalive after worker A2 initialized'
+    send_bridge_request a 'session A replacement load' \
+        "$A_REPLACEMENT_LOAD"
+    wait_for_rpc_response 'session A replacement load' 310 \
+        "$BRIDGE_A_STDOUT" "$BRIDGE_A_PID" "$BRIDGE_A_STDERR" 60
+    assert_rpc_empty_result \
+        'session A replacement could not load the retained ACP session' \
+        "$BRIDGE_A_STDOUT" 310
+
+    WORKER_POD_A2=$(single_owned_resource_name pod \
+        'app.kubernetes.io/managed-by=openab-session-controller,openab.dev/resource=worker-pod' \
+        "$ANCHOR_UID" 'session A replacement worker Pod')
+    WORKSPACE_PVC_A2=$(single_owned_resource_name persistentvolumeclaim \
+        'app.kubernetes.io/managed-by=openab-session-controller,openab.dev/resource=workspace-pvc' \
+        "$ANCHOR_UID" 'session A retained workspace PVC')
+    WORKER_SERVICE_ACCOUNT_A2=$(single_owned_resource_name serviceaccount \
+        'app.kubernetes.io/managed-by=openab-session-controller,openab.dev/resource=worker-service-account' \
+        "$ANCHOR_UID" 'session A replacement worker ServiceAccount')
+    WORKER_NETWORK_POLICY_A2=$(single_owned_resource_name networkpolicy \
+        'app.kubernetes.io/managed-by=openab-session-controller,openab.dev/resource=worker-network-policy' \
+        "$ANCHOR_UID" 'session A replacement worker NetworkPolicy')
+    kubectl -n "$WORKER_NAMESPACE" wait \
+        --for=condition=Ready "pod/$WORKER_POD_A2" --timeout=120s
+    WORKER_POD_UID_A2=$(kubernetes_resource_uid pod \
+        "$WORKER_POD_A2" 'session A replacement worker Pod')
+    WORKSPACE_PVC_UID_A2=$(kubernetes_resource_uid persistentvolumeclaim \
+        "$WORKSPACE_PVC_A2" 'session A retained workspace PVC')
+    WORKER_SERVICE_ACCOUNT_UID_A2=$(kubernetes_resource_uid serviceaccount \
+        "$WORKER_SERVICE_ACCOUNT_A2" 'session A replacement ServiceAccount')
+    WORKER_NETWORK_POLICY_UID_A2=$(kubernetes_resource_uid networkpolicy \
+        "$WORKER_NETWORK_POLICY_A2" 'session A replacement NetworkPolicy')
+
+    ANCHOR_REPLACEMENT_A="$TEMPORARY_ROOT/anchor-replacement-a.json"
+    wait_for_anchor_state \
+        "$ANCHOR_NAME" "$ANCHOR_UID" ready "$WORKER_POD_UID_A2" \
+        "$ANCHOR_REPLACEMENT_A" 60
+    refresh_session_b 406 'session B keepalive after worker A2 became ready'
+    if ! jq -e \
+        --slurpfile baseline "$ANCHOR_BASELINE_A" \
+        --arg attempt_id '00000000-0000-0000-0000-000000000066' \
+        --arg pod_uid "$WORKER_POD_UID_A2" '
+        .uid == $baseline[0].uid
+        and .state.sessionId == $baseline[0].state.sessionId
+        and .state.scopeId == $baseline[0].state.scopeId
+        and .state.profile == $baseline[0].state.profile
+        and .state.incarnationId == $baseline[0].state.incarnationId
+        and .state.fence.generation
+            == ($baseline[0].state.fence.generation + 1)
+        and .state.fence.attemptId == $attempt_id
+        and .state.fence.attemptId
+            != $baseline[0].state.fence.attemptId
+        and .state.phase == "ready"
+        and .state.podUid == $pod_uid
+    ' "$ANCHOR_REPLACEMENT_A" >/dev/null; then
+        fail "session A replacement did not advance exactly one generation"
+    fi
+    if [ "$WORKSPACE_PVC_A2" != "$WORKSPACE_PVC" ] || \
+        [ "$WORKSPACE_PVC_UID_A2" != "$WORKSPACE_PVC_UID" ] || \
+        [ "$WORKER_POD_UID_A2" = "$WORKER_POD_UID" ] || \
+        [ "$WORKER_SERVICE_ACCOUNT_UID_A2" = "$WORKER_SERVICE_ACCOUNT_UID" ] || \
+        [ "$WORKER_NETWORK_POLICY_UID_A2" = "$WORKER_NETWORK_POLICY_UID" ]; then
+        fail "session A replacement changed its logical identity or PVC"
+    fi
+    assert_anchor_owner pod "$WORKER_POD_A2" \
+        "$ANCHOR_NAME" "$ANCHOR_UID" 'replacement worker Pod A'
+    assert_anchor_owner serviceaccount "$WORKER_SERVICE_ACCOUNT_A2" \
+        "$ANCHOR_NAME" "$ANCHOR_UID" 'replacement worker ServiceAccount A'
+    assert_anchor_owner networkpolicy "$WORKER_NETWORK_POLICY_A2" \
+        "$ANCHOR_NAME" "$ANCHOR_UID" 'replacement worker NetworkPolicy A'
+    assert_worker_pod_isolation_contract \
+        "$WORKER_POD_A2" "$WORKSPACE_PVC_A2" "$WORKSPACE_PVC_B" \
+        'replacement worker Pod A' "session B's"
+    assert_worker_shared_skills "$WORKER_POD_A2"
+    assert_worker_network_policy_contract \
+        a2 "$WORKER_NETWORK_POLICY_A2" "$WORKER_POD_A2" "$WORKER_POD_B" \
+        'session A replacement'
+
+    REPLACEMENT_CHILDREN_A="$TEMPORARY_ROOT/replacement-children-a.json"
+    assert_active_session_children \
+        "$SESSION_ID_A" "$REPLACEMENT_CHILDREN_A" \
+        "$WORKER_NETWORK_POLICY_A2" "$WORKER_NETWORK_POLICY_UID_A2" \
+        "$WORKSPACE_PVC_A2" "$WORKSPACE_PVC_UID_A2" \
+        "$WORKER_POD_A2" "$WORKER_POD_UID_A2" \
+        "$WORKER_SERVICE_ACCOUNT_A2" "$WORKER_SERVICE_ACCOUNT_UID_A2" \
+        'session A replacement retained an unexpected child resource'
+
+    send_bridge_request a 'session A replacement workspace read' \
+        "$A_REPLACEMENT_WORKSPACE_READ"
+    wait_for_rpc_response 'session A replacement workspace read' 311 \
+        "$BRIDGE_A_STDOUT" "$BRIDGE_A_PID" "$BRIDGE_A_STDERR" 60
+    assert_rpc_content_result \
+        'session A replacement did not retain its workspace state' \
+        "$BRIDGE_A_STDOUT" 311 "$WORKSPACE_A_MARKER_V2"
+    send_bridge_request a 'session A replacement prompt' \
+        "$A_REPLACEMENT_PROMPT"
+    wait_for_rpc_response 'session A replacement prompt' 312 \
+        "$BRIDGE_A_STDOUT" "$BRIDGE_A_PID" "$BRIDGE_A_STDERR" 60
+    assert_rpc_prompt_result \
+        'session A replacement prompt returned an unexpected result' \
+        "$BRIDGE_A_STDOUT" 312
+
+    send_bridge_request b 'session B post-replacement workspace read' \
+        "$B_POST_REPLACEMENT_WORKSPACE_READ"
+    wait_for_rpc_response 'session B post-replacement workspace read' 499 \
+        "$BRIDGE_B_STDOUT" "$BRIDGE_B_PID" "$BRIDGE_B_STDERR" 60
+    assert_rpc_content_result \
+        'session A replacement affected session B' \
+        "$BRIDGE_B_STDOUT" 499 "$WORKSPACE_B_MARKER_V1"
+    ANCHOR_POST_REPLACEMENT_B="$TEMPORARY_ROOT/anchor-post-replacement-b.json"
+    wait_for_anchor_state \
+        "$ANCHOR_NAME_B" "$ANCHOR_UID_B" ready "$WORKER_POD_UID_B" \
+        "$ANCHOR_POST_REPLACEMENT_B" 30
+    assert_anchor_stable_identity \
+        "$ANCHOR_POST_REPLACEMENT_B" "$ANCHOR_BASELINE_B" \
+        'session A replacement affected session B'
+    CHILDREN_POST_REPLACEMENT_B="$TEMPORARY_ROOT/children-post-replacement-b.json"
+    snapshot_session_children \
+        "$SESSION_ID_B" "$CHILDREN_POST_REPLACEMENT_B"
+    assert_session_children_unchanged \
+        "$CHILDREN_POST_REPLACEMENT_B" "$CHILDREN_BASELINE_B" \
+        'session A replacement affected session B'
+    if ! kill -0 "$BRIDGE_A_PID" >/dev/null 2>&1 || \
+        ! kill -0 "$BRIDGE_B_PID" >/dev/null 2>&1; then
+        fail "session A replacement affected session B"
+    fi
+
 fi
 
 SERVICE_TYPE=$(kubectl -n "$SYSTEM_NAMESPACE" get service "$CONTROLLER_NAME" \
