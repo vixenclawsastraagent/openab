@@ -1,7 +1,6 @@
 use crate::identity::{ScopeId, SessionId};
 use crate::state::{validate_profile_name, Fence};
 use serde_json::{json, Map, Value};
-use std::env;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -52,8 +51,6 @@ pub enum BridgeIdentityError {
     EmptyScope,
     #[error("{SESSION_KEY_ENV} must not be empty")]
     EmptySessionKey,
-    #[error("required broker-owned environment variable {name} is unavailable")]
-    EnvironmentVariable { name: &'static str },
     #[error("{SESSION_ATTEMPT_ID_ENV} must be a non-nil UUID")]
     InvalidAttemptId,
     #[error("requested profile name must be a lowercase Kubernetes DNS label")]
@@ -71,22 +68,6 @@ pub struct BridgeIdentity {
 }
 
 impl BridgeIdentity {
-    pub fn from_environment(
-        scope: &str,
-        requested_profile_name: &str,
-    ) -> Result<Self, BridgeIdentityError> {
-        let session_key =
-            env::var(SESSION_KEY_ENV).map_err(|_| BridgeIdentityError::EnvironmentVariable {
-                name: SESSION_KEY_ENV,
-            })?;
-        let attempt_id = env::var(SESSION_ATTEMPT_ID_ENV).map_err(|_| {
-            BridgeIdentityError::EnvironmentVariable {
-                name: SESSION_ATTEMPT_ID_ENV,
-            }
-        })?;
-        Self::from_values(scope, &session_key, &attempt_id, requested_profile_name)
-    }
-
     /// Construct from already captured broker values.
     ///
     /// This is useful for embedders that read the process environment before
