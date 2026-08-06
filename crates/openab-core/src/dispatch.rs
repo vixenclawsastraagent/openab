@@ -696,7 +696,7 @@ async fn dispatch_batch(
             .send_message(&dispatch_channel, &format!("⚠️ {message}"))
             .await;
         error!(
-            session_key,
+            session_key = %crate::redact::redact_session_ids(&session_key),
             "workspace directive rejected before provisioning"
         );
         return;
@@ -754,7 +754,11 @@ async fn dispatch_batch(
                     let _ = adapter
                         .send_message(&dispatch_channel, &format!("⚠️ {e}"))
                         .await;
-                    error!(session_key, error = %e, "workspace directive rejected");
+                    error!(
+                        session_key = %crate::redact::redact_session_ids(&session_key),
+                        error = %e,
+                        "workspace directive rejected"
+                    );
                     return;
                 }
 
@@ -767,7 +771,11 @@ async fn dispatch_batch(
                 if let Some(ref title) = title_to_apply {
                     if !title.is_empty() {
                         if let Err(e) = adapter.rename_thread(&dispatch_channel, title).await {
-                            warn!(session_key, error = %e, "failed to apply title directive");
+                            warn!(
+                                session_key = %crate::redact::redact_session_ids(&session_key),
+                                error = %e,
+                                "failed to apply title directive"
+                            );
                         }
                     }
                 }
@@ -1625,6 +1633,75 @@ mod tests {
 
         assert_eq!(mock.ensure_calls(), 0);
         assert!(mock.calls().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn isolated_workspace_rejection_log_redacts_acp_session_key() {
+        use std::io::Write;
+        use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+        #[derive(Clone)]
+        struct Capture(StdArc<StdMutex<Vec<u8>>>);
+
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let uuid = "00000000-0000-0000-0000-000000000000";
+        let acp_id = format!("acp_{uuid}");
+        let session_key = format!("acp:{acp_id}");
+        let channel = ChannelRef {
+            platform: "acp".into(),
+            channel_id: acp_id.clone(),
+            thread_id: Some(acp_id),
+            parent_id: None,
+            origin_event_id: None,
+        };
+        let mock = Arc::new(MockDispatchTarget::without_workspace_directives());
+        let target: Arc<dyn DispatchTarget> = mock;
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+        let buffer = StdArc::new(StdMutex::new(Vec::new()));
+        let capture = Capture(StdArc::clone(&buffer));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || capture.clone())
+            .with_ansi(false)
+            .finish();
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        dispatch_batch(
+            &session_key,
+            &channel,
+            &target,
+            &adapter,
+            vec![make_msg("[[ws:@shared]]\ninspect this", 10)],
+            false,
+        )
+        .await;
+
+        let output = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("workspace directive rejected before provisioning"),
+            "the rejection must be logged: {output}"
+        );
+        assert!(
+            !output.contains(uuid),
+            "no raw UUID may reach the log: {output}"
+        );
+        assert!(
+            !output.contains("acp_"),
+            "no raw ACP id prefix may reach the log: {output}"
+        );
+        assert!(
+            output.contains("acp:#"),
+            "the platform and redaction tag must survive: {output}"
+        );
     }
 
     #[tokio::test]
