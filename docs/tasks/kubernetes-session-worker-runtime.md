@@ -482,8 +482,10 @@ physical reclamation of its backing PersistentVolume or cloud disk.
     for secret leakage, broad RBAC, mutable/shared mounts, default-path edits,
     TODOs without issues, and deviations from the spec. Fix failures in small
     cause-specific commits and rerun the affected checkpoint.
-  - Acceptance: every required gate passes without `--no-verify`, skips, lint
-    suppression, or disabled tests.
+  - Acceptance: every branch-relevant gate passes without `--no-verify`, lint
+    suppression, or disabled tests. Any pre-existing upstream gate failure is
+    run, reproduced on a clean upstream checkout, and disclosed rather than
+    hidden or expanded into unrelated formatting churn.
   - Verify:
     - `cargo fmt --all -- --check`
     - `cargo check --workspace`
@@ -504,24 +506,47 @@ physical reclamation of its backing PersistentVolume or cloud disk.
     - `helm template test charts/openab-kubernetes-session --set enabled=true --set-string 'networkPolicy.controller.apiServerCIDRs[0]=10.96.0.1/32' --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`
     - `helm unittest charts/openab-kubernetes-session`
     - `scripts/test-kubernetes-session-kind.sh --isolation`
+  - Current evidence (2026-08-06 UTC):
+    - PASS: root workspace check, test, both required clippy modes, gateway ACP
+      (402 tests), ACP-MCP (5 tests), ACP pool (92 tests), root ACP (42 tests),
+      and unified build.
+    - PASS: standalone add-on format, no-default check, 639 all-feature tests,
+      all-target/all-feature clippy with warnings denied, and release build.
+    - PASS: root-chart render, add-on lint/render and 37 unit tests, default-off
+      empty output, digest-pinned enabled output, negative unsafe-value renders,
+      POSIX shell syntax, image static checks, the offline Kind contract, and
+      `git diff --check`.
+    - BASELINE: root `cargo fmt --all -- --check` reports the same repository-wide
+      formatting diff on clean detached `upstream/main` at `3ace7de3`; all Rust
+      files changed in the final core fixes and the standalone crate format
+      cleanly.
+    - LIVE: full two-session Kind isolation passed at `4e8f72cb` in
+      [run 31103234684](https://github.com/vixenclawsastraagent/openab/actions/runs/31103234684).
+      The latest-head rerun remains the final gate after the fork branch is
+      pushed; local Docker/Kind is unavailable on this host.
+    - AUDIT: no release blocker remains. Production agent-flavour Git worktree
+      E2E is still deferred; the proven filesystem claim is distinct private
+      PVCs plus non-interfering fixed workspace marker state.
   - Commit: none when clean; any correction uses its own conventional commit.
 
-- [ ] **Task 22 — Final upstream sync and draft PR handoff.**
+- [ ] **Task 22 — Final upstream sync and fork draft handoff.**
   - Depends on: Task 21.
   - Work: fetch `upstream/main`; merge new changes rather than rebasing the
     feature history; rerun affected and final gates; verify Git and active `gh`
-    identities; push only to the `vixenclawsastraagent` fork; open an upstream
-    draft PR containing the Review Contract, `Closes #1461`, the Discord
-    discussion URL, exact validation evidence, residual risks, and explicit
-    enterprise deferrals.
+    identities; push only to the `vixenclawsastraagent` fork; update the
+    existing fork-internal draft PR with the Review Contract, issue and Discord
+    discussion URLs, exact validation evidence, residual risks, and explicit
+    enterprise deferrals. Do not open an upstream PR until maintainers signal
+    architectural interest and the feature owner explicitly requests it.
   - Acceptance: the fork branch is reproducible, the upstream diff excludes
-    upstream's own history, the PR remains draft, and no deployment or default
-    OpenAB behavior is changed outside the opt-in add-on.
+    upstream's own history, the fork PR remains draft, no upstream PR is opened,
+    and no deployment or default OpenAB behavior is changed outside the opt-in
+    add-on.
   - Verify:
     - `git log -1 --format='%an <%ae>'`
     - `gh auth status`
     - `git diff --check upstream/main...HEAD`
-    - `gh pr view --repo openabdev/openab --json isDraft,headRefName,body,url`
+    - `gh pr view 2 --repo vixenclawsastraagent/openab --json isDraft,headRefName,body,url`
   - Commit: `chore(sync): merge upstream main` only if upstream advanced;
     otherwise no commit.
 
