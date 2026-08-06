@@ -849,6 +849,7 @@ mod tests {
             Arc::new(Mutex::new(permission_writer)),
             Arc::clone(&pending),
             notify_tx,
+            None,
         ));
         let handle = AcpLifecycleHandle::new(
             Arc::new(Mutex::new(client_writer)),

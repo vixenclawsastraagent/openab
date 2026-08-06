@@ -26,6 +26,7 @@ use tracing::{debug, error, info, trace};
 const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const SESSION_NEW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const ISOLATED_INITIALIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+const FIRST_REQUEST_ID: u64 = 1;
 
 fn request_timeout(method: &str, isolated_session_runtime: bool) -> std::time::Duration {
     match (method, isolated_session_runtime) {
@@ -251,13 +252,16 @@ fn build_agent_env(
 /// Reader loop body: reads JSON-RPC messages from `reader`, auto-replies
 /// `session/request_permission` via `writer`, resolves pending responses,
 /// and forwards notifications + stale id-bearing messages to the active
-/// subscriber. Extracted as a free generic function so unit tests can drive
-/// it with `tokio::io::duplex()` halves instead of a real child process.
+/// subscriber. A raw frame is retained only for the one explicitly selected
+/// response and is never copied to the subscriber. Extracted as a free generic
+/// function so unit tests can drive it with `tokio::io::duplex()` halves
+/// instead of a real child process.
 pub(crate) async fn run_reader_loop<R, W>(
     reader: R,
     writer: Arc<Mutex<W>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>,
     notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
+    retain_raw_response_id: Option<u64>,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -279,7 +283,9 @@ pub(crate) async fn run_reader_loop<R, W>(
             Ok(message) => message,
             Err(_) => continue,
         };
-        msg.raw = Some(raw.into());
+        if msg.id == retain_raw_response_id {
+            msg.raw = Some(raw.into());
+        }
         debug!(line = line.trim(), "acp_recv");
 
         // Auto-reply session/request_permission
@@ -319,7 +325,7 @@ pub(crate) async fn run_reader_loop<R, W>(
                         result: msg.result.clone(),
                         error: msg.error.clone(),
                         params: None,
-                        raw: msg.raw.clone(),
+                        raw: None,
                     });
                 }
                 let _ = tx.send(msg);
@@ -334,6 +340,7 @@ pub(crate) async fn run_reader_loop<R, W>(
         // Notification → forward to subscriber
         let sub = notify_tx.lock().await;
         if let Some(tx) = sub.as_ref() {
+            msg.raw = None;
             let _ = tx.send(msg);
         }
     }
@@ -515,12 +522,18 @@ impl AcpConnection {
         let pending: PendingRequests = Arc::new(Mutex::new(HashMap::new()));
         let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
             Arc::new(Mutex::new(None));
+        let retain_raw_response_id = session_context
+            .is_some_and(|context| {
+                context.broker_mapping_expectation() == BrokerMappingExpectation::Present
+            })
+            .then_some(FIRST_REQUEST_ID);
 
         let reader_handle = tokio::spawn(run_reader_loop(
             stdout,
             stdin.clone(),
             pending.clone(),
             notify_tx.clone(),
+            retain_raw_response_id,
         ));
 
         let activity = Arc::new(SessionActivity::new());
@@ -529,7 +542,7 @@ impl AcpConnection {
             _proc: proc,
             child_pgid,
             stdin,
-            next_id: Arc::new(AtomicU64::new(1)),
+            next_id: Arc::new(AtomicU64::new(FIRST_REQUEST_ID)),
             pending,
             notify_tx,
             acp_session_id: None,
@@ -1482,6 +1495,7 @@ mod reader_loop_tests {
             writer,
             pending.clone(),
             notify_tx.clone(),
+            None,
         ));
 
         let stale = b"{\"jsonrpc\":\"2.0\",\"id\":42,\"result\":{\"stopReason\":\"ok\"}}\n";
@@ -1493,6 +1507,10 @@ mod reader_loop_tests {
             .expect("subscriber should receive stale message before timeout")
             .expect("subscriber channel should not be closed");
         assert_eq!(forwarded.id, Some(42));
+        assert!(
+            forwarded.raw.is_none(),
+            "the subscriber must never retain a duplicate raw frame"
+        );
         assert!(pending.lock().await.is_empty());
 
         drop(agent_stdout_writer);
@@ -1525,6 +1543,7 @@ mod reader_loop_tests {
             writer,
             pending.clone(),
             notify_tx.clone(),
+            None,
         ));
 
         let payload = b"{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"stopReason\":\"end_turn\"}}\n";
@@ -1536,12 +1555,20 @@ mod reader_loop_tests {
             .expect("oneshot should resolve")
             .expect("oneshot should not be cancelled");
         assert_eq!(resolved.id, Some(7));
+        assert!(
+            resolved.raw.is_none(),
+            "the default reader must not retain the raw frame"
+        );
 
         let forwarded = tokio::time::timeout(std::time::Duration::from_secs(2), sub_rx.recv())
             .await
             .expect("subscriber should receive forwarded copy")
             .expect("subscriber channel should not be closed");
         assert_eq!(forwarded.id, Some(7));
+        assert!(
+            forwarded.raw.is_none(),
+            "the subscriber must never retain a duplicate raw frame"
+        );
         assert!(pending.lock().await.is_empty());
 
         drop(agent_stdout_writer);
