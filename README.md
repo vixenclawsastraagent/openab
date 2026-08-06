@@ -265,6 +265,14 @@ The Docker image bundles both `openab` and `kiro-cli` in a single container.
 └───────────────────────────────────────────────────────┘
 ```
 
+This is the default agent-level deployment: ACP sessions in different threads
+still share the Pod's filesystem and workload identity. Operators that require
+a kernel-enforced per-thread boundary can instead evaluate the default-off
+[Kubernetes session worker add-on](charts/openab-kubernetes-session/README.md).
+It keeps the IM-facing OpenAB broker but runs each selected logical session's
+agent in a separate worker Pod with private writable state. Installing the
+add-on chart alone does not change the default runtime.
+
 ### Deploy without Helm
 
 ```bash

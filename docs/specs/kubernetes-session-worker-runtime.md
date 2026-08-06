@@ -14,8 +14,9 @@ contracts that are already implemented and tested.
    routing, but it must not run any session's agent/CLI workload when
    Kubernetes session mode is selected.
 2. Each logical thread session owns at most one active worker Pod. Different
-   sessions never share writable HOME, workspace, Git metadata, PVC, process
-   namespace, cgroup, or worker ServiceAccount.
+   sessions never share writable HOME, workspace, PVC, process namespace,
+   cgroup, or worker ServiceAccount. Any checkout or Git metadata introduced by
+   a production worker flavour must remain on that session's private PVC.
 3. A worker opens one outbound WSS connection to the controller. It has no
    inbound Service, Kubernetes API credential, RoleBinding, transparent
    reconnect, message replay, or fallback to local execution.
@@ -81,7 +82,7 @@ Discord / Slack
               +-----------------------+--+
               | Worker Pod A             |
               | supervisor <--> ACP CLI A|
-              | private HOME/worktree/PVC|
+              | private workspace + PVC  |
               +--------------------------+
 
        create/fence B                 worker outbound WSS
@@ -90,7 +91,7 @@ Discord / Slack
               +-----------------------+--+
               | Worker Pod B             |
               | supervisor <--> ACP CLI B|
-              | private HOME/worktree/PVC|
+              | private workspace + PVC  |
               +--------------------------+
 
 Worker A and B may both read a pinned skills ConfigMap and call explicitly
@@ -314,7 +315,7 @@ operator-provided value through the process exit code.
 - Add-on Helm render:
   `helm template test charts/openab-kubernetes-session --set enabled=true --set-string 'networkPolicy.controller.apiServerCIDRs[0]=10.96.0.1/32'`
 - Kind isolation test:
-  `scripts/test-kubernetes-session-kind.sh`
+  `scripts/test-kubernetes-session-kind.sh --isolation`
 
 The image, Helm, and Kind commands become mandatory once their corresponding
 files exist. Tests that require a container runtime must fail with a clear
@@ -341,13 +342,14 @@ prerequisite message rather than silently skip isolation assertions.
 - `crates/openab-kubernetes-session/src/controller/generation.rs`: final CA pin
   validation before creation, adoption, and registration.
 - `crates/openab-kubernetes-session/tests/`: resource, registration, transport,
-  and end-to-end fake ACP tests.
+  and worker integration tests using the deterministic fake ACP.
 - `Dockerfile.kubernetes-session`: separate broker, controller, worker-base,
   and worker-test image targets without changing default image targets.
 - `charts/openab-kubernetes-session/`: default-off controller/RBAC/network
   policy/configuration add-on; it does not own or delete the worker namespace.
 - `scripts/test-kubernetes-session-kind.sh`: deterministic two-session
-  isolation, replacement, suspension, release, and cleanup verification.
+  isolation, replacement, suspension, release, and Kubernetes API-object
+  absence verification.
 
 ## Code style
 
@@ -395,10 +397,13 @@ prerequisite message rather than silently skip isolation assertions.
    the existing OpenAB close/release capability; and exposes only narrow
    workspace read/write probes needed by the isolation test. It never runs a
    shell or arbitrary executable.
-7. Kind tests start two logical sessions, observe distinct Pods/PVCs/SAs,
-   attempt cross-session filesystem access, verify shared skills are read-only,
-   replace one failed Pod without changing logical identity/PVC, then verify
-   compute TTL and explicit release cleanup.
+7. Kind tests start two logical sessions, observe distinct Pods/PVCs/SAs, use
+   the fake ACP's fixed same-relative-path marker plus exact Pod/PVC mount
+   inspection to detect shared writable state, verify shared skills are
+   read-only, replace one failed Pod without changing logical identity/PVC,
+   then verify compute TTL and explicit release removes the exact Kubernetes
+   API objects. They do not exercise arbitrary shell/path reads, a production
+   agent, Git/worktree, or backing PV/disk deletion.
 8. Existing OpenAB core, default image, and default Helm tests remain green.
    Any pre-existing unrelated failure is reproduced and reported, never
    bypassed or folded into this change.
@@ -450,9 +455,13 @@ prerequisite message rather than silently skip isolation assertions.
 - Connection loss produces no reconnect or replay and lets the existing
   controller containment/replacement path preserve logical session identity
   and private PVC state.
-- Two concurrent thread fixtures cannot read or mutate one another's HOME,
-  Git metadata, workspace, or PVC, while both can read the same pinned skills
-  object and reach only explicitly allowed services.
+- Two concurrent thread fixtures use distinct Pod/PVC boundaries, and fixed
+  marker state is neither visible nor mutable across sessions. Both mount the
+  same pinned skills object read-only, receive exact session-scoped
+  NetworkPolicies, pass the fixed DNS allow/deny gate, and register with the
+  relay. Production-agent, arbitrary business-service traffic, and
+  Git/worktree end-to-end coverage remain deferred; any future Git metadata
+  must remain on the private PVC.
 - The separate image targets build reproducibly, the add-on chart renders only
   when explicitly enabled, and the Kind isolation test passes.
 - All repository-required format, clippy, test, release-build, image, chart,

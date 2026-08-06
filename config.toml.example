@@ -177,7 +177,7 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 # When enabling it, comment out the explicit [agent].command block below;
 # [agent].env/inherit_env may still configure the trusted bridge process.
 # [kubernetes_session]
-# controller_url = "wss://openab-session-controller.openab-system.svc/relay"
+# controller_url = "wss://openab-session-controller.openab-system.svc:8443/v1/bridge"
 # profile = "codex-strict"
 # scope = "team-a-openab-codex"
 # credential_file = "/var/run/secrets/openab-session/token"

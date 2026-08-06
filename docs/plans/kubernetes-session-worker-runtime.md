@@ -11,19 +11,20 @@ this plan is approved.
 
 ## Baseline and integration decision
 
-The feature branch is currently 78 commits ahead of and one commit behind
-`upstream/main`. The upstream commit adds MCP-over-ACP browser control and
-overlaps the Kubernetes isolation work in two composition surfaces:
+At plan approval, the feature branch was 78 commits ahead of and one commit
+behind `upstream/main`. That upstream commit added MCP-over-ACP browser control
+and overlapped the Kubernetes isolation work in two composition surfaces:
 
 - `crates/openab-core/src/acp/pool.rs`; and
 - `src/main.rs`.
 
-A three-way merge simulation reports only those two content conflicts. The
-plan therefore merges `upstream/main` into the feature branch before new
-worker work rather than rebasing 78 commits and resolving the same conceptual
-overlap at multiple historical points. The merge preserves existing reviewed
-feature commit identities; GitHub's upstream PR diff still excludes upstream's
-own commit. A final upstream sync is repeated before opening the draft PR.
+A three-way merge simulation reported only those two content conflicts. The
+plan therefore required merging `upstream/main` into the feature branch before
+new worker work rather than rebasing the then-current 78 commits and resolving
+the same conceptual overlap at multiple historical points. The merge preserved
+existing reviewed feature commit identities; GitHub's upstream PR diff still
+excludes upstream's own commit. A final upstream sync is repeated before
+opening the draft PR.
 
 Conflict resolution must compose, not choose between, the two features:
 
@@ -288,20 +289,26 @@ Checkpoint evidence:
 - no public Ingress, LoadBalancer, NodePort, plaintext relay, or worker Service
   is rendered;
 - the existing OpenAB chart renders identically; and
-- retained storage can be reclaimed only through controller-owned explicit
-  release policy, not Helm uninstall.
+- within the add-on lifecycle, a retained PVC Kubernetes API object is removed
+  only by controller-owned explicit release, never by Helm uninstall; backing
+  PV or disk reclamation remains outside the controller contract.
 
 ### 9. Prove isolation and lifecycle in Kind
 
 Build/load the test images, install the add-on, and drive two logical thread
 fixtures through separate bridge processes. Assert distinct worker Pods,
-PVCs, UIDs, cgroups/resource specs, ServiceAccounts, and writable workspaces.
-Assert both can read pinned skills/CA and only approved services, while neither
-can discover or mutate the other's private files.
+PVCs, UIDs, cgroups/resource specs, ServiceAccounts, and fixed workspace-marker
+state. Use the fake ACP's same-relative-path marker probe to detect accidental
+shared writable state; do not claim an arbitrary-filesystem or Git/worktree
+end-to-end test. Inspect both Pods' pinned skills/CA mounts and exact
+NetworkPolicies; prove shared skills are read-only, the fixed DNS allow/deny
+gate is enforced, and both workers register with the relay.
 
 Then fail one Pod, prove the replacement keeps logical session and PVC state,
 suspend compute by TTL, explicitly release the session, and prove bounded
-cleanup of its anchor and private storage without affecting the peer session.
+absence of its anchor, PVC, and generation-scoped Kubernetes API objects
+without affecting the peer session. This does not prove backing PV or cloud
+disk deletion.
 
 NetworkPolicy structure is asserted from the rendered and live objects. Active
 network enforcement is tested only through fixed harness endpoints with a
@@ -309,7 +316,7 @@ NetworkPolicy-capable CNI; the fake ACP worker does not gain arbitrary network
 or shell execution merely to make the test convenient.
 
 Checkpoint evidence is the deterministic script output plus captured object
-names/UIDs and negative filesystem/network assertions. Missing Docker, Kind,
+names/UIDs and negative fixed-marker/network assertions. Missing Docker, Kind,
 Helm, or kubectl prerequisites fail clearly rather than skipping the test.
 
 ### 10. Run final regression and prepare contribution
@@ -337,7 +344,8 @@ Safe parallel work after upstream integration:
 Required sequential boundaries:
 
 - upstream integration precedes all new edits;
-- resource injection and client transport precede end-to-end worker startup;
+- resource injection and client transport precede integrated fake-ACP worker
+  startup;
 - handshake ACK precedes child spawn by invariant;
 - working binaries precede final images;
 - images and chart precede Kind; and
@@ -363,7 +371,7 @@ changes without an explicit ownership handoff.
 | Child descendants survive session loss | Dedicated process group, socket-drop-first, bounded TERM/KILL/reap |
 | Shared resource becomes a writable isolation bypass | Only immutable read-only ConfigMaps or authenticated services; never shared writable volumes |
 | Add-on changes existing deployments | Separate feature, binaries, images, chart, and absent-config regression tests |
-| Idle Pods/PVCs grow without bound | Existing compute/storage TTLs, scope capacity, quotas, explicit release, and Kind lifecycle proof |
+| Idle Pods/PVCs grow without bound | Compute-TTL suspension, advisory storage-expiry reporting, scope capacity, namespace quotas, explicit release, and Kind API-object lifecycle proof |
 | Private images cannot pull without exposing credentials | Reference imagePullSecrets only from the Pod, never mount them, and dedicate the worker namespace because the controller's Secret reconciliation RBAC cannot be restricted by field or name prefix |
 
 ## Verification checkpoints
@@ -377,7 +385,7 @@ changes without an explicit ownership handoff.
 | Process relay | strict stdio framing, queue-free scoped pumps, deadline/error sanitization, backpressure, signal and process-tree suites |
 | Images | clean builds, non-root smoke tests, expected binary inventories |
 | Helm | lint, disabled/enabled renders, exact RBAC/network-policy inspection, default-chart regression |
-| Kind | two-session isolation, shared-read-only access, replacement, TTL and release |
+| Kind | two-session isolation, shared-read-only access, replacement, compute TTL and explicit-release API-object absence |
 | Final | format, no-default check, all-feature clippy/test/release, root workspace gates, diff/security review |
 
 All commits remain small, independently verifiable, conventionally named, and

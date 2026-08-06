@@ -411,10 +411,11 @@ and all default Dockerfiles against the Stage A baseline.
     or an inbound worker Service.
   - Work: drive two logical thread fixtures through separate bridges; capture
     object names/UIDs; write distinct markers through the fake ACP's fixed,
-    path-confined workspace probe; prove each worker cannot discover or mutate
-    the peer while both read the pinned skills and CA and call only
-    harness-approved services. A production agent/Git-worktree end-to-end test
-    remains part of the deferred worker-flavour work in Task 20.
+    path-confined workspace probe; prove the peer marker is not visible, each
+    Pod mounts only its own PVC, shared skills are read-only, exact generated
+    NetworkPolicies are scoped per session, the fixed DNS allow/deny gate is
+    enforced, and both workers register with the relay. A production
+    agent/Git-worktree end-to-end test remains deferred.
   - Files: Kind script and constrained fixture endpoints.
   - Acceptance: Pods, PVCs, ServiceAccounts, process/resource boundaries, and
     writable state are distinct; shared platform data is read-only or a
@@ -435,7 +436,7 @@ and all default Dockerfiles against the Stage A baseline.
     never leaks across sessions and its PVC API object persists until explicit
     release. The MVP storage-retention deadline is advisory and does not grant
     deletion authority.
-  - Verify: `scripts/test-kubernetes-session-kind.sh`.
+  - Verify: `scripts/test-kubernetes-session-kind.sh --isolation`.
   - Commit: `test(kubernetes): verify session lifecycle`.
 
 ### Checkpoint F
@@ -457,7 +458,7 @@ physical reclamation of its backing PersistentVolume or cloud disk.
 
 ## Stage F: contribution readiness
 
-- [ ] **Task 20 — Document the opt-in deployment and deferred production work.**
+- [x] **Task 20 — Document the opt-in deployment and deferred production work.**
   - Depends on: Tasks 15–19.
   - Work: document enablement, required immutable CA/namespace/image digests,
     one-thread/one-Pod invariant, trusted broker/controller boundaries,
@@ -502,7 +503,7 @@ physical reclamation of its backing PersistentVolume or cloud disk.
     - `helm template test charts/openab --set-string agents.kiro.configUrl=https://example.invalid/config.toml`
     - `helm template test charts/openab-kubernetes-session --set enabled=true --set-string 'networkPolicy.controller.apiServerCIDRs[0]=10.96.0.1/32'`
     - `helm unittest charts/openab-kubernetes-session`
-    - `scripts/test-kubernetes-session-kind.sh`
+    - `scripts/test-kubernetes-session-kind.sh --isolation`
   - Commit: none when clean; any correction uses its own conventional commit.
 
 - [ ] **Task 22 — Final upstream sync and draft PR handoff.**

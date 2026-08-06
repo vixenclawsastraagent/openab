@@ -322,7 +322,7 @@ agent process.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `controller_url` | string | required | Authenticated controller relay URL. Must use `wss://`, include a host, and contain no URL user credentials. |
+| `controller_url` | string | required | Authenticated controller bridge URL. Must use `wss://`, include a host, contain no URL user credentials or query, and use the exact `/v1/bridge` path. |
 | `profile` | string | required | Cluster-owned worker profile name as a lowercase Kubernetes DNS label. |
 | `scope` | string | required | Non-empty stable team/agent state-ownership scope without edge whitespace, up to 253 bytes. It is hashed before use in Kubernetes resource identity. |
 | `credential_file` | string | `/var/run/secrets/openab-session/token` | Absolute path to the projected broker-to-controller credential. The credential value is not stored in TOML. |
@@ -330,7 +330,7 @@ agent process.
 
 ```toml
 [kubernetes_session]
-controller_url = "wss://openab-session-controller.openab-system.svc/relay"
+controller_url = "wss://openab-session-controller.openab-system.svc:8443/v1/bridge"
 profile = "codex-strict"
 scope = "team-a-openab-codex"
 # Optional when the controller uses a private CA:
@@ -471,7 +471,7 @@ Session pool settings for managing concurrent agent sessions.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `max_sessions` | usize | `10` | Maximum number of concurrent agent sessions. When full, the oldest idle session is suspended (recoverable); if all sessions are busy, new requests are rejected. |
-| `session_ttl_hours` | u64 | `4` | Session time-to-live in hours. Idle sessions are reclaimed after this period. The example config uses `24`. |
+| `session_ttl_hours` | u64 | `4` | Session time-to-live in hours. Kubernetes-isolated sessions request non-destructive compute suspension and retain their mapping, anchor, and PVC; other runtimes keep their existing lifecycle behavior. The example config uses `24`. |
 | `hung_grace_secs` | u64 | `120` | Grace period after `prompt_hard_timeout_secs` before a session stuck with its connection mutex held (in-flight prompt) is force-evicted from the pool. Eviction threshold: `prompt_hard_timeout_secs + hung_grace_secs`. |
 | `default_config_options` | map | `{}` | Config options to set automatically after session creation. Keys are config option IDs (e.g. `mode`, `model`), values are the desired values (e.g. `bypass`, `swe-1-6`). Sent via ACP `session/set_config_option` after each `session/new`. |
 

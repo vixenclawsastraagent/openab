@@ -40,8 +40,10 @@ When an agent selects this mode:
 
 1. one chat thread maps to one logical OpenAB session;
 2. one logical session owns at most one active Kubernetes worker Pod;
-3. each worker owns its private writable HOME, checkout and Git metadata, ACP
-   state, temporary files, credentials, and persistent volume;
+3. each worker owns a session-private writable HOME, workspace, ACP state,
+   temporary files, and PVC; any production-agent credentials, checkout, or
+   Git metadata introduced by a future worker flavour must also remain
+   session-private;
 4. workers may access only explicitly approved shared read-only inputs or
    authorized shared services; and
 5. compute and retained storage are managed with separate lifetimes.
@@ -69,7 +71,7 @@ The first version is intentionally bounded:
   configured scope;
 - one controller replica;
 - a small, administrator-owned set of worker profiles;
-- one private persistent volume per retained session;
+- one private PVC Kubernetes API object per retained session;
 - a deterministic fake ACP worker for integration and isolation tests; and
 - Kubernetes-native state rather than a new database or CRD.
 
@@ -136,7 +138,8 @@ Untrusted execution Pods
 +-----------------------------+  +-----------------------------+
 | Worker Pod A                |  | Worker Pod B                |
 | ACP/CLI A                   |  | ACP/CLI B                   |
-| private HOME/PVC/.git/tmp A |  | private HOME/PVC/.git/tmp B |
+| private HOME/workspace/PVC  |  | private HOME/workspace/PVC  |
+| private ephemeral scratch   |  | private ephemeral scratch   |
 | no Kubernetes API token     |  | no Kubernetes API token     |
 +-----------------------------+  +-----------------------------+
                    |                             |
@@ -276,7 +279,8 @@ The controller:
 - creates, observes, suspends, replaces, and deletes worker resources;
 - fences all mutations against the latest durable lifecycle anchor;
 - reconciles intermediate states after restart; and
-- enforces active-worker and retained-storage policy.
+- enforces active-worker admission and reports retained-storage deadline
+  observations.
 
 The worker namespace is the complete trust domain for exactly one controller
 scope, not a shared tenant namespace. Kubernetes RBAC cannot grant Pod creation
@@ -509,7 +513,8 @@ State responsibilities are separated:
 |---|---|
 | OpenAB logical-session mapping | broker storage |
 | lifecycle phase, profile, deadlines, and fencing metadata | ConfigMap anchor |
-| checkout, HOME, ACP state, and mutable files | private PVC |
+| durable workspace, HOME, ACP state, and files; any future worker-flavour checkout or Git metadata | private PVC |
+| ephemeral `/tmp`, `/var/tmp`, and `/run/openab` state | per-worker `emptyDir` volumes |
 | generation-specific bootstrap credential | immutable Secret |
 | live execution identity and resource accounting | worker Pod |
 
@@ -600,16 +605,19 @@ never be blocked by the compute-cap policy.
                               v
                        Provisioning
 
- Suspended -- explicit reset ---------------------> Deleting --> Absent
-      |
-      +-- retention expiry --> report deadline-expired observation (no mutation)
+ Ready / Busy -- explicit reset ------------------> Deleting --> Absent
+
+ Suspended -- retention expiry --> report deadline-expired observation
+                                  (no mutation)
 ```
 
 Compute idle expiry suspends the worker Pod but retains resumable private
 storage. In the MVP, storage retention expiry is advisory: reconciliation
 reports a stale-tolerant deadline observation but does not mutate the anchor,
 PVC, or generation resources. The observation is not release authorization.
-Only an explicit reset starts fenced, controller-managed destructive cleanup.
+Only an explicit reset from an active, reconciled bridge starts fenced,
+controller-managed destructive cleanup. A suspended or orphaned session must
+first follow the next-message resume path before reset.
 Broker shutdown follows the non-destructive path. Bridge or broker failure
 leaves the session reconcilable; it never implies destructive release.
 
@@ -819,8 +827,8 @@ The MVP deliberately provides no transparent same-generation reconnect. After
 compute absence is proven, a newly spawned bridge uses a fresh attempt ID to
 advance the clean `Blocked` anchor to the next generation and loads the
 retained ACP session from its private PVC. An interrupted prompt is not
-automatically replayed: its worktree may contain partial private changes, so a
-human or higher-level workflow decides whether to retry.
+automatically replayed: its private workspace may contain partial changes, so
+a human or higher-level workflow decides whether to retry.
 
 `Released` proves that the Kubernetes PVC API object is absent; it does not by
 itself prove that a backing PersistentVolume or cloud disk has been physically
@@ -837,14 +845,17 @@ This separation addresses the cost concern without weakening isolation:
 - the [scope-wide active-worker admission policy](#51-active-worker-capacity-admission)
   and namespace `ResourceQuota` bound concurrent compute;
 - an idle deadline bounds unused Pods;
-- a storage-retention deadline identifies abandoned PVCs for release, while
-  namespace storage quota bounds aggregate retained capacity;
+- a storage-retention deadline reports retained PVCs for operator review but
+  does not release them, while namespace storage quota bounds aggregate
+  retained capacity;
 - controller reconciliation handles resources left by crashes; and
-- metrics and alerts expose active workers, retained storage, cleanup failure,
-  and sessions blocked on policy.
+- deadline-scan logs report expired-storage observations and cleanup failures;
+  operators provide external metrics and alerts for active workers, retained
+  storage, and sessions blocked on policy in the MVP.
 
-Concrete TTLs and quotas are operator policy and belong in the worker profile
-or chart values, not in this ADR.
+Concrete lifecycle TTLs belong in the profile ConfigMap's scope-wide
+`[policy]`; quotas and admission controls belong on the dedicated worker
+namespace. They are operator policy, not Helm defaults in this ADR.
 
 For ACP lifecycle integration, `session/close` means non-destructive compute
 suspension. ACP standardized that capability in April 2026. Destructive reset
@@ -944,7 +955,7 @@ or panic payloads.
 | Worker reads another thread's worktree | separate Pod and private volume; no shared writable Git common directory |
 | Worker obtains Kubernetes control | token automount disabled; no worker RoleBinding; RBAC held only by controller |
 | Stale bridge replaces or deletes a newer worker | scope, generation, attempt ID, anchor UID, and Pod UID fencing |
-| Crash leaves compute or disks indefinitely | durable deadlines, idempotent reconciliation, quotas, metrics, and alerts |
+| Crash leaves compute or retained PVC API objects indefinitely | compute deadlines, idempotent reconciliation, explicit release, namespace quotas, and operator monitoring; backing PV/disk reclaim remains StorageClass/provisioner policy |
 | Shared skills become a write channel | pinned read-only mount or image layer; generated state stored privately |
 | Shared cache leaks another session | service API authorization and tenant namespace; never mount another worker's cache |
 | Broker path is smuggled into worker setup | bridge-owned fixed working directory and rejected filesystem/MCP mounts |
@@ -958,9 +969,11 @@ release artifacts can evolve independently behind a small broker seam.
 
 The trade-off is an additional trusted service and explicit operational
 responsibility for quotas, storage classes, retention, reconciliation,
-credentials, networking, and observability. Suspended PVCs continue to cost
-money until released or expired. A controller outage affects opted-in
-sessions, though it does not alter default OpenAB deployments.
+credentials, networking, and observability. Suspended PVCs remain and may
+continue to cost money until explicitly released; expiry alone is only an
+observation. Backing-volume reclamation then remains subject to the storage
+policy described in [section 6](#6-lifecycle-and-cost). A controller outage
+affects opted-in sessions, though it does not alter default OpenAB deployments.
 
 ## 10. Alternatives considered
 

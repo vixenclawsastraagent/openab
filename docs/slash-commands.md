@@ -60,10 +60,21 @@ Cancels any in-flight operation, then removes the session from the pool. The ACP
 
 This is equivalent to the `sessions close` + `sessions new` pattern used by [OpenClaw ACPX](https://github.com/openclaw/acpx).
 
+In opt-in Kubernetes session mode, Discord `/reset` is also the explicit
+destructive release request. It fences the active session and waits for the
+controller to acknowledge removal of its anchor and PVC Kubernetes API objects
+before the broker forgets the mapping. If compute is already suspended or the
+bridge is orphaned, send a new message to resume and reconcile the session
+before invoking `/reset`. Backing PersistentVolume or cloud-disk reclamation is
+controlled separately by the cluster's storage policy. Slack does not expose
+thread slash commands, so a Slack-specific user release surface remains
+deferred for this add-on.
+
 **What gets cleared:**
 - Conversation history
 - ACP process and connection
-- Suspended session state (no resume after reset)
+- Suspended session state after any runtime-required resume (no resume after a
+  successful reset)
 
 **What is preserved:**
 - Bot identity and system prompt (re-applied on next session creation)
