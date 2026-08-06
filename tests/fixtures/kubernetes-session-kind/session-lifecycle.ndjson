@@ -5,7 +5,11 @@
 {"jsonrpc":"2.0","id":404,"method":"session/prompt","params":{"sessionId":"openab-fake-session-v1","prompt":[]}}
 {"jsonrpc":"2.0","id":405,"method":"session/prompt","params":{"sessionId":"openab-fake-session-v1","prompt":[]}}
 {"jsonrpc":"2.0","id":406,"method":"session/prompt","params":{"sessionId":"openab-fake-session-v1","prompt":[]}}
+{"jsonrpc":"2.0","id":407,"method":"session/prompt","params":{"sessionId":"openab-fake-session-v1","prompt":[]}}
+{"jsonrpc":"2.0","id":408,"method":"session/prompt","params":{"sessionId":"openab-fake-session-v1","prompt":[]}}
+{"jsonrpc":"2.0","id":409,"method":"session/prompt","params":{"sessionId":"openab-fake-session-v1","prompt":[]}}
 {"jsonrpc":"2.0","id":310,"method":"session/load","params":{"sessionId":"openab-fake-session-v1"}}
 {"jsonrpc":"2.0","id":311,"method":"_openab/test/workspace/read","params":{"sessionId":"openab-fake-session-v1"}}
 {"jsonrpc":"2.0","id":312,"method":"session/prompt","params":{"sessionId":"openab-fake-session-v1","prompt":[]}}
+{"jsonrpc":"2.0","id":498,"method":"_openab/test/workspace/read","params":{"sessionId":"openab-fake-session-v1"}}
 {"jsonrpc":"2.0","id":499,"method":"_openab/test/workspace/read","params":{"sessionId":"openab-fake-session-v1"}}

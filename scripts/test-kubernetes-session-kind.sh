@@ -7,6 +7,7 @@ REPOSITORY_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 FIXTURE_ROOT="$REPOSITORY_ROOT/tests/fixtures/kubernetes-session-kind"
 CHART="$REPOSITORY_ROOT/charts/openab-kubernetes-session"
 API_SERVER_ENDPOINT_FILTER="$FIXTURE_ROOT/api-server-endpoints.jq"
+COMPUTE_DEADLINE_FILTER="$FIXTURE_ROOT/session-compute-deadline.jq"
 MODE=${1:-}
 
 KIND_NODE_IMAGE='kindest/node:v1.32.11@sha256:5fc52d52a7b9574015299724bd68f183702956aa4a2116ae75a63cb574b35af8'
@@ -16,6 +17,8 @@ RELEASE_NAME='openab-session-controller'
 CONTROLLER_NAME='openab-session-controller'
 BROKER_POD='openab-kind-smoke-broker'
 PROBE_POD='openab-kind-network-probe'
+COMPUTE_IDLE_SECONDS=300
+STORAGE_RETENTION_SECONDS=3600
 
 fail() {
     printf '%s\n' "kubernetes-session Kind test: $*" >&2
@@ -59,6 +62,7 @@ for fixture in \
     profiles.toml.in \
     shared-skill.md \
     api-server-endpoints.jq \
+    session-compute-deadline.jq \
     smoke.ndjson \
     workspace-isolation.ndjson \
     session-lifecycle.ndjson \
@@ -662,6 +666,8 @@ capture_anchor_snapshot() {
             {
                 name: $config_map.metadata.name,
                 uid: $config_map.metadata.uid,
+                resourceVersion: $config_map.metadata.resourceVersion,
+                anchorRaw: $config_map.data["anchor.json"],
                 state: $state
             }
           else
@@ -880,6 +886,115 @@ assert_session_children_unchanged() {
     jq -e --slurpfile baseline "$children_baseline" \
         '. == $baseline[0]' "$children_current" >/dev/null || {
         fail "$children_description"
+    }
+}
+
+plan_accelerated_compute_deadline() {
+    deadline_snapshot=$1
+    deadline_plan=$2
+    deadline_patch=$3
+
+    jq -e \
+        --argjson compute_idle_seconds "$COMPUTE_IDLE_SECONDS" \
+        --argjson storage_retention_seconds "$STORAGE_RETENTION_SECONDS" \
+        -f "$COMPUTE_DEADLINE_FILTER" "$deadline_snapshot" \
+        > "$deadline_plan" || {
+        fail "session A live deadlines did not match the configured retention policy"
+    }
+    jq -e '
+        .patch
+        | if (
+            type == "array"
+            and length == 4
+            and [.[].op] == ["test", "test", "test", "replace"]
+            and [.[].path] == [
+                "/metadata/uid",
+                "/metadata/resourceVersion",
+                "/data/anchor.json",
+                "/data/anchor.json"
+            ]
+          ) then
+            .
+          else
+            error("deadline planner emitted an invalid JSON Patch")
+          end
+    ' "$deadline_plan" > "$deadline_patch" || {
+        fail "session A compute deadline patch was malformed"
+    }
+}
+
+assert_deadline_patch_response() {
+    deadline_baseline=$1
+    deadline_plan=$2
+    deadline_response=$3
+
+    jq -e \
+        --slurpfile baseline "$deadline_baseline" \
+        --slurpfile plan "$deadline_plan" '
+        .metadata.name == $baseline[0].name
+        and .metadata.uid == $baseline[0].uid
+        and (.metadata.resourceVersion | (
+            type == "string" and length > 0
+        ))
+        and .metadata.resourceVersion != $baseline[0].resourceVersion
+        and (.data | keys == ["anchor.json"])
+        and (.data["anchor.json"] | fromjson) == $plan[0].expectedState
+        and $plan[0].expectedState.computeDeadlineAt
+            != $baseline[0].state.computeDeadlineAt
+        and (
+            $plan[0].expectedState | del(.computeDeadlineAt)
+        ) == (
+            $baseline[0].state | del(.computeDeadlineAt)
+        )
+    ' "$deadline_response" >/dev/null || {
+        fail "session A deadline patch changed more than computeDeadlineAt"
+    }
+}
+
+capture_controller_fingerprint() {
+    controller_fingerprint_destination=$1
+    controller_fingerprint_raw="$controller_fingerprint_destination.raw"
+
+    kubectl --request-timeout=5s -n "$SYSTEM_NAMESPACE" get pods \
+        -l 'app.kubernetes.io/name=openab-kubernetes-session,app.kubernetes.io/instance=openab-session-controller,app.kubernetes.io/component=controller' \
+        -o json > "$controller_fingerprint_raw"
+    jq -e '
+        if (
+            type == "object"
+            and (.items | type == "array" and length == 1)
+        ) then
+            .items[0] as $pod
+            | [
+                $pod.status.containerStatuses[]?
+                | select(.name == "controller")
+              ] as $containers
+            | if (
+                $pod.metadata.deletionTimestamp == null
+                and ($pod.metadata.uid | (
+                    type == "string" and length > 0
+                ))
+                and ($containers | length == 1)
+                and ($containers[0].containerID | (
+                    type == "string" and length > 0
+                ))
+                and ($containers[0].restartCount | (
+                    type == "number" and . >= 0 and floor == .
+                ))
+              ) then
+                {
+                    podUid: $pod.metadata.uid,
+                    containerId: $containers[0].containerID,
+                    restartCount: $containers[0].restartCount
+                }
+              else
+                error("controller fingerprint is incomplete")
+              end
+        else
+            error("controller fingerprint requires exactly one Pod")
+        end
+    ' "$controller_fingerprint_raw" \
+        > "$controller_fingerprint_destination" || {
+        fail "session controller fingerprint was unavailable"
     }
 }
 
@@ -2215,6 +2330,7 @@ if [ "$MODE" = '--isolation' ]; then
     A_REPLACEMENT_LOAD=$(lifecycle_request 310)
     A_REPLACEMENT_WORKSPACE_READ=$(lifecycle_request 311)
     A_REPLACEMENT_PROMPT=$(lifecycle_request 312)
+    B_POST_TTL_WORKSPACE_READ=$(lifecycle_request 498)
     B_POST_REPLACEMENT_WORKSPACE_READ=$(lifecycle_request 499)
 
     send_bridge_request a 'session A pre-failure prompt' \
@@ -2454,6 +2570,141 @@ if [ "$MODE" = '--isolation' ]; then
     if ! kill -0 "$BRIDGE_A_PID" >/dev/null 2>&1 || \
         ! kill -0 "$BRIDGE_B_PID" >/dev/null 2>&1; then
         fail "session A replacement affected session B"
+    fi
+
+    refresh_session_b 407 'session B keepalive before worker A compute TTL'
+    ANCHOR_TTL_BASELINE_B="$TEMPORARY_ROOT/anchor-ttl-baseline-b.json"
+    wait_for_anchor_state \
+        "$ANCHOR_NAME_B" "$ANCHOR_UID_B" ready "$WORKER_POD_UID_B" \
+        "$ANCHOR_TTL_BASELINE_B" 30
+    assert_anchor_stable_identity \
+        "$ANCHOR_TTL_BASELINE_B" "$ANCHOR_BASELINE_B" \
+        'compute suspension affected session B'
+
+    ANCHOR_TTL_BASELINE_A="$TEMPORARY_ROOT/anchor-ttl-baseline-a.json"
+    wait_for_anchor_state \
+        "$ANCHOR_NAME" "$ANCHOR_UID" ready "$WORKER_POD_UID_A2" \
+        "$ANCHOR_TTL_BASELINE_A" 30
+    CONTROLLER_FINGERPRINT_BEFORE_TTL="$TEMPORARY_ROOT/controller-before-ttl.json"
+    capture_controller_fingerprint "$CONTROLLER_FINGERPRINT_BEFORE_TTL"
+
+    DEADLINE_PLAN_A="$TEMPORARY_ROOT/deadline-plan-a.json"
+    DEADLINE_PATCH_A="$TEMPORARY_ROOT/deadline-patch-a.json"
+    DEADLINE_RESPONSE_A="$TEMPORARY_ROOT/deadline-response-a.json"
+    plan_accelerated_compute_deadline \
+        "$ANCHOR_TTL_BASELINE_A" "$DEADLINE_PLAN_A" "$DEADLINE_PATCH_A"
+    if ! kill -0 "$BRIDGE_A_PID" >/dev/null 2>&1; then
+        fail "session A bridge died before compute TTL acceleration"
+    fi
+    POD_BEFORE_TTL_A="$TEMPORARY_ROOT/pod-before-ttl-a.json"
+    kubectl --request-timeout=5s -n "$WORKER_NAMESPACE" get pod \
+        "$WORKER_POD_A2" -o json > "$POD_BEFORE_TTL_A"
+    jq -e --arg pod_uid "$WORKER_POD_UID_A2" '
+        .metadata.uid == $pod_uid
+        and .metadata.deletionTimestamp == null
+        and any(
+            .status.conditions[]?;
+            .type == "Ready" and .status == "True"
+        )
+    ' "$POD_BEFORE_TTL_A" >/dev/null || {
+        fail "session A worker Pod was not live before compute TTL acceleration"
+    }
+    # Test-only CI acceleration: production still records a 300-second TTL,
+    # and the controller retains its fixed 30-second maintenance loop.
+    kubectl --request-timeout=10s -n "$WORKER_NAMESPACE" patch configmap \
+        "$ANCHOR_NAME" --type=json --patch-file "$DEADLINE_PATCH_A" \
+        -o json > "$DEADLINE_RESPONSE_A" || {
+        fail "session A fenced compute deadline acceleration was rejected"
+    }
+    assert_deadline_patch_response \
+        "$ANCHOR_TTL_BASELINE_A" "$DEADLINE_PLAN_A" "$DEADLINE_RESPONSE_A"
+    sleep 2
+
+    if wait_for_process_exit "$BRIDGE_A_PID" 120; then
+        :
+    else
+        sed -n '1,80p' "$BRIDGE_A_STDERR" >&2 || true
+        fail "session A TTL bridge did not exit after compute suspension"
+    fi
+    BRIDGE_A_TTL_EXIT_STATUS=$BRIDGE_EXIT_STATUS
+    exec 3>&-
+    BRIDGE_A_WRITER_OPEN=0
+    BRIDGE_A_PID=''
+    [ "$BRIDGE_A_TTL_EXIT_STATUS" -ne 0 ] || {
+        fail "session A TTL bridge did not exit after compute suspension"
+    }
+    refresh_session_b 408 'session B keepalive after worker A compute TTL'
+
+    ANCHOR_SUSPENDED_A="$TEMPORARY_ROOT/anchor-suspended-a.json"
+    wait_for_anchor_state \
+        "$ANCHOR_NAME" "$ANCHOR_UID" suspended '' \
+        "$ANCHOR_SUSPENDED_A" 120
+    refresh_session_b 409 'session B keepalive after worker A suspended'
+    jq -e \
+        --slurpfile baseline "$ANCHOR_TTL_BASELINE_A" \
+        --slurpfile plan "$DEADLINE_PLAN_A" \
+        --slurpfile response "$DEADLINE_RESPONSE_A" '
+        .name == $baseline[0].name
+        and .uid == $baseline[0].uid
+        and .resourceVersion != $response[0].metadata.resourceVersion
+        and .state.lastPromptTurnId == null
+        and (
+            .state | del(.lastPromptTurnId)
+        ) == (
+            $plan[0].expectedState
+            | .phase = "suspended"
+            | .podUid = null
+            | del(.lastPromptTurnId)
+        )
+    ' "$ANCHOR_SUSPENDED_A" >/dev/null || {
+        fail "session A compute TTL changed logical identity or retained live compute"
+    }
+    wait_for_exact_uid_absent pods "$WORKER_POD_UID_A2" \
+        a-generation-2-ttl-pod 60
+    wait_for_exact_uid_absent serviceaccounts \
+        "$WORKER_SERVICE_ACCOUNT_UID_A2" \
+        a-generation-2-ttl-service-account 60
+    wait_for_exact_uid_absent networkpolicies.networking.k8s.io \
+        "$WORKER_NETWORK_POLICY_UID_A2" \
+        a-generation-2-ttl-network-policy 60
+    SUSPENDED_CHILDREN_A="$TEMPORARY_ROOT/suspended-children-a.json"
+    assert_retained_session_children \
+        "$SESSION_ID_A" "$SUSPENDED_CHILDREN_A" \
+        "$WORKSPACE_PVC_A2" "$WORKSPACE_PVC_UID_A2" \
+        'session A compute suspension retained generation-scoped resources'
+
+    CONTROLLER_FINGERPRINT_AFTER_TTL="$TEMPORARY_ROOT/controller-after-ttl.json"
+    capture_controller_fingerprint "$CONTROLLER_FINGERPRINT_AFTER_TTL"
+    jq -e \
+        --slurpfile baseline "$CONTROLLER_FINGERPRINT_BEFORE_TTL" \
+        '. == $baseline[0]' "$CONTROLLER_FINGERPRINT_AFTER_TTL" \
+        >/dev/null || {
+        fail "session controller restarted during compute TTL verification"
+    }
+
+    send_bridge_request b 'session B post-TTL workspace read' \
+        "$B_POST_TTL_WORKSPACE_READ"
+    wait_for_rpc_response 'session B post-TTL workspace read' 498 \
+        "$BRIDGE_B_STDOUT" "$BRIDGE_B_PID" "$BRIDGE_B_STDERR" 60
+    assert_rpc_content_result \
+        'compute suspension affected session B' \
+        "$BRIDGE_B_STDOUT" 498 "$WORKSPACE_B_MARKER_V1"
+    ANCHOR_POST_TTL_B="$TEMPORARY_ROOT/anchor-post-ttl-b.json"
+    wait_for_anchor_state \
+        "$ANCHOR_NAME_B" "$ANCHOR_UID_B" ready "$WORKER_POD_UID_B" \
+        "$ANCHOR_POST_TTL_B" 30
+    assert_anchor_stable_identity \
+        "$ANCHOR_POST_TTL_B" "$ANCHOR_TTL_BASELINE_B" \
+        'compute suspension affected session B'
+    CHILDREN_POST_TTL_B="$TEMPORARY_ROOT/children-post-ttl-b.json"
+    snapshot_session_children "$SESSION_ID_B" "$CHILDREN_POST_TTL_B"
+    assert_session_children_unchanged \
+        "$CHILDREN_POST_TTL_B" "$CHILDREN_POST_REPLACEMENT_B" \
+        'compute suspension affected session B'
+    kubectl -n "$WORKER_NAMESPACE" wait \
+        --for=condition=Ready "pod/$WORKER_POD_B" --timeout=30s
+    if ! kill -0 "$BRIDGE_B_PID" >/dev/null 2>&1; then
+        fail "compute suspension affected session B"
     fi
 
 fi

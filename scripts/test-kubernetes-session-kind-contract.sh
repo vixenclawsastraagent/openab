@@ -11,6 +11,8 @@ WORKSPACE_FIXTURE="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/workspa
 LIFECYCLE_FIXTURE="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/session-lifecycle.ndjson"
 ENDPOINT_FILTER="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/api-server-endpoints.jq"
 ENDPOINT_FIXTURE="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/api-server-endpoints.json"
+DEADLINE_FILTER="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/session-compute-deadline.jq"
+PROCESS_CONFIG_SOURCE="$SCRIPT_DIR/../crates/openab-kubernetes-session/src/controller_process_config.rs"
 TEMPORARY_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/openab-session-kind-contract.XXXXXX")
 
 fail() {
@@ -86,6 +88,27 @@ assert_endpoint_filter_failure() {
     }
 }
 
+assert_deadline_filter_failure() {
+    case_name=$1
+    fixture=$2
+    expected=$3
+    stdout_file="$TEMPORARY_ROOT/$case_name.stdout"
+    stderr_file="$TEMPORARY_ROOT/$case_name.stderr"
+
+    if jq -e \
+        --argjson compute_idle_seconds 300 \
+        --argjson storage_retention_seconds 3600 \
+        -f "$DEADLINE_FILTER" "$fixture" \
+        > "$stdout_file" 2> "$stderr_file"; then
+        fail "$case_name unexpectedly succeeded"
+    fi
+    [ ! -s "$stdout_file" ] || fail "$case_name wrote unexpected stdout"
+    grep -Fq "$expected" "$stderr_file" || {
+        sed -n '1,20p' "$stderr_file" >&2
+        fail "$case_name did not fail with the expected planner error"
+    }
+}
+
 [ -f "$TARGET" ] || fail "missing scripts/test-kubernetes-session-kind.sh"
 [ -f "$WORKFLOW" ] || fail "missing Kubernetes Session Images workflow"
 [ -f "$PROFILE_FIXTURE" ] || fail "missing Kind worker profile fixture"
@@ -94,6 +117,8 @@ assert_endpoint_filter_failure() {
 [ -f "$LIFECYCLE_FIXTURE" ] || fail "missing session lifecycle fixture"
 [ -f "$ENDPOINT_FILTER" ] || fail "missing API EndpointSlice jq filter"
 [ -f "$ENDPOINT_FIXTURE" ] || fail "missing API EndpointSlice JSON fixture"
+[ -f "$DEADLINE_FILTER" ] || fail "missing session compute deadline jq filter"
+[ -f "$PROCESS_CONFIG_SOURCE" ] || fail "missing controller process config source"
 
 endpoint_output=$(jq -r -f "$ENDPOINT_FILTER" "$ENDPOINT_FIXTURE")
 expected_endpoint_output='endpoint=172.18.0.2:6443'
@@ -144,6 +169,16 @@ assert_endpoint_filter_failure invalid-port \
 
 grep -Fq 'cidr = "192.0.2.1/32"' "$PROFILE_FIXTURE" || {
     fail "Kind profile must use a non-relay documentation egress target"
+}
+grep -Fqx 'compute_idle_seconds = 300' "$PROFILE_FIXTURE" || {
+    fail "Kind profile must exercise the production 300-second compute TTL"
+}
+grep -Fqx 'storage_retention_seconds = 3600' "$PROFILE_FIXTURE" || {
+    fail "Kind profile must retain storage beyond compute suspension"
+}
+grep -Fqx 'const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);' \
+    "$PROCESS_CONFIG_SOURCE" || {
+    fail "Kind TTL bound requires the production 30-second maintenance interval"
 }
 if grep -Fq 'port = 8443' "$PROFILE_FIXTURE"; then
     fail "Kind profile must leave relay egress to the static chart policy"
@@ -214,9 +249,10 @@ lifecycle_fixture_bytes=$(wc -c < "$LIFECYCLE_FIXTURE")
     fail "session lifecycle fixture exceeds its bounded input size"
 }
 jq -s -e '
-    length == 11
+    length == 15
     and ([.[].id] | sort == [
-        301, 310, 311, 312, 401, 402, 403, 404, 405, 406, 499
+        301, 310, 311, 312, 401, 402, 403, 404, 405, 406, 407, 408,
+        409, 498, 499
     ])
     and all(.[];
         type == "object"
@@ -259,11 +295,99 @@ jq -s -e '
         [404, "session/prompt"],
         [405, "session/prompt"],
         [406, "session/prompt"],
+        [407, "session/prompt"],
+        [408, "session/prompt"],
+        [409, "session/prompt"],
+        [498, "_openab/test/workspace/read"],
         [499, "_openab/test/workspace/read"]
     ]
 ' "$LIFECYCLE_FIXTURE" >/dev/null || {
     fail "session lifecycle fixture is not a closed replacement sequence"
 }
+
+DEADLINE_SNAPSHOT="$TEMPORARY_ROOT/deadline-snapshot.json"
+DEADLINE_PLAN="$TEMPORARY_ROOT/deadline-plan.json"
+jq -n '
+    {
+        schemaVersion: 1,
+        sessionId: ("a" * 64),
+        scopeId: ("b" * 64),
+        profile: {name: "kind-smoke", version: "v1"},
+        incarnationId: "00000000-0000-0000-0000-000000000010",
+        fence: {
+            generation: 2,
+            attemptId: "00000000-0000-0000-0000-000000000066"
+        },
+        phase: "ready",
+        podUid: "worker-pod-uid",
+        lastPromptTurnId: "00000000-0000-0000-0000-000000000020",
+        lastActivityAt: "2026-12-31T23:59:59.123456789Z",
+        computeDeadlineAt: "2027-01-01T00:04:59.123456789Z",
+        storageDeadlineAt: "2027-01-01T00:59:59.123456789Z"
+    } as $state
+    | {
+        name: "openab-session-deadline-fixture",
+        uid: "anchor-uid",
+        resourceVersion: "100",
+        anchorRaw: ($state | tojson),
+        state: $state
+    }
+' > "$DEADLINE_SNAPSHOT"
+jq -e \
+    --argjson compute_idle_seconds 300 \
+    --argjson storage_retention_seconds 3600 \
+    -f "$DEADLINE_FILTER" "$DEADLINE_SNAPSHOT" > "$DEADLINE_PLAN"
+jq -e --slurpfile snapshot "$DEADLINE_SNAPSHOT" '
+    .expectedDeadline == "2027-01-01T00:00:00.123456789Z"
+    and .expectedState == (
+        $snapshot[0].state
+        | .computeDeadlineAt = "2027-01-01T00:00:00.123456789Z"
+    )
+    and .patch == [
+        {
+            op: "test",
+            path: "/metadata/uid",
+            value: $snapshot[0].uid
+        },
+        {
+            op: "test",
+            path: "/metadata/resourceVersion",
+            value: $snapshot[0].resourceVersion
+        },
+        {
+            op: "test",
+            path: "/data/anchor.json",
+            value: $snapshot[0].anchorRaw
+        },
+        {
+            op: "replace",
+            path: "/data/anchor.json",
+            value: (.expectedState | tojson)
+        }
+    ]
+' "$DEADLINE_PLAN" >/dev/null || {
+    fail "deadline planner did not preserve fractional seconds and exact fences"
+}
+DEADLINE_RAW_MISMATCH="$TEMPORARY_ROOT/deadline-raw-mismatch.json"
+jq '.anchorRaw = "{}"' "$DEADLINE_SNAPSHOT" > "$DEADLINE_RAW_MISMATCH"
+assert_deadline_filter_failure deadline-raw-mismatch \
+    "$DEADLINE_RAW_MISMATCH" \
+    'deadline snapshot raw anchor disagrees with parsed state'
+DEADLINE_INVALID_DATE="$TEMPORARY_ROOT/deadline-invalid-date.json"
+jq '
+    .state.lastActivityAt = "2026-02-30T23:59:59.123456789Z"
+    | .anchorRaw = (.state | tojson)
+' "$DEADLINE_SNAPSHOT" > "$DEADLINE_INVALID_DATE"
+assert_deadline_filter_failure deadline-invalid-date \
+    "$DEADLINE_INVALID_DATE" \
+    'deadline timestamp must be canonical UTC RFC3339'
+DEADLINE_BUSY="$TEMPORARY_ROOT/deadline-busy.json"
+jq '
+    .state.phase = "busy"
+    | .anchorRaw = (.state | tojson)
+' "$DEADLINE_SNAPSHOT" > "$DEADLINE_BUSY"
+assert_deadline_filter_failure deadline-busy "$DEADLINE_BUSY" \
+    'deadline planner requires a ready anchor with a live Pod'
 
 unknown_stdout="$TEMPORARY_ROOT/unknown.stdout"
 unknown_stderr="$TEMPORARY_ROOT/unknown.stderr"
@@ -589,6 +713,29 @@ grep -Fq 'session A replacement did not retain its workspace state' \
 }
 grep -Fq 'session A replacement affected session B' "$TARGET" || {
     fail "failed-Pod recovery must prove peer non-interference"
+}
+grep -Fq 'plan_accelerated_compute_deadline()' "$TARGET" || {
+    fail "compute TTL acceleration must use the tested jq planner"
+}
+grep -Fq -- '--type=json' "$TARGET" || {
+    fail "compute TTL acceleration must use an RFC 6902 JSON Patch"
+}
+grep -Fq -- '--patch-file' "$TARGET" || {
+    fail "compute TTL acceleration must avoid inline shell patch escaping"
+}
+grep -Fq 'session A TTL bridge did not exit after compute suspension' \
+    "$TARGET" || {
+    fail "compute TTL must terminate the affected generation bridge"
+}
+grep -Fq 'session A compute suspension retained generation-scoped resources' \
+    "$TARGET" || {
+    fail "compute TTL must remove compute while retaining only private storage"
+}
+grep -Fq 'compute suspension affected session B' "$TARGET" || {
+    fail "compute TTL must prove peer non-interference"
+}
+grep -Fq 'capture_controller_fingerprint()' "$TARGET" || {
+    fail "compute TTL must rule out a controller restart"
 }
 grep -Fq 'kubernetes-session Kind test: isolation checks passed' "$TARGET" || {
     fail "the isolation mode must have its own completion signal"
