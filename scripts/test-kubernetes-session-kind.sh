@@ -424,6 +424,22 @@ assert_rpc_empty_result() {
     fi
 }
 
+close_release_input_after_ack() {
+    release_ack_output_file=$1
+    release_ack_request_id=$2
+
+    [ "$BRIDGE_A_WRITER_OPEN" -eq 1 ] || {
+        fail "session A release input closed before acknowledgement validation"
+    }
+    assert_rpc_empty_result \
+        'session A release did not receive correlated acknowledgement' \
+        "$release_ack_output_file" "$release_ack_request_id"
+    # The remote bridge has already flushed its terminal ACK, but the local
+    # kubectl exec -i wrapper retains stdin until this FIFO writer is closed.
+    exec 3>&-
+    BRIDGE_A_WRITER_OPEN=0
+}
+
 assert_initialize_release_capability() {
     initialize_output_file=$1
     initialize_description=$2
@@ -2919,9 +2935,7 @@ if [ "$MODE" = '--isolation' ]; then
     wait_for_rpc_response \
         'session A release did not receive correlated acknowledgement' 315 \
         "$BRIDGE_A_STDOUT" "$BRIDGE_A_PID" "$BRIDGE_A_STDERR" 120
-    assert_rpc_empty_result \
-        'session A release did not receive correlated acknowledgement' \
-        "$BRIDGE_A_STDOUT" 315
+    close_release_input_after_ack "$BRIDGE_A_STDOUT" 315
     if wait_for_process_exit "$BRIDGE_A_PID" 30; then
         :
     else
@@ -2932,8 +2946,6 @@ if [ "$MODE" = '--isolation' ]; then
     [ "$BRIDGE_A_RELEASE_EXIT_STATUS" -eq 0 ] || {
         fail "session A release bridge did not exit cleanly"
     }
-    exec 3>&-
-    BRIDGE_A_WRITER_OPEN=0
     BRIDGE_A_PID=''
     refresh_session_b 413 'session B keepalive after session A release'
 

@@ -969,6 +969,25 @@ grep -Fq 'session A release did not receive correlated acknowledgement' \
     "$TARGET" || {
     fail "explicit release must receive the correlated controller result"
 }
+grep -Fq 'close_release_input_after_ack()' "$TARGET" || {
+    fail "explicit release must validate its acknowledgement before closing input"
+}
+release_input_helper_count=$(grep -Fc 'close_release_input_after_ack' "$TARGET")
+[ "$release_input_helper_count" -ge 2 ] || {
+    fail "explicit release must use its acknowledgement-gated input close"
+}
+release_validation_line=$(awk '
+    /^close_release_input_after_ack\(\) \{/ { inside = 1 }
+    inside && /assert_rpc_empty_result/ { print NR; exit }
+' "$TARGET")
+release_input_close_line=$(awk '
+    /^close_release_input_after_ack\(\) \{/ { inside = 1 }
+    inside && /exec 3>&-/ { print NR; exit }
+' "$TARGET")
+[ -n "$release_validation_line" ] && [ -n "$release_input_close_line" ] && \
+    [ "$release_validation_line" -lt "$release_input_close_line" ] || {
+    fail "explicit release input must close only after exact acknowledgement validation"
+}
 grep -Fq 'session A release bridge did not exit cleanly' "$TARGET" || {
     fail "explicit release must terminate its bridge only after a clean result"
 }
