@@ -12,23 +12,38 @@ jobs:
   check:
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       pull-requests: write
       issues: write
     steps:
-      - uses: actions/create-github-app-token@v3
+      # pull_request_target must only execute trusted default-branch policy.
+      - name: Check out the default branch policy
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Test PR discussion workflow contract
+        run: perl .github/scripts/test_pr_discussion_check_workflow.pl
+      - name: Create GitHub App token
         id: app-token
+        if: github.repository == 'openabdev/openab'
+        uses: actions/create-github-app-token@v3
         with:
           client-id: ${{ secrets.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
-      - uses: actions/github-script@v7
+      - name: Check Discord discussion URL
+        uses: actions/github-script@v7
         with:
-          github-token: ${{ steps.app-token.outputs.token }}
+          github-token: ${{ steps.app-token.outputs.token || github.token }}
           script: |
             const pr = context.payload.pull_request;
             const body = pr.body || '';
             const labels = pr.labels.map(l => l.name);
             const marker = '<!-- openab-pr-discussion-check -->';
             const label = 'closing-soon';
+            const isUpstream =
+              context.repo.owner === 'openabdev' &&
+              context.repo.repo === 'openab';
 
             const hasDiscordUrl = /https:\/\/(discord\.com|discordapp\.com)\/channels\/\d+\/\d+/.test(body);
 
@@ -50,22 +65,24 @@ jobs:
               return;
             }
 
-            // Exempt maintainers (openabdev/openab-maintainers — team must be associated with repo)
-            const { data: maintainerMembers } = await github.rest.teams.listMembersInOrg({
-              org: 'openabdev',
-              team_slug: 'openab-maintainers',
-              per_page: 100
-            });
-            const maintainerLogins = new Set(maintainerMembers.map(m => m.login));
-            if (maintainerLogins.has(pr.user.login)) {
-              console.log(`Skipping discussion check for maintainer ${pr.user.login}`);
-              if (old) {
-                await github.rest.issues.deleteComment({ ...context.repo, comment_id: old.id });
+            // The organization App can read this team; fork-scoped tokens cannot.
+            if (isUpstream) {
+              const { data: maintainerMembers } = await github.rest.teams.listMembersInOrg({
+                org: 'openabdev',
+                team_slug: 'openab-maintainers',
+                per_page: 100
+              });
+              const maintainerLogins = new Set(maintainerMembers.map(m => m.login));
+              if (maintainerLogins.has(pr.user.login)) {
+                console.log(`Skipping discussion check for maintainer ${pr.user.login}`);
+                if (old) {
+                  await github.rest.issues.deleteComment({ ...context.repo, comment_id: old.id });
+                }
+                if (labels.includes(label)) {
+                  try { await github.rest.issues.removeLabel({ ...context.repo, issue_number: pr.number, name: label }); } catch (e) { if (e.status !== 404) throw e; }
+                }
+                return;
               }
-              if (labels.includes(label)) {
-                try { await github.rest.issues.removeLabel({ ...context.repo, issue_number: pr.number, name: label }); } catch (e) { if (e.status !== 404) throw e; }
-              }
-              return;
             }
 
             if (!hasDiscordUrl) {
