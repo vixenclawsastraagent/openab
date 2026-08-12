@@ -212,6 +212,9 @@ The evidence reports whether each PVC was bound to a distinct PV object and
 whether that PV identity survived replacement, compute suspension, and resume.
 Release evidence stops at PVC API-object absence: it deliberately does not
 claim that the provisioner physically deleted the backing disk.
+The `source.testedSha` field identifies the exact checked-out commit. On pull
+requests this can be GitHub's synthetic merge commit, so CI also records the
+contributor branch commit separately as `source.headSha`.
 
 That mode proves distinct Pod/PVC/ServiceAccount identities and resource
 limits, path-confined private marker state, immutable shared skills, enforced

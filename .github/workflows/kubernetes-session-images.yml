@@ -68,6 +68,7 @@ jobs:
       - name: Verify two isolated sessions in Kind
         env:
           OPENAB_KIND_EVIDENCE_FILE: ${{ runner.temp }}/kubernetes-session-isolation-evidence.json
+          OPENAB_KIND_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: sh scripts/test-kubernetes-session-kind.sh --isolation
 
       - name: Validate isolation evidence

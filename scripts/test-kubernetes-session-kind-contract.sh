@@ -153,11 +153,12 @@ assert_evidence_filter_failure() {
 VALID_EVIDENCE="$TEMPORARY_ROOT/valid-isolation-evidence.json"
 jq -n '
     {
-        schemaVersion: 1,
+        schemaVersion: 2,
         result: "passed",
         mode: "isolation",
         source: {
             testedSha: ("a" * 40),
+            headSha: ("b" * 40),
             treeState: "clean"
         },
         isolation: {
@@ -244,6 +245,8 @@ assert_evidence_filter_failure evidence-shared-pv-identity \
     '.isolation.sessionB.pvUid = .isolation.sessionA.pvUid' invalid
 assert_evidence_filter_failure evidence-replacement-pv-drift \
     '.lifecycle.replacement.pvUid = "different-pv"' invalid
+assert_evidence_filter_failure evidence-invalid-head-sha \
+    '.source.headSha = "not-a-git-object-id"' invalid
 
 endpoint_output=$(jq -r -f "$ENDPOINT_FILTER" "$ENDPOINT_FIXTURE")
 expected_endpoint_output='endpoint=172.18.0.2:6443'
@@ -1120,6 +1123,9 @@ grep -Fq 'kubernetes-session Kind test: isolation checks passed' "$TARGET" || {
 grep -Fq 'OPENAB_KIND_EVIDENCE_FILE' "$TARGET" || {
     fail "the isolation harness must expose opt-in evidence output"
 }
+grep -Fq 'OPENAB_KIND_HEAD_SHA' "$TARGET" || {
+    fail "the isolation evidence must distinguish head and checkout SHAs"
+}
 grep -Fq 'capture_bound_volume()' "$TARGET" || {
     fail "the isolation harness must verify each PVC-to-PV binding"
 }
@@ -1147,6 +1153,10 @@ grep -Fq 'jq -e -f tests/fixtures/kubernetes-session-kind/isolation-evidence.jq'
 }
 grep -Fq 'name: kubernetes-session-isolation-evidence' "$WORKFLOW" || {
     fail "the image workflow must upload reviewer-facing isolation evidence"
+}
+grep -Fq 'OPENAB_KIND_HEAD_SHA: ${{ github.event.pull_request.head.sha }}' \
+    "$WORKFLOW" || {
+    fail "the image workflow must record the pull-request head SHA"
 }
 grep -Fq 'run: sh scripts/test-kubernetes-session-kind.sh --isolation' \
     "$WORKFLOW" || {

@@ -18,13 +18,14 @@ and keys == [
     "schemaVersion",
     "source"
 ]
-and .schemaVersion == 1
+and .schemaVersion == 2
 and .result == "passed"
 and .mode == "isolation"
 and (
     .source
     | type == "object"
-    and keys == ["testedSha", "treeState"]
+    and keys == ["headSha", "testedSha", "treeState"]
+    and (.headSha | test("^([0-9a-f]{40}|[0-9a-f]{64})$"))
     and (.testedSha | test("^([0-9a-f]{40}|[0-9a-f]{64})$"))
     and (.treeState == "clean" or .treeState == "dirty")
 )

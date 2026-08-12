@@ -13,6 +13,7 @@ MODE=${1:-}
 EVIDENCE_FILE=${OPENAB_KIND_EVIDENCE_FILE:-}
 EVIDENCE_STAGE=''
 SOURCE_SHA=''
+SOURCE_HEAD_SHA=${OPENAB_KIND_HEAD_SHA:-}
 SOURCE_TREE_STATE=''
 
 KIND_NODE_IMAGE='kindest/node:v1.32.11@sha256:5fc52d52a7b9574015299724bd68f183702956aa4a2116ae75a63cb574b35af8'
@@ -69,6 +70,14 @@ prepare_evidence_output() {
         fail "OPENAB_KIND_EVIDENCE_FILE parent directory must not be a symlink"
     }
     SOURCE_SHA=$(git -C "$REPOSITORY_ROOT" rev-parse HEAD)
+    if [ -z "$SOURCE_HEAD_SHA" ]; then
+        SOURCE_HEAD_SHA=$SOURCE_SHA
+    fi
+    jq -ne --arg sha "$SOURCE_HEAD_SHA" '
+        $sha | test("^([0-9a-f]{40}|[0-9a-f]{64})$")
+    ' >/dev/null || {
+        fail "OPENAB_KIND_HEAD_SHA must be a lowercase Git object ID"
+    }
     if [ -z "$(git -C "$REPOSITORY_ROOT" status --porcelain)" ]; then
         SOURCE_TREE_STATE='clean'
     else
@@ -3158,6 +3167,7 @@ if [ -n "$EVIDENCE_FILE" ]; then
     EVIDENCE_STAGE=$(mktemp "$evidence_parent/.openab-kind-evidence.XXXXXX")
     jq -n \
         --arg tested_sha "$SOURCE_SHA" \
+        --arg head_sha "$SOURCE_HEAD_SHA" \
         --arg tree_state "$SOURCE_TREE_STATE" \
         --arg pod_uid_a "$WORKER_POD_UID" \
         --arg pvc_uid_a "$WORKSPACE_PVC_UID" \
@@ -3174,10 +3184,11 @@ if [ -n "$EVIDENCE_FILE" ]; then
         --argjson replacement_generation "$REPLACEMENT_GENERATION" \
         --argjson resume_generation "$RESUME_GENERATION" '
         {
-            schemaVersion: 1,
+            schemaVersion: 2,
             result: "passed",
             mode: "isolation",
             source: {
+                headSha: $head_sha,
                 testedSha: $tested_sha,
                 treeState: $tree_state
             },
