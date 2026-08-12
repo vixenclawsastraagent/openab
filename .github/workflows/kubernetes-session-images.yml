@@ -66,4 +66,19 @@ jobs:
         run: sh scripts/test-kubernetes-session-images.sh --build
 
       - name: Verify two isolated sessions in Kind
+        env:
+          OPENAB_KIND_EVIDENCE_FILE: ${{ runner.temp }}/kubernetes-session-isolation-evidence.json
         run: sh scripts/test-kubernetes-session-kind.sh --isolation
+
+      - name: Validate isolation evidence
+        run: >-
+          jq -e -f tests/fixtures/kubernetes-session-kind/isolation-evidence.jq
+          "$RUNNER_TEMP/kubernetes-session-isolation-evidence.json" > /dev/null
+
+      - name: Upload isolation evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: kubernetes-session-isolation-evidence
+          path: ${{ runner.temp }}/kubernetes-session-isolation-evidence.json
+          if-no-files-found: error
+          retention-days: 14

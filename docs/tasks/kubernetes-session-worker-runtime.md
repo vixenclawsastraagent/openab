@@ -441,11 +441,14 @@ and all default Dockerfiles against the Stage A baseline.
 
 ### Checkpoint F
 
-Archive the deterministic Kind output and Kubernetes object identifiers. A
-passing test must include negative filesystem and network assertions plus
-replacement, TTL, release, and peer-non-interference evidence.
+Archive the deterministic Kind output and Kubernetes object identifiers. The
+CI harness writes a schema-validated, allowlisted JSON artifact only after all
+assertions pass. A passing test must include negative filesystem and network
+assertions, distinct PVC-to-PV binding identities, replacement and TTL storage
+continuity, release, and peer-non-interference evidence. The artifact excludes
+session keys, logical session IDs, attempt IDs, workspace markers, and logs.
 
-Live evidence (2026-08-06 UTC): `Kubernetes Session Images`
+Historical CI evidence (2026-08-06 UTC): `Kubernetes Session Images`
 [run 31103234684](https://github.com/vixenclawsastraagent/openab/actions/runs/31103234684)
 and `smoke-test`
 [job 92621780179](https://github.com/vixenclawsastraagent/openab/actions/runs/31103234684/job/92621780179)
@@ -455,6 +458,16 @@ mixed-GVK inventory independently corroborates absence by deterministic names,
 captured UIDs, and session annotations; it is not an atomic Kubernetes
 snapshot. The test proves absence of the PVC Kubernetes API object, not
 physical reclamation of its backing PersistentVolume or cloud disk.
+
+Latest local evidence (2026-08-12 Asia/Taipei): the complete two-session Kind
+suite passed after merging `upstream/main` at `62453ac7`. It proved distinct
+Pod, PVC, PV, and ServiceAccount UIDs for sessions A and B; the same PVC and PV
+UID persisted through worker replacement, compute suspension, and resume; and
+explicit release removed the PVC API object without affecting session B. The
+observed pre-release PV policy was `Delete`, while backing-volume deletion
+remained explicitly `not-asserted`. The first evidence artifact records a dirty
+tree because it exercised the uncommitted harness change; a clean exact-SHA run
+and fork CI remain the final publication gates.
 
 ## Stage F: contribution readiness
 
@@ -506,7 +519,7 @@ physical reclamation of its backing PersistentVolume or cloud disk.
     - `helm template test charts/openab-kubernetes-session --set enabled=true --set-string 'networkPolicy.controller.apiServerCIDRs[0]=10.96.0.1/32' --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`
     - `helm unittest charts/openab-kubernetes-session`
     - `scripts/test-kubernetes-session-kind.sh --isolation`
-  - Current evidence (2026-08-06 UTC):
+  - Current evidence (updated 2026-08-12 Asia/Taipei):
     - PASS: root workspace check, test, both required clippy modes, gateway ACP
       (402 tests), ACP-MCP (5 tests), ACP pool (92 tests), root ACP (42 tests),
       and unified build.
@@ -516,14 +529,16 @@ physical reclamation of its backing PersistentVolume or cloud disk.
       empty output, digest-pinned enabled output, negative unsafe-value renders,
       POSIX shell syntax, image static checks, the offline Kind contract, and
       `git diff --check`.
-    - BASELINE: root `cargo fmt --all -- --check` reports the same repository-wide
-      formatting diff on clean detached `upstream/main` at `3ace7de3`; all Rust
-      files changed in the final core fixes and the standalone crate format
-      cleanly.
-    - LIVE: full two-session Kind isolation passed at `4e8f72cb` in
+    - BASELINE: root `cargo fmt --all -- --check` reports a repository-wide
+      formatting diff that predates this add-on; all add-on Rust files format
+      cleanly. Reproduction on a clean latest-upstream checkout remains part of
+      the final evidence record.
+    - CI: full two-session Kind isolation passed at `4e8f72cb` in
       [run 31103234684](https://github.com/vixenclawsastraagent/openab/actions/runs/31103234684).
-      The latest-head rerun remains the final gate after the fork branch is
-      pushed; local Docker/Kind is unavailable on this host.
+    - LOCAL LIVE: after merging latest `upstream/main`, the full suite passed
+      with distinct PV identity and storage-continuity checks. Its allowlisted
+      JSON evidence correctly limits release proof to PVC API-object absence.
+      A clean exact-SHA rerun and fork CI remain final gates after commit/push.
     - AUDIT: no release blocker remains. Production agent-flavour Git worktree
       E2E is still deferred; the proven filesystem claim is distinct private
       PVCs plus non-interfering fixed workspace marker state.

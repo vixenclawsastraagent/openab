@@ -13,6 +13,7 @@ ENDPOINT_FILTER="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/api-serve
 ENDPOINT_FIXTURE="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/api-server-endpoints.json"
 DEADLINE_FILTER="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/session-compute-deadline.jq"
 RELEASE_INVENTORY_FILTER="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/released-session-inventory.jq"
+EVIDENCE_FILTER="$SCRIPT_DIR/../tests/fixtures/kubernetes-session-kind/isolation-evidence.jq"
 PROCESS_CONFIG_SOURCE="$SCRIPT_DIR/../crates/openab-kubernetes-session/src/controller_process_config.rs"
 TEMPORARY_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/openab-session-kind-contract.XXXXXX")
 
@@ -121,6 +122,19 @@ run_release_inventory_filter() {
         > "$release_inventory_output"
 }
 
+assert_evidence_filter_failure() {
+    case_name=$1
+    mutation=$2
+    expected=$3
+    fixture="$TEMPORARY_ROOT/$case_name-evidence.json"
+
+    jq "$mutation" "$VALID_EVIDENCE" > "$fixture"
+    if jq -e -f "$EVIDENCE_FILTER" "$fixture" >/dev/null; then
+        fail "$case_name evidence unexpectedly passed validation"
+    fi
+    [ "$expected" = 'invalid' ] || fail "$case_name test contract is invalid"
+}
+
 [ -f "$TARGET" ] || fail "missing scripts/test-kubernetes-session-kind.sh"
 [ -f "$WORKFLOW" ] || fail "missing Kubernetes Session Images workflow"
 [ -f "$PROFILE_FIXTURE" ] || fail "missing Kind worker profile fixture"
@@ -133,7 +147,103 @@ run_release_inventory_filter() {
 [ -f "$RELEASE_INVENTORY_FILTER" ] || {
     fail "missing released-session inventory jq filter"
 }
+[ -f "$EVIDENCE_FILTER" ] || fail "missing isolation evidence jq filter"
 [ -f "$PROCESS_CONFIG_SOURCE" ] || fail "missing controller process config source"
+
+VALID_EVIDENCE="$TEMPORARY_ROOT/valid-isolation-evidence.json"
+jq -n '
+    {
+        schemaVersion: 1,
+        result: "passed",
+        mode: "isolation",
+        source: {
+            testedSha: ("a" * 40),
+            treeState: "clean"
+        },
+        isolation: {
+            sessionA: {
+                podUid: "pod-a",
+                pvcUid: "pvc-a",
+                pvUid: "pv-a",
+                serviceAccountUid: "sa-a"
+            },
+            sessionB: {
+                podUid: "pod-b",
+                pvcUid: "pvc-b",
+                pvUid: "pv-b",
+                serviceAccountUid: "sa-b"
+            },
+            uidsDistinct: {
+                pod: true,
+                pvc: true,
+                pv: true,
+                serviceAccount: true
+            },
+            workspaceProbe: "passed",
+            peerPvcMountAbsent: true,
+            sharedSkillsReadOnly: true
+        },
+        network: {
+            cniDefaultDenyProbe: "passed",
+            perSessionPolicyContract: "passed",
+            workerServicesAbsent: true,
+            controllerServiceExposure: "cluster-internal"
+        },
+        lifecycle: {
+            replacement: {
+                generation: 2,
+                podUidChanged: true,
+                pvcUidPreserved: true,
+                pvUid: "pv-a",
+                pvUidPreserved: true,
+                workspaceStatePreserved: true,
+                peerUnaffected: true
+            },
+            suspension: {
+                phase: "suspended",
+                computeResourcesAbsent: true,
+                pvcApiObjectRetained: true,
+                pvUid: "pv-a",
+                pvUidPreserved: true,
+                peerUnaffected: true
+            },
+            resume: {
+                generation: 3,
+                podUidChanged: true,
+                pvcUidPreserved: true,
+                pvUid: "pv-a",
+                pvUidPreserved: true,
+                workspaceStatePreserved: true
+            },
+            release: {
+                acknowledged: true,
+                pvcApiObjectAbsent: true,
+                backingVolumeReclaimProof: "not-asserted",
+                observedPreReleasePvReclaimPolicy: "Delete",
+                peerUnaffected: true
+            }
+        },
+        claimBoundary: {
+            fullDiscordIngressE2e: "not-tested",
+            productionAgentCli: "not-tested",
+            gitWorktreeIsolation: "not-tested",
+            backingVolumeDeletion: "not-asserted"
+        }
+    }
+' > "$VALID_EVIDENCE"
+jq -e -f "$EVIDENCE_FILTER" "$VALID_EVIDENCE" >/dev/null || {
+    fail "valid isolation evidence did not pass its schema"
+}
+assert_evidence_filter_failure evidence-overclaims-reclaim \
+    '.lifecycle.release.backingVolumeReclaimProof = "deleted"' invalid
+assert_evidence_filter_failure evidence-leaks-session-id \
+    '.sessionId = "sensitive"' invalid
+assert_evidence_filter_failure evidence-missing-pv-identity \
+    'del(.isolation.sessionB.pvUid)' invalid
+assert_evidence_filter_failure evidence-shared-pv-identity \
+    '.isolation.sessionB.pvUid = .isolation.sessionA.pvUid' invalid
+assert_evidence_filter_failure evidence-replacement-pv-drift \
+    '.lifecycle.replacement.pvUid = "different-pv"' invalid
 
 endpoint_output=$(jq -r -f "$ENDPOINT_FILTER" "$ENDPOINT_FIXTURE")
 expected_endpoint_output='endpoint=172.18.0.2:6443'
@@ -1006,6 +1116,37 @@ grep -Fq 'session A release affected session B' "$TARGET" || {
 }
 grep -Fq 'kubernetes-session Kind test: isolation checks passed' "$TARGET" || {
     fail "the isolation mode must have its own completion signal"
+}
+grep -Fq 'OPENAB_KIND_EVIDENCE_FILE' "$TARGET" || {
+    fail "the isolation harness must expose opt-in evidence output"
+}
+grep -Fq 'capture_bound_volume()' "$TARGET" || {
+    fail "the isolation harness must verify each PVC-to-PV binding"
+}
+grep -Fq '.spec.claimRef.uid == $pvc_uid' "$TARGET" || {
+    fail "bound PV verification must fence on the exact PVC UID"
+}
+grep -Fq '[ "$BOUND_PV_UID_A" != "$BOUND_PV_UID_B" ]' "$TARGET" || {
+    fail "the isolation harness must prove sessions use distinct PV objects"
+}
+grep -Fq '[ "$BOUND_PV_UID_A2" = "$BOUND_PV_UID_A" ]' "$TARGET" || {
+    fail "worker replacement must retain the session PV identity"
+}
+grep -Fq '[ "$BOUND_PV_UID_SUSPENDED_A" = "$BOUND_PV_UID_A" ]' "$TARGET" || {
+    fail "compute suspension must retain the session PV identity"
+}
+grep -Fq '[ "$BOUND_PV_UID_A3" = "$BOUND_PV_UID_A" ]' "$TARGET" || {
+    fail "worker resume must retain the session PV identity"
+}
+grep -Fq 'backingVolumeReclaimProof: "not-asserted"' "$TARGET" || {
+    fail "release evidence must not overclaim backing-volume reclamation"
+}
+grep -Fq 'jq -e -f tests/fixtures/kubernetes-session-kind/isolation-evidence.jq' \
+    "$WORKFLOW" || {
+    fail "the image workflow must validate the isolation evidence artifact"
+}
+grep -Fq 'name: kubernetes-session-isolation-evidence' "$WORKFLOW" || {
+    fail "the image workflow must upload reviewer-facing isolation evidence"
 }
 grep -Fq 'run: sh scripts/test-kubernetes-session-kind.sh --isolation' \
     "$WORKFLOW" || {

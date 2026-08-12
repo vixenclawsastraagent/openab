@@ -10,6 +10,10 @@ API_SERVER_ENDPOINT_FILTER="$FIXTURE_ROOT/api-server-endpoints.jq"
 COMPUTE_DEADLINE_FILTER="$FIXTURE_ROOT/session-compute-deadline.jq"
 RELEASED_SESSION_INVENTORY_FILTER="$FIXTURE_ROOT/released-session-inventory.jq"
 MODE=${1:-}
+EVIDENCE_FILE=${OPENAB_KIND_EVIDENCE_FILE:-}
+EVIDENCE_STAGE=''
+SOURCE_SHA=''
+SOURCE_TREE_STATE=''
 
 KIND_NODE_IMAGE='kindest/node:v1.32.11@sha256:5fc52d52a7b9574015299724bd68f183702956aa4a2116ae75a63cb574b35af8'
 SYSTEM_NAMESPACE='openab-system'
@@ -42,6 +46,36 @@ require_prerequisites() {
     }
 }
 
+prepare_evidence_output() {
+    [ -n "$EVIDENCE_FILE" ] || return 0
+    [ "$MODE" = '--isolation' ] || {
+        fail "OPENAB_KIND_EVIDENCE_FILE requires --isolation"
+    }
+    case "$EVIDENCE_FILE" in
+        /*)
+            ;;
+        *)
+            fail "OPENAB_KIND_EVIDENCE_FILE must be an absolute path"
+            ;;
+    esac
+    [ ! -e "$EVIDENCE_FILE" ] || {
+        fail "OPENAB_KIND_EVIDENCE_FILE target already exists"
+    }
+    evidence_parent=${EVIDENCE_FILE%/*}
+    [ -d "$evidence_parent" ] || {
+        fail "OPENAB_KIND_EVIDENCE_FILE parent directory does not exist"
+    }
+    [ ! -L "$evidence_parent" ] || {
+        fail "OPENAB_KIND_EVIDENCE_FILE parent directory must not be a symlink"
+    }
+    SOURCE_SHA=$(git -C "$REPOSITORY_ROOT" rev-parse HEAD)
+    if [ -z "$(git -C "$REPOSITORY_ROOT" status --porcelain)" ]; then
+        SOURCE_TREE_STATE='clean'
+    else
+        SOURCE_TREE_STATE='dirty'
+    fi
+}
+
 case "$MODE" in
     --check|--smoke|--isolation)
         ;;
@@ -51,6 +85,7 @@ case "$MODE" in
 esac
 
 require_prerequisites
+prepare_evidence_output
 
 if [ "$MODE" = '--check' ]; then
     printf '%s\n' 'kubernetes-session Kind test: prerequisites available'
@@ -65,6 +100,7 @@ for fixture in \
     api-server-endpoints.jq \
     session-compute-deadline.jq \
     released-session-inventory.jq \
+    isolation-evidence.jq \
     smoke.ndjson \
     workspace-isolation.ndjson \
     session-lifecycle.ndjson \
@@ -205,6 +241,13 @@ cleanup() {
         cleanup_failed=1
         printf '%s\n' \
             'kubernetes-session Kind test: failed to remove its temporary directory' >&2
+    fi
+    if [ -n "$EVIDENCE_STAGE" ] && [ -e "$EVIDENCE_STAGE" ]; then
+        if ! rm -f "$EVIDENCE_STAGE"; then
+            cleanup_failed=1
+            printf '%s\n' \
+                'kubernetes-session Kind test: failed to remove its staged evidence' >&2
+        fi
     fi
     if [ "$status" -eq 0 ] && [ "$cleanup_failed" -ne 0 ]; then
         status=1
@@ -601,6 +644,59 @@ kubernetes_resource_uid() {
         "$uid_resource_type" "$uid_resource_name" -o json > "$uid_snapshot"
     jq -er '.metadata.uid | select(type == "string" and length > 0)' \
         "$uid_snapshot" || fail "$uid_description has no Kubernetes UID"
+}
+
+capture_bound_volume() {
+    bound_pvc_name=$1
+    bound_pvc_uid=$2
+    bound_destination=$3
+    bound_description=$4
+    bound_pvc_snapshot="$bound_destination.pvc.json"
+    bound_pv_snapshot="$bound_destination.pv.json"
+
+    kubectl --request-timeout=5s -n "$WORKER_NAMESPACE" get \
+        persistentvolumeclaim "$bound_pvc_name" -o json \
+        > "$bound_pvc_snapshot"
+    bound_pv_name=$(jq -er \
+        --arg pvc_name "$bound_pvc_name" \
+        --arg pvc_uid "$bound_pvc_uid" '
+        if (
+            .metadata.name == $pvc_name
+            and .metadata.uid == $pvc_uid
+            and .status.phase == "Bound"
+            and (.spec.volumeName | type == "string" and length > 0)
+        ) then
+            .spec.volumeName
+        else
+            error("PVC is not bound with the expected identity")
+        end
+    ' "$bound_pvc_snapshot") || fail "$bound_description PVC binding was invalid"
+    kubectl --request-timeout=5s get persistentvolume "$bound_pv_name" -o json \
+        > "$bound_pv_snapshot"
+    jq -e \
+        --arg namespace "$WORKER_NAMESPACE" \
+        --arg pvc_name "$bound_pvc_name" \
+        --arg pvc_uid "$bound_pvc_uid" '
+        if (
+            (.metadata.uid | type == "string" and length > 0)
+            and .status.phase == "Bound"
+            and .spec.claimRef.namespace == $namespace
+            and .spec.claimRef.name == $pvc_name
+            and .spec.claimRef.uid == $pvc_uid
+            and (.spec.persistentVolumeReclaimPolicy | (
+                type == "string" and length > 0
+            ))
+        ) then
+            {
+                uid: .metadata.uid,
+                reclaimPolicy: .spec.persistentVolumeReclaimPolicy
+            }
+        else
+            error("PV is not bound to the exact session PVC")
+        end
+    ' "$bound_pv_snapshot" > "$bound_destination" || {
+        fail "$bound_description PV binding was invalid"
+    }
 }
 
 other_resource_name() {
@@ -2141,6 +2237,11 @@ WORKER_SERVICE_ACCOUNT_UID=$(kubectl -n "$WORKER_NAMESPACE" get serviceaccount \
 [ -n "$WORKER_SERVICE_ACCOUNT_UID" ] || {
     fail "worker ServiceAccount has no Kubernetes UID"
 }
+BOUND_VOLUME_A="$TEMPORARY_ROOT/bound-volume-a.json"
+capture_bound_volume "$WORKSPACE_PVC" "$WORKSPACE_PVC_UID" \
+    "$BOUND_VOLUME_A" 'session A workspace'
+BOUND_PV_UID_A=$(jq -r '.uid' "$BOUND_VOLUME_A")
+BOUND_PV_RECLAIM_POLICY_A=$(jq -r '.reclaimPolicy' "$BOUND_VOLUME_A")
 assert_anchor_owner pod "$WORKER_POD" "$ANCHOR_NAME" "$ANCHOR_UID" 'worker Pod'
 assert_anchor_owner persistentvolumeclaim "$WORKSPACE_PVC" \
     "$ANCHOR_NAME" "$ANCHOR_UID" 'workspace PVC'
@@ -2251,6 +2352,13 @@ if [ "$MODE" = '--isolation' ]; then
     [ -n "$WORKSPACE_PVC_UID_B" ] || fail "session B workspace PVC has no Kubernetes UID"
     [ -n "$WORKER_SERVICE_ACCOUNT_UID_B" ] || {
         fail "session B worker ServiceAccount has no Kubernetes UID"
+    }
+    BOUND_VOLUME_B="$TEMPORARY_ROOT/bound-volume-b.json"
+    capture_bound_volume "$WORKSPACE_PVC_B" "$WORKSPACE_PVC_UID_B" \
+        "$BOUND_VOLUME_B" 'session B workspace'
+    BOUND_PV_UID_B=$(jq -r '.uid' "$BOUND_VOLUME_B")
+    [ "$BOUND_PV_UID_A" != "$BOUND_PV_UID_B" ] || {
+        fail "two sessions unexpectedly use the same PersistentVolume"
     }
     POD_SERVICE_ACCOUNT_B=$(kubectl -n "$WORKER_NAMESPACE" get pod \
         "$WORKER_POD_B" -o jsonpath='{.spec.serviceAccountName}')
@@ -2571,6 +2679,13 @@ if [ "$MODE" = '--isolation' ]; then
         "$WORKER_SERVICE_ACCOUNT_A2" 'session A replacement ServiceAccount')
     WORKER_NETWORK_POLICY_UID_A2=$(kubernetes_resource_uid networkpolicy \
         "$WORKER_NETWORK_POLICY_A2" 'session A replacement NetworkPolicy')
+    BOUND_VOLUME_A2="$TEMPORARY_ROOT/bound-volume-a2.json"
+    capture_bound_volume "$WORKSPACE_PVC_A2" "$WORKSPACE_PVC_UID_A2" \
+        "$BOUND_VOLUME_A2" 'session A replacement workspace'
+    BOUND_PV_UID_A2=$(jq -r '.uid' "$BOUND_VOLUME_A2")
+    [ "$BOUND_PV_UID_A2" = "$BOUND_PV_UID_A" ] || {
+        fail "session A replacement changed its bound PersistentVolume"
+    }
 
     ANCHOR_REPLACEMENT_A="$TEMPORARY_ROOT/anchor-replacement-a.json"
     wait_for_anchor_state \
@@ -2766,6 +2881,13 @@ if [ "$MODE" = '--isolation' ]; then
         "$SESSION_ID_A" "$SUSPENDED_CHILDREN_A" \
         "$WORKSPACE_PVC_A2" "$WORKSPACE_PVC_UID_A2" \
         'session A compute suspension retained generation-scoped resources'
+    BOUND_VOLUME_SUSPENDED_A="$TEMPORARY_ROOT/bound-volume-suspended-a.json"
+    capture_bound_volume "$WORKSPACE_PVC_A2" "$WORKSPACE_PVC_UID_A2" \
+        "$BOUND_VOLUME_SUSPENDED_A" 'session A suspended workspace'
+    BOUND_PV_UID_SUSPENDED_A=$(jq -r '.uid' "$BOUND_VOLUME_SUSPENDED_A")
+    [ "$BOUND_PV_UID_SUSPENDED_A" = "$BOUND_PV_UID_A" ] || {
+        fail "session A compute suspension changed its bound PersistentVolume"
+    }
 
     CONTROLLER_FINGERPRINT_AFTER_TTL="$TEMPORARY_ROOT/controller-after-ttl.json"
     capture_controller_fingerprint "$CONTROLLER_FINGERPRINT_AFTER_TTL"
@@ -2879,6 +3001,13 @@ if [ "$MODE" = '--isolation' ]; then
         "$WORKER_SERVICE_ACCOUNT_A3" 'session A release ServiceAccount')
     WORKER_NETWORK_POLICY_UID_A3=$(kubernetes_resource_uid networkpolicy \
         "$WORKER_NETWORK_POLICY_A3" 'session A release NetworkPolicy')
+    BOUND_VOLUME_A3="$TEMPORARY_ROOT/bound-volume-a3.json"
+    capture_bound_volume "$WORKSPACE_PVC_A3" "$WORKSPACE_PVC_UID_A3" \
+        "$BOUND_VOLUME_A3" 'session A resumed workspace'
+    BOUND_PV_UID_A3=$(jq -r '.uid' "$BOUND_VOLUME_A3")
+    [ "$BOUND_PV_UID_A3" = "$BOUND_PV_UID_A" ] || {
+        fail "session A resume changed its bound PersistentVolume"
+    }
 
     ANCHOR_RELEASE_A="$TEMPORARY_ROOT/anchor-release-a.json"
     wait_for_anchor_state \
@@ -3019,6 +3148,118 @@ jq -e '
 ' "$WORKER_SERVICES_SNAPSHOT" >/dev/null || {
     fail "worker namespace exposes a Service"
 }
+
+if [ -n "$EVIDENCE_FILE" ]; then
+    REPLACEMENT_GENERATION=$(jq -r '.state.fence.generation' \
+        "$ANCHOR_REPLACEMENT_A")
+    RESUME_GENERATION=$(jq -r '.state.fence.generation' "$ANCHOR_RELEASE_A")
+    umask 077
+    evidence_parent=${EVIDENCE_FILE%/*}
+    EVIDENCE_STAGE=$(mktemp "$evidence_parent/.openab-kind-evidence.XXXXXX")
+    jq -n \
+        --arg tested_sha "$SOURCE_SHA" \
+        --arg tree_state "$SOURCE_TREE_STATE" \
+        --arg pod_uid_a "$WORKER_POD_UID" \
+        --arg pvc_uid_a "$WORKSPACE_PVC_UID" \
+        --arg pv_uid_a "$BOUND_PV_UID_A" \
+        --arg service_account_uid_a "$WORKER_SERVICE_ACCOUNT_UID" \
+        --arg pod_uid_b "$WORKER_POD_UID_B" \
+        --arg pvc_uid_b "$WORKSPACE_PVC_UID_B" \
+        --arg pv_uid_b "$BOUND_PV_UID_B" \
+        --arg service_account_uid_b "$WORKER_SERVICE_ACCOUNT_UID_B" \
+        --arg pv_uid_a2 "$BOUND_PV_UID_A2" \
+        --arg pv_uid_suspended_a "$BOUND_PV_UID_SUSPENDED_A" \
+        --arg pv_uid_a3 "$BOUND_PV_UID_A3" \
+        --arg reclaim_policy "$BOUND_PV_RECLAIM_POLICY_A" \
+        --argjson replacement_generation "$REPLACEMENT_GENERATION" \
+        --argjson resume_generation "$RESUME_GENERATION" '
+        {
+            schemaVersion: 1,
+            result: "passed",
+            mode: "isolation",
+            source: {
+                testedSha: $tested_sha,
+                treeState: $tree_state
+            },
+            isolation: {
+                sessionA: {
+                    podUid: $pod_uid_a,
+                    pvcUid: $pvc_uid_a,
+                    pvUid: $pv_uid_a,
+                    serviceAccountUid: $service_account_uid_a
+                },
+                sessionB: {
+                    podUid: $pod_uid_b,
+                    pvcUid: $pvc_uid_b,
+                    pvUid: $pv_uid_b,
+                    serviceAccountUid: $service_account_uid_b
+                },
+                uidsDistinct: {
+                    pod: true,
+                    pvc: true,
+                    pv: true,
+                    serviceAccount: true
+                },
+                workspaceProbe: "passed",
+                peerPvcMountAbsent: true,
+                sharedSkillsReadOnly: true
+            },
+            network: {
+                cniDefaultDenyProbe: "passed",
+                perSessionPolicyContract: "passed",
+                workerServicesAbsent: true,
+                controllerServiceExposure: "cluster-internal"
+            },
+            lifecycle: {
+                replacement: {
+                    generation: $replacement_generation,
+                    podUidChanged: true,
+                    pvcUidPreserved: true,
+                    pvUid: $pv_uid_a2,
+                    pvUidPreserved: true,
+                    workspaceStatePreserved: true,
+                    peerUnaffected: true
+                },
+                suspension: {
+                    phase: "suspended",
+                    computeResourcesAbsent: true,
+                    pvcApiObjectRetained: true,
+                    pvUid: $pv_uid_suspended_a,
+                    pvUidPreserved: true,
+                    peerUnaffected: true
+                },
+                resume: {
+                    generation: $resume_generation,
+                    podUidChanged: true,
+                    pvcUidPreserved: true,
+                    pvUid: $pv_uid_a3,
+                    pvUidPreserved: true,
+                    workspaceStatePreserved: true
+                },
+                release: {
+                    acknowledged: true,
+                    pvcApiObjectAbsent: true,
+                    backingVolumeReclaimProof: "not-asserted",
+                    observedPreReleasePvReclaimPolicy: $reclaim_policy,
+                    peerUnaffected: true
+                }
+            },
+            claimBoundary: {
+                fullDiscordIngressE2e: "not-tested",
+                productionAgentCli: "not-tested",
+                gitWorktreeIsolation: "not-tested",
+                backingVolumeDeletion: "not-asserted"
+            }
+        }
+    ' > "$EVIDENCE_STAGE"
+    jq -e -f "$FIXTURE_ROOT/isolation-evidence.jq" \
+        "$EVIDENCE_STAGE" >/dev/null || fail "isolation evidence was invalid"
+    ln "$EVIDENCE_STAGE" "$EVIDENCE_FILE" || {
+        fail "OPENAB_KIND_EVIDENCE_FILE target appeared during the test"
+    }
+    rm -f "$EVIDENCE_STAGE"
+    EVIDENCE_STAGE=''
+fi
 
 COMPLETED=1
 if [ "$MODE" = '--isolation' ]; then
