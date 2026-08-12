@@ -460,14 +460,13 @@ snapshot. The test proves absence of the PVC Kubernetes API object, not
 physical reclamation of its backing PersistentVolume or cloud disk.
 
 Latest local evidence (2026-08-12 Asia/Taipei): the complete two-session Kind
-suite passed after merging `upstream/main` at `62453ac7`. It proved distinct
-Pod, PVC, PV, and ServiceAccount UIDs for sessions A and B; the same PVC and PV
-UID persisted through worker replacement, compute suspension, and resume; and
-explicit release removed the PVC API object without affecting session B. The
-observed pre-release PV policy was `Delete`, while backing-volume deletion
-remained explicitly `not-asserted`. The first evidence artifact records a dirty
-tree because it exercised the uncommitted harness change; a clean exact-SHA run
-and fork CI remain the final publication gates.
+suite passed on clean exact branch SHA `5997edc8` after merging
+`upstream/main` at `448b05fb`. It proved distinct Pod, PVC, PV, and
+ServiceAccount UIDs for sessions A and B; the same PVC and PV UID persisted
+through worker replacement, compute suspension, and resume; and explicit
+release removed the PVC API object without affecting session B. The observed
+pre-release PV policy was `Delete`, while backing-volume deletion remained
+explicitly `not-asserted`. Fork CI remains the final publication gate.
 
 ## Stage F: contribution readiness
 
@@ -535,10 +534,10 @@ and fork CI remain the final publication gates.
       the final evidence record.
     - CI: full two-session Kind isolation passed at `4e8f72cb` in
       [run 31103234684](https://github.com/vixenclawsastraagent/openab/actions/runs/31103234684).
-    - LOCAL LIVE: after merging latest `upstream/main`, the full suite passed
-      with distinct PV identity and storage-continuity checks. Its allowlisted
-      JSON evidence correctly limits release proof to PVC API-object absence.
-      A clean exact-SHA rerun and fork CI remain final gates after commit/push.
+    - LOCAL LIVE: after merging latest `upstream/main`, the full suite passed on
+      clean exact SHA `5997edc8` with distinct PV identity and
+      storage-continuity checks. Its allowlisted JSON evidence correctly limits
+      release proof to PVC API-object absence. Fork CI remains the final gate.
     - AUDIT: no release blocker remains. Production agent-flavour Git worktree
       E2E is still deferred; the proven filesystem claim is distinct private
       PVCs plus non-interfering fixed workspace marker state.
