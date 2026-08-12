@@ -102,9 +102,9 @@ boundary.
   retained session. The anchor does not replace or reconstruct the broker
   mapping.
 - Durable agent state lives on the session-private PVC. Ephemeral runtime state
-  uses per-worker `emptyDir` volumes; neither storage class is shared between
-  sessions. Generation Secrets, ServiceAccounts, NetworkPolicies, and Pods are
-  replaceable children of the anchor.
+  uses per-worker `emptyDir` volumes; neither writable volume allocation is
+  shared between sessions. Generation Secrets, ServiceAccounts,
+  NetworkPolicies, and Pods are replaceable children of the anchor.
 - `worker-base` packages the supervisor only. `worker-test` adds the constrained
   fake ACP used by CI; neither is a supported production agent flavour.
 - Compute TTL schedules suspension of an expired `Ready` worker while
@@ -197,6 +197,21 @@ Run the complete two-session and lifecycle gate separately:
 ```console
 sh scripts/test-kubernetes-session-kind.sh --isolation
 ```
+
+To retain a reviewer-facing JSON summary of a successful isolation run, provide
+an absolute, non-existing output path. The file records only Kubernetes object
+UIDs and asserted outcomes; it excludes session keys, logical session IDs,
+attempt IDs, workspace markers, and logs.
+
+```sh
+OPENAB_KIND_EVIDENCE_FILE="$PWD/kubernetes-session-isolation-evidence.json" \
+  sh scripts/test-kubernetes-session-kind.sh --isolation
+```
+
+The evidence reports whether each PVC was bound to a distinct PV object and
+whether that PV identity survived replacement, compute suspension, and resume.
+Release evidence stops at PVC API-object absence: it deliberately does not
+claim that the provisioner physically deleted the backing disk.
 
 That mode proves distinct Pod/PVC/ServiceAccount identities and resource
 limits, path-confined private marker state, immutable shared skills, enforced
@@ -330,6 +345,42 @@ storage quotas remain required as independent cost bounds. Skills are mounted
 at `/opt/openab/skills` read-only. Each allowed business-service destination
 must appear in the trusted profile; neither a chat message nor ACP traffic can
 expand it.
+
+### Workspace storage
+
+Prepare a StorageClass before enabling a worker profile. For every logical
+session, the controller automatically creates a separately named PVC using the
+profile's `size`, `storage_class`, and `access_mode`; a dynamic provisioner is
+the recommended way to request its exclusively bound PV. A replacement worker
+for the same session remounts that PVC, while another session receives a
+different claim. Operators must verify that the provisioner or static PV pool
+never aliases distinct session claims to the same writable backing path or
+storage identity; distinct Kubernetes objects alone do not prove backend
+isolation.
+
+Use `read_write_once_pod` when the CSI driver supports it. Use
+`read_write_once` only as a compatibility fallback, including for the Kind
+fixture and common K3s `local-path` development clusters. RWO limits a volume
+to one node, not one Pod, so the controller's distinct-PVC and mount checks
+and the dedicated-namespace sole-writer trust assumption remain part of the
+boundary. The MVP does not preflight StorageClass or CSI capabilities;
+operators must validate provisioning, RWOP support, topology, node-loss
+recovery, and reclaim behavior before enabling a production profile. The
+current runtime does not support an `existingClaim`, controller-managed PV
+prebinding, selectors, snapshots, or clones. Do not mount one writable PVC into
+multiple session workers or divide it with `subPath`.
+
+For dynamically provisioned volumes, the StorageClass selects the reclaim
+policy inherited by the resulting PV. For static provisioning, configure the
+policy directly on each PV; a PVC cannot override it. Prefer `Delete` when
+released session disks should be reclaimed for cost control; use `Retain` only
+with an audited cleanup or recovery process. Topology-constrained storage
+should normally use `volumeBindingMode: WaitForFirstConsumer`. See the ADR's
+[storage provisioning and reclamation contract](../../docs/adr/kubernetes-session-isolation.md#62-storage-provisioning-and-reclamation)
+and the Kubernetes documentation for
+[dynamic provisioning](https://kubernetes.io/docs/concepts/storage/dynamic-provisioning/),
+[access modes](https://kubernetes.io/docs/concepts/storage/persistent-volumes/#access-modes),
+and [StorageClass policies](https://kubernetes.io/docs/concepts/storage/storage-classes/).
 
 Treat a published revision as append-only. To change image, command, resources,
 trust, skills, or network policy, add a new revision and move

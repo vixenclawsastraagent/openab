@@ -840,6 +840,79 @@ and [StorageClass reclaim policy](https://kubernetes.io/docs/concepts/storage/st
 Operators that require physical deletion guarantees must select and verify a
 compatible storage policy outside this controller's API-object proof.
 
+### 6.2 Storage provisioning and reclamation
+
+The worker-storage contract is one logical session, one deterministically
+named PVC, and one exclusive Kubernetes PVC-to-PV binding. The cluster operator
+supplies the StorageClass before enabling a profile; the controller creates
+neither StorageClasses nor PVs. Each immutable profile revision selects an
+explicit `workspace.storage_class`, `workspace.size`, and
+`workspace.access_mode`, and the controller creates the session-private
+`Filesystem` PVC from those values. With a dynamic provisioner, that claim
+requests a backing volume; when provisioning and binding succeed, the PV is
+exclusively bound to the session PVC. Kubernetes documents this division of
+responsibility under [Dynamic Volume Provisioning](https://kubernetes.io/docs/concepts/storage/dynamic-provisioning/)
+and [PersistentVolume binding](https://kubernetes.io/docs/concepts/storage/persistent-volumes/#binding).
+
+An operator may pre-provision separate PVs that ordinary Kubernetes binding can
+match to later session PVCs, but the MVP has no `existingClaim`, `volumeName`,
+claim selector, `dataSource`, snapshot, or clone contract. The controller and
+profile schema therefore provide no supported way to select or prebind a
+particular existing PV or PVC; any PV-side `claimRef` reservation is an
+operator-managed action outside the MVP lifecycle contract. One pre-created
+writable claim shared by multiple sessions, or an RWX claim divided with
+`subPath`, is prohibited: both collapse the requested volume boundary back into
+directory-level separation. Operators must also verify that the selected
+provisioner or static PV pool never aliases distinct session claims to the same
+writable backing path or storage identity; distinct Kubernetes objects alone
+do not prove backend isolation. Shared inputs remain immutable read-only
+ConfigMaps or controlled services, never the session's mutable workspace
+claim.
+
+Profiles support `read_write_once_pod` and `read_write_once` only. Prefer
+`ReadWriteOncePod` when the selected CSI driver and cluster support it because
+Kubernetes then restricts the claim to one Pod cluster-wide. `ReadWriteOnce`
+is the compatibility fallback used by the Kind test and common K3s local
+storage; it restricts read-write mounting to one node, not one Pod, and is not
+by itself the isolation boundary. The distinct claim, dedicated-namespace
+sole-writer trust assumption, worker Pod mount namespace, controller ownership
+checks, and absence of peer-volume mounts remain mandatory in either mode. The
+MVP does not preflight the selected StorageClass or CSI driver's capabilities.
+Operators must validate provisioning, RWOP support, topology, node-loss
+recovery, and reclamation before enabling a production profile. See Kubernetes
+[PersistentVolume access modes](https://kubernetes.io/docs/concepts/storage/persistent-volumes/#access-modes).
+
+For dynamically provisioned production storage, prefer a StorageClass with
+`volumeBindingMode: WaitForFirstConsumer` when topology or node placement
+matters. This lets scheduling constraints participate before the backing
+volume is selected or provisioned. For dynamically provisioned volumes, the
+StorageClass selects the reclaim policy inherited by the resulting PV. For
+static provisioning, operators configure the policy directly on each PV. A
+PVC cannot override it. `Delete` is the cost-oriented default for disposable
+session storage, while `Retain` is an explicit recovery or compliance choice
+that leaves backing storage for separate audited cleanup. See Kubernetes
+[volume binding mode](https://kubernetes.io/docs/concepts/storage/storage-classes/#volume-binding-mode)
+and [reclaim policy](https://kubernetes.io/docs/concepts/storage/storage-classes/#reclaim-policy).
+
+Replacement workers reuse the same session PVC. Compute suspension deletes the
+Pod but retains that claim. Explicit fenced release deletes the PVC API object;
+the storage-retention deadline remains advisory in the MVP. Namespace
+`ResourceQuota` must bound both PVC count and aggregate requested storage so
+the total requested capacity and PVC count of retained sessions remain
+cluster-bounded. For K3s, `local-path` is suitable for development, Kind-like
+validation, or an accepted node-local operating model; the K3s documentation
+states that its volumes use storage on the respective node, so it is not the
+recommended profile when session recovery must survive node loss. Such
+deployments should select and validate a CSI-backed managed or distributed
+StorageClass instead. See
+[K3s Volumes and Storage](https://docs.k3s.io/add-ons/storage).
+
+Volume expansion, snapshot/restore, cross-class migration, automatic
+destructive expiry, and proof of physical backend deletion are deferred. A
+later storage capability must preserve the per-session private-volume
+invariant and make its backup, restore, retention, and reclamation semantics
+explicit.
+
 This separation addresses the cost concern without weakening isolation:
 
 - the [scope-wide active-worker admission policy](#51-active-worker-capacity-admission)
@@ -1029,6 +1102,7 @@ decide:
 1. the first supported production worker flavour and image ownership;
 2. how a profile seeds a private repository checkout;
 3. default compute and storage retention policy;
-4. supported storage classes and access modes; and
+4. which CSI-backed StorageClass and driver combinations receive verified
+   production profiles; and
 5. whether a later shared controller should serve multiple authenticated
    scopes.
