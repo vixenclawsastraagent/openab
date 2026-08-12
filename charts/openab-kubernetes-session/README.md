@@ -361,6 +361,12 @@ never aliases distinct session claims to the same writable backing path or
 storage identity; distinct Kubernetes objects alone do not prove backend
 isolation.
 
+The persistent private PVC is mandatory in this MVP. HOME, the workspace, ACP
+state, and any future checkout cannot use an ephemeral `emptyDir`; only
+process-lifetime scratch paths do. This preserves state across replacement and
+compute suspend/resume. A lower-cost, Pod-lifetime workspace would require a
+future explicit profile mode with intentionally weaker persistence semantics.
+
 Use `read_write_once_pod` when the CSI driver supports it. Use
 `read_write_once` only as a compatibility fallback, including for the Kind
 fixture and common K3s `local-path` development clusters. RWO limits a volume
@@ -372,6 +378,13 @@ recovery, and reclaim behavior before enabling a production profile. The
 current runtime does not support an `existingClaim`, controller-managed PV
 prebinding, selectors, snapshots, or clones. Do not mount one writable PVC into
 multiple session workers or divide it with `subPath`.
+
+The controller accepts only its expected PVC binding metadata, Kubernetes PVC
+protection, and a bounded set of standard binding, provisioner, selected-node,
+and resizer annotations. Before production use, verify that admission,
+backup, and CSI integrations do not add other PVC labels, annotations, or
+finalizers; unexpected metadata makes adoption, reconciliation, or release
+fail closed.
 
 For dynamically provisioned volumes, the StorageClass selects the reclaim
 policy inherited by the resulting PV. For static provisioning, configure the

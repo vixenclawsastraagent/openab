@@ -854,6 +854,14 @@ exclusively bound to the session PVC. Kubernetes documents this division of
 responsibility under [Dynamic Volume Provisioning](https://kubernetes.io/docs/concepts/storage/dynamic-provisioning/)
 and [PersistentVolume binding](https://kubernetes.io/docs/concepts/storage/persistent-volumes/#binding).
 
+A persistent private claim is mandatory in the MVP. HOME, the workspace, ACP
+state, and any future checkout are not configurable as `emptyDir`; only
+process-lifetime scratch paths use per-Pod `emptyDir` volumes. This deliberate
+persistence trade-off lets replacement and compute suspend/resume preserve
+session state. An optional Pod-lifetime workspace would weaken that continuity
+contract and requires a later, explicit profile mode rather than an implicit
+fallback when storage provisioning fails.
+
 An operator may pre-provision separate PVs that ordinary Kubernetes binding can
 match to later session PVCs, but the MVP has no `existingClaim`, `volumeName`,
 claim selector, `dataSource`, snapshot, or clone contract. The controller and
@@ -881,6 +889,13 @@ MVP does not preflight the selected StorageClass or CSI driver's capabilities.
 Operators must validate provisioning, RWOP support, topology, node-loss
 recovery, and reclamation before enabling a production profile. See Kubernetes
 [PersistentVolume access modes](https://kubernetes.io/docs/concepts/storage/persistent-volumes/#access-modes).
+The controller also validates observed PVC metadata fail-closed. The MVP
+recognizes its own binding metadata, Kubernetes PVC protection, and a bounded
+set of standard binding, provisioner, selected-node, and resizer annotations.
+A CSI driver, admission policy, backup agent, or other integration that injects
+additional PVC labels, annotations, or finalizers is not a verified production
+combination: it can cause adoption, reconciliation, or release to reject the
+claim until that metadata contract is reviewed and supported.
 
 For dynamically provisioned production storage, prefer a StorageClass with
 `volumeBindingMode: WaitForFirstConsumer` when topology or node placement
@@ -907,11 +922,12 @@ deployments should select and validate a CSI-backed managed or distributed
 StorageClass instead. See
 [K3s Volumes and Storage](https://docs.k3s.io/add-ons/storage).
 
-Volume expansion, snapshot/restore, cross-class migration, automatic
+Ephemeral workspace profiles, extensible safe PVC-metadata compatibility,
+volume expansion, snapshot/restore, cross-class migration, automatic
 destructive expiry, and proof of physical backend deletion are deferred. A
 later storage capability must preserve the per-session private-volume
-invariant and make its backup, restore, retention, and reclamation semantics
-explicit.
+invariant and make its persistence, backup, restore, retention, and reclamation
+semantics explicit.
 
 This separation addresses the cost concern without weakening isolation:
 
