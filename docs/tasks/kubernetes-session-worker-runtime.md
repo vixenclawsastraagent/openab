@@ -21,9 +21,11 @@ Handoff snapshot (2026-08-18 Asia/Taipei):
   cited as verification of those commits.
 - Upstream `280db4db9452e7e108b52720fddf18dd8c3f5181` was merged without
   rebasing by `c7b484f012d055c38064ecc47782335f873ae88b`; the feature branch was
-  behind by zero commits immediately after that merge. Task 22 remains active
-  until the post-merge exact-head gates and evidence pass and the draft PR is
-  updated.
+  behind by zero commits immediately after that merge. Task 22 was completed
+  after post-merge exact-head gates, fork CI, schema-v2 evidence publication,
+  and the draft PR handoff were refreshed. The mutable PR body carries the
+  final contributor-head and GitHub-tested SHA because a commit cannot name its
+  own SHA.
 - `openab-cp` does not replace the durable Kubernetes lifecycle controller;
   its bounded registration, admission, queueing, and write patterns are future
   reuse candidates. The proposed `openab-pty` ADR's workspace adjacency is an
@@ -593,9 +595,10 @@ not a publication artifact, so fork CI must regenerate the evidence.
       this historical completion record for handoff readiness.
   - Commit: none when clean; any correction uses its own conventional commit.
 
-- [ ] **Task 22 — Final upstream sync and fork draft handoff.**
-  - Status: local post-merge verification complete on 2026-08-18; fork
-    publication, exact PR CI, and PR-body update remain active.
+- [x] **Task 22 — Final upstream sync and fork draft handoff.**
+  - Status: completed on 2026-08-18; upstream sync, local verification, fork
+    publication, exact PR CI/evidence, bounded self-review, and the PR-body
+    handoff were refreshed without opening an upstream issue or PR.
   - Depends on: Task 21.
   - Work: fetch `upstream/main`; merge new changes rather than rebasing the
     feature history; rerun affected and final gates; verify Git and active `gh`
@@ -626,8 +629,21 @@ not a publication artifact, so fork CI must regenerate the evidence.
       offline contracts, four clean-context image builds, and the complete Kind
       isolation gate passed. Root `cargo fmt --all -- --check` still reports the
       same repository-wide drift reproduced on clean `upstream/main@280db4db`;
-      the standalone add-on format gate passes. Fork publication and exact PR
-      CI remain required before this task can be checked.
+      the standalone add-on format gate passes.
+    - The first published post-merge checkpoint was clean contributor head
+      `a603d756bf236933105ea68313f72c719c62ec12`. Root
+      [CI run 32110302779](https://github.com/vixenclawsastraagent/openab/actions/runs/32110302779)
+      and Kubernetes Session Images
+      [run 32110302896](https://github.com/vixenclawsastraagent/openab/actions/runs/32110302896)
+      passed. Schema-v2 artifact `9315000786`, retained through 2026-09-01,
+      records that contributor head separately from GitHub's tested synthetic
+      merge `c05303aa8c755cf42c46e772927a944c3ec0f50f`.
+    - The bounded final self-review found one cancellation leak in lifecycle
+      request bookkeeping and mutable tags in the feature-owned evidence
+      workflow. Commits `5f3257f8` and `d5892ac4` add abort-safe pending-entry
+      cleanup with a regression test and pin the two Actions to immutable
+      commits. The final exact-head local evidence, fork CI run, synthetic
+      tested SHA, and artifact are recorded in draft PR #2.
   - Verify:
     - `git log -1 --format='%an <%ae>'`
     - `gh auth status`
@@ -638,8 +654,8 @@ not a publication artifact, so fork CI must regenerate the evidence.
     - `jq -e -f tests/fixtures/kubernetes-session-kind/isolation-evidence.jq "$EVIDENCE_DIR/kubernetes-session-isolation-evidence.json"`
     - `jq -e --arg head "$(git rev-parse HEAD)" '.schemaVersion == 2 and .result == "passed" and .mode == "isolation" and .source.headSha == $head and .source.testedSha == $head and .source.treeState == "clean"' "$EVIDENCE_DIR/kubernetes-session-isolation-evidence.json"`
     - `gh pr view 2 --repo vixenclawsastraagent/openab --json isDraft,headRefName,body,url`
-  - Commit: `chore(sync): merge upstream main` only if upstream advanced;
-    otherwise no commit.
+  - Commit: `chore(sync): merge upstream main` when upstream advances;
+    evidence-only closure may use `docs(kubernetes): complete final handoff`.
 
 ## Task review decision
 
