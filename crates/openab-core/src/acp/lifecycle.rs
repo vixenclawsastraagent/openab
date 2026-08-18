@@ -19,6 +19,55 @@ pub(crate) const MAPPING_ABSENT_INITIALIZATION_ERROR_CODE: i64 = -32041;
 
 pub(crate) type PendingRequests = Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>;
 
+/// Removes a response registration if its owning request future is cancelled.
+struct PendingRequestGuard {
+    id: u64,
+    pending: PendingRequests,
+    armed: bool,
+}
+
+impl PendingRequestGuard {
+    fn new(id: u64, pending: &PendingRequests) -> Self {
+        Self {
+            id,
+            pending: Arc::clone(pending),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    async fn remove(&mut self) {
+        self.pending.lock().await.remove(&self.id);
+        self.disarm();
+    }
+}
+
+impl Drop for PendingRequestGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        if let Ok(mut pending) = self.pending.try_lock() {
+            pending.remove(&self.id);
+            return;
+        }
+
+        // Drop cannot await a contended Tokio mutex, so detach the cleanup on
+        // the same runtime that was polling the request future.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let id = self.id;
+            let pending = Arc::clone(&self.pending);
+            handle.spawn(async move {
+                pending.lock().await.remove(&id);
+            });
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct LifecycleCapabilities {
     pub(crate) close: bool,
@@ -83,21 +132,25 @@ where
     let data = serde_json::to_string(&request)?;
     let (response_tx, response_rx) = oneshot::channel();
     pending.lock().await.insert(id, response_tx);
+    let mut pending_guard = PendingRequestGuard::new(id, pending);
 
     debug!(data = data.trim(), "acp_send");
     if let Err(error) = write_bounded_line(writer, &data, write_timeout).await {
-        pending.lock().await.remove(&id);
+        pending_guard.remove().await;
         return Err(error);
     }
 
     let response = match tokio::time::timeout(response_timeout, response_rx).await {
-        Ok(Ok(response)) => response,
+        Ok(Ok(response)) => {
+            pending_guard.disarm();
+            response
+        }
         Ok(Err(_)) => {
-            pending.lock().await.remove(&id);
+            pending_guard.disarm();
             return Err(anyhow!("channel closed waiting for {method}"));
         }
         Err(_) => {
-            pending.lock().await.remove(&id);
+            pending_guard.remove().await;
             return Err(anyhow!("timeout waiting for {method} response"));
         }
     };
@@ -767,6 +820,58 @@ mod tests {
         request.await.unwrap().unwrap();
         assert_eq!(next_id.load(Ordering::Relaxed), 8);
         assert!(pending.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn aborted_bounded_request_removes_pending_entry() {
+        let (writer, _peer) = duplex(8 * 1024);
+        let writer = Arc::new(Mutex::new(writer));
+        let writer_guard = writer.lock().await;
+        let pending = pending_requests();
+        let next_id = Arc::new(AtomicU64::new(1));
+        let request = tokio::spawn({
+            let writer = Arc::clone(&writer);
+            let pending = Arc::clone(&pending);
+            let next_id = Arc::clone(&next_id);
+            async move {
+                send_bounded_request(
+                    &writer,
+                    &next_id,
+                    &pending,
+                    "session/close",
+                    Some(json!({"sessionId": "outer-session"})),
+                    Duration::from_secs(60),
+                    Duration::from_secs(60),
+                )
+                .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if pending.lock().await.contains_key(&1) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("request should register its pending response");
+
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if pending.lock().await.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborted request should remove its pending response");
+
+        drop(writer_guard);
     }
 
     #[tokio::test]
