@@ -1,0 +1,6 @@
+apiVersion: v2
+name: openab-kubernetes-session
+description: Optional controller for one isolated Kubernetes worker Pod per OpenAB session.
+type: application
+version: 0.1.0
+appVersion: "0.10.0"

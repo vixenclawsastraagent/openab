@@ -50,6 +50,16 @@ jobs:
         run: cargo clippy --workspace --features unified -- -D warnings
       - name: cargo test
         run: cargo test --workspace
+      # Kubernetes client dependencies remain feature-gated so ordinary OpenAB builds do not
+      # acquire a controller runtime path. Exercise the complete opt-in runtime explicitly.
+      - name: cargo check (Kubernetes session base)
+        run: cargo check --manifest-path crates/openab-kubernetes-session/Cargo.toml --locked --no-default-features
+      - name: cargo clippy (Kubernetes session controller library)
+        run: cargo clippy --manifest-path crates/openab-kubernetes-session/Cargo.toml --locked --all-targets --features controller -- -D warnings
+      - name: cargo clippy (Kubernetes session runtimes)
+        run: cargo clippy --manifest-path crates/openab-kubernetes-session/Cargo.toml --locked --all-targets --all-features -- -D warnings
+      - name: cargo test (Kubernetes session runtimes)
+        run: cargo test --manifest-path crates/openab-kubernetes-session/Cargo.toml --locked --all-features
       # `cargo test --workspace` builds with default features, so openab-gateway's `acp`-gated
       # conformance/handler/streaming tests never compile or run. Exercise them explicitly, and
       # build the unified binary so the embedded /acp endpoint is compiled in CI. Scoped to

@@ -1,0 +1,20 @@
+schema_version = 1
+scope = "kind-smoke"
+worker_namespace = "openab-sessions"
+profiles_file = "/etc/openab-kubernetes-session/profiles/profiles.toml"
+
+[listen]
+relay_address = "0.0.0.0:8443"
+probe_address = "0.0.0.0:8080"
+
+[tls]
+certificate_file = "/var/run/openab-kubernetes-session/tls/tls.crt"
+private_key_file = "/var/run/openab-kubernetes-session/tls/tls.key"
+
+[authentication]
+bridge_credential_file = "/var/run/openab-kubernetes-session/auth/token"
+
+[relay]
+max_connections = 16
+queue_capacity = 8
+byte_budget_bytes = 134217728

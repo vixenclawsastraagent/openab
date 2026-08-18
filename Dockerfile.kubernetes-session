@@ -1,0 +1,104 @@
+# Standalone, opt-in artifacts for Kubernetes session isolation. These targets
+# do not replace or modify any default OpenAB image.
+
+ARG RUNTIME_IMAGE=debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
+
+# Build the add-on from its independent locked workspace. Each artifact stage
+# selects only the features required by that runtime role.
+FROM rust:1-bookworm@sha256:5e2214abe154fe26e39f64488952e5c991eeed1d6d6da7cc8381ae83927f0cfc AS session-source
+WORKDIR /build
+COPY crates/openab-kubernetes-session/Cargo.toml crates/openab-kubernetes-session/Cargo.lock ./
+COPY crates/openab-kubernetes-session/src/ src/
+
+FROM session-source AS bridge-builder
+RUN cargo build --locked --release --no-default-features \
+        --features bridge-runtime \
+        --bin openab-kubernetes-session \
+    && install -D -m 0755 target/release/openab-kubernetes-session \
+        /out/openab-kubernetes-session
+
+FROM session-source AS controller-builder
+RUN cargo build --locked --release --no-default-features \
+        --features controller-runtime \
+        --bin openab-kubernetes-session-controller \
+    && install -D -m 0755 target/release/openab-kubernetes-session-controller \
+        /out/openab-kubernetes-session-controller
+
+FROM session-source AS worker-builder
+RUN cargo build --locked --release --no-default-features \
+        --features worker-runtime \
+        --bin openab-kubernetes-session-worker \
+    && install -D -m 0755 target/release/openab-kubernetes-session-worker \
+        /out/openab-kubernetes-session-worker
+
+FROM worker-builder AS worker-test-builder
+RUN cargo build --locked --release --no-default-features \
+        --features fake-acp \
+        --bin openab-kubernetes-session-fake-acp \
+    && install -D -m 0755 target/release/openab-kubernetes-session-fake-acp \
+        /out/openab-kubernetes-session-fake-acp
+
+# The broker target keeps the existing OpenAB process and adds only the
+# Kubernetes ACP bridge executable. Its dependency-cache layout intentionally
+# follows the repository's established builder pattern.
+FROM rust:1-bookworm@sha256:5e2214abe154fe26e39f64488952e5c991eeed1d6d6da7cc8381ae83927f0cfc AS openab-builder
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates/openab-core/Cargo.toml crates/openab-core/Cargo.toml
+COPY crates/openab-gateway/Cargo.toml crates/openab-gateway/Cargo.toml
+COPY crates/openab-mcp/Cargo.toml crates/openab-mcp/Cargo.toml
+COPY crates/openab-cp/Cargo.toml crates/openab-cp/Cargo.toml
+RUN mkdir -p src crates/openab-core/src crates/openab-gateway/src crates/openab-mcp/src crates/openab-cp/src \
+    && printf 'fn main() {}\n' > src/main.rs \
+    && printf '\n' > crates/openab-core/src/lib.rs \
+    && printf '\n' > crates/openab-gateway/src/lib.rs \
+    && printf '\n' > crates/openab-mcp/src/lib.rs \
+    && printf '\n' > crates/openab-cp/src/lib.rs \
+    && cargo build --locked --release --bin openab \
+    && rm -rf src crates/openab-core/src crates/openab-gateway/src crates/openab-mcp/src crates/openab-cp/src
+COPY src/ src/
+COPY crates/openab-core/ crates/openab-core/
+COPY crates/openab-gateway/ crates/openab-gateway/
+COPY crates/openab-mcp/ crates/openab-mcp/
+COPY crates/openab-cp/ crates/openab-cp/
+RUN touch src/main.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/lib.rs crates/openab-mcp/src/lib.rs crates/openab-cp/src/lib.rs \
+    && cargo build --locked --release --bin openab \
+    && install -D -m 0755 target/release/openab /out/openab
+
+# Shared runtime is deliberately small: TLS roots, PID 1 handling, and one
+# fixed non-root identity. Writable state must arrive through explicit mounts.
+FROM ${RUNTIME_IMAGE} AS session-runtime
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 1000 agent \
+    && useradd --uid 1000 --gid 1000 --create-home \
+        --home-dir /home/agent --shell /usr/sbin/nologin agent
+ENV HOME=/home/agent
+WORKDIR /home/agent
+USER 1000:1000
+ENTRYPOINT ["/usr/bin/tini", "--"]
+
+FROM session-runtime AS broker
+COPY --from=openab-builder /out/openab /usr/local/bin/openab
+COPY --from=bridge-builder /out/openab-kubernetes-session /usr/local/bin/openab-kubernetes-session
+CMD ["/usr/local/bin/openab", "run", "-c", "/etc/openab/config.toml"]
+
+FROM session-runtime AS controller
+COPY --from=controller-builder /out/openab-kubernetes-session-controller /usr/local/bin/openab-kubernetes-session-controller
+CMD ["/usr/local/bin/openab-kubernetes-session-controller", "--config-file", "/etc/openab-kubernetes-session/controller.toml"]
+
+FROM session-runtime AS worker-base
+USER root
+RUN usermod --home /session/home agent
+ENV HOME=/session/home \
+    OPENAB_SESSION_ROOT=/session \
+    OPENAB_WORKSPACE=/session/workspace
+WORKDIR /
+COPY --from=worker-builder /out/openab-kubernetes-session-worker /usr/local/bin/openab-kubernetes-session-worker
+USER 1000:1000
+CMD ["/usr/local/bin/openab-kubernetes-session-worker"]
+
+FROM worker-base AS worker-test
+COPY --from=worker-test-builder /out/openab-kubernetes-session-fake-acp /usr/local/bin/openab-kubernetes-session-fake-acp
+CMD ["/usr/local/bin/openab-kubernetes-session-worker", "serve", "--", "/usr/local/bin/openab-kubernetes-session-fake-acp"]

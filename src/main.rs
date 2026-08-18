@@ -525,6 +525,7 @@ async fn main() -> anyhow::Result<()> {
     // session-aware in-process source — one listener, per-session identity
     // via broker-minted tokens; no per-session proxy servers.
     let facade_sessions = openab_mcp::mcp::sources::SessionTokens::new();
+    let kubernetes_session_enabled = cfg.kubernetes_session.is_some();
     // Only read under the acp feature (pool facade wiring below).
     #[cfg(feature = "acp")]
     let facade_serving = cfg.mcp.is_some();
@@ -534,8 +535,15 @@ async fn main() -> anyhow::Result<()> {
     // reports the variable now.
     // Gated on `acp` (the root feature that pulls in core's `acp-mcp`), not on `acp-mcp` itself —
     // that is a core feature and naming it here is an unknown-cfg error.
+    if kubernetes_session_enabled && cfg.mcp.is_some() {
+        tracing::warn!(
+            "[mcp] remains broker-local in Kubernetes session mode; isolated workers receive no facade URL, OPENAB_SESSION_TOKEN, or .openab/mcp-facade.json"
+        );
+    }
     #[cfg(feature = "acp")]
-    openab_core::acp_mcp::report_facade_status(cfg.mcp.is_some(), &cfg.agent.working_dir);
+    if !kubernetes_session_enabled {
+        openab_core::acp_mcp::report_facade_status(cfg.mcp.is_some(), &cfg.agent.working_dir);
+    }
     if let Some(mcp_cfg) = cfg.mcp.clone() {
         let listen = mcp_cfg.listen.clone();
         let tokens = facade_sessions.clone();
@@ -559,32 +567,60 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let pool_inner = acp::SessionPool::new(
-        cfg.agent,
-        cfg.pool.max_sessions,
-        cfg.pool
-            .prompt_hard_timeout_secs
-            .saturating_add(cfg.pool.hung_grace_secs),
-        cfg.pool.default_config_options,
-    );
+    let kubernetes_scope = cfg
+        .kubernetes_session
+        .as_ref()
+        .map(|runtime| runtime.scope.clone());
+    #[cfg(feature = "acp")]
+    let facade_url = facade_serving.then(|| {
+        format!(
+            "http://{}/mcp",
+            cfg.mcp
+                .as_ref()
+                .map(|m| m.listen.as_str())
+                .unwrap_or("127.0.0.1:8848")
+        )
+    });
+    let agent_config = cfg.agent;
+    let max_sessions = cfg.pool.max_sessions;
+    let hung_threshold_secs = cfg
+        .pool
+        .prompt_hard_timeout_secs
+        .saturating_add(cfg.pool.hung_grace_secs);
+    let ttl_secs = cfg.pool.session_ttl_hours * 3600;
+    let default_config_options = cfg.pool.default_config_options;
+    let pool_inner = match kubernetes_scope {
+        Some(scope) => acp::SessionPool::try_new_with_kubernetes_session_isolation(
+            agent_config,
+            max_sessions,
+            hung_threshold_secs,
+            default_config_options,
+            &scope,
+        )?,
+        None => acp::SessionPool::new(
+            agent_config,
+            max_sessions,
+            hung_threshold_secs,
+            default_config_options,
+        ),
+    };
     // Facade session wiring: only when the facade is actually serving. With no `[mcp]` there is
     // no registrar and no facade url, and the pool simply starts sessions without browser
-    // capabilities — there is no longer a proxy path for it to fall back to.
+    // capabilities. Strict workers live in another Pod and never receive the
+    // broker-local URL, config file, or token.
     #[cfg(feature = "acp")]
-    let pool_inner = pool_inner.with_facade_sessions(
-        facade_serving.then(|| {
-            Arc::new(acp_tunnel_source::FacadeRegistrar(facade_sessions.clone()))
-                as Arc<dyn openab_core::acp_mcp::SessionTokenRegistrar>
-        }),
-        facade_serving.then(|| {
-            format!(
-                "http://{}/mcp",
-                cfg.mcp.as_ref().map(|m| m.listen.as_str()).unwrap_or("127.0.0.1:8848")
-            )
-        }),
-    );
+    let pool_inner = if kubernetes_session_enabled {
+        pool_inner
+    } else {
+        pool_inner.with_facade_sessions(
+            facade_serving.then(|| {
+                Arc::new(acp_tunnel_source::FacadeRegistrar(facade_sessions.clone()))
+                    as Arc<dyn openab_core::acp_mcp::SessionTokenRegistrar>
+            }),
+            facade_url,
+        )
+    };
     let pool = Arc::new(pool_inner);
-    let ttl_secs = cfg.pool.session_ttl_hours * 3600;
 
     // Resolve STT config (auto-detect GROQ_API_KEY from env)
     if cfg.stt.enabled {

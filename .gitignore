@@ -1,5 +1,6 @@
 /target
 gateway/target/
+crates/openab-kubernetes-session/target/
 config.toml
 *.swp
 .DS_Store

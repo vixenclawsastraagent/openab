@@ -1,3 +1,7 @@
+mod kubernetes_session;
+
+pub use kubernetes_session::KubernetesSessionConfig;
+
 use crate::markdown::TableMode;
 use regex::Regex;
 use serde::Deserialize;
@@ -133,7 +137,8 @@ fn default_mcp_listen() -> String {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct AgentCoreConfig {    /// AgentCore Runtime ARN (required)
+pub struct AgentCoreConfig {
+    /// AgentCore Runtime ARN (required)
     pub runtime_arn: String,
     /// ACP agent command to run in the PTY shell (default: kiro-cli acp --trust-all-tools)
     #[serde(default = "default_agentcore_shell_command")]
@@ -245,6 +250,8 @@ pub struct Config {
     pub teams: Option<TeamsConfig>,
     pub feishu: Option<FeishuConfig>,
     pub agentcore: Option<AgentCoreConfig>,
+    /// Optional, default-off Kubernetes session-isolation runtime.
+    pub kubernetes_session: Option<KubernetesSessionConfig>,
     /// OAB MCP Facade (`[mcp]` — OAB MCP Adapter ADR §6.2/§6.3). Presence is
     /// the opt-in signal: absent = no facade, no listener, no new behavior.
     pub mcp: Option<McpFacadeConfig>,
@@ -2210,6 +2217,8 @@ async fn load_config_from_url(url: &str) -> anyhow::Result<Config> {
 fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
     let mut config: Config = toml::from_str(expanded)
         .map_err(|e| anyhow::anyhow!("failed to parse config from {source}: {e}"))?;
+
+    kubernetes_session::apply(&mut config)?;
 
     // Resolve Discord shortcodes in reactions.mapping keys.
     // Allows operators to write `:thumbsup: = "OK"` instead of `"👍" = "OK"`.

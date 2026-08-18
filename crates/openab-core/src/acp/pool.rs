@@ -1,8 +1,17 @@
-use crate::acp::connection::{AcpConnection, SessionActivity};
+mod isolated;
+
+use crate::acp::connection::{
+    AcpConnection, BrokerMappingExpectation, LifecycleHandle, SessionActivity,
+};
+use crate::acp::lifecycle::MappingAbsentInitialization;
 use crate::acp::protocol::ConfigOption;
+use crate::acp::SessionContextMode;
 use crate::config::AgentConfig;
 use anyhow::{anyhow, Result};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -13,6 +22,137 @@ use tracing::{info, warn};
 /// transient failure worth preserving the session ID for retry, as opposed to
 /// a permanent agent-side rejection.
 const TRANSIENT_LOAD_ERRORS: &[&str] = &["timeout waiting for", "channel closed"];
+const KUBERNETES_RUNTIME_STATE_VERSION: &str = "kubernetes-v1";
+const MAX_KUBERNETES_SCOPE_BYTES: usize = 253;
+
+fn kubernetes_scope_partition(scope: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"openab-scope-v1");
+    hasher.update([0]);
+    hasher.update(scope.as_bytes());
+    let digest = hasher.finalize();
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
+}
+
+fn validate_kubernetes_scope(scope: &str) -> Result<()> {
+    if scope.trim().is_empty() || scope != scope.trim() || scope.len() > MAX_KUBERNETES_SCOPE_BYTES
+    {
+        return Err(anyhow!(
+            "Kubernetes session scope must be non-empty, trimmed, and at most {MAX_KUBERNETES_SCOPE_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
+
+fn kubernetes_openab_dir_from_home(home: Option<OsString>) -> Result<PathBuf> {
+    let home = home
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("HOME must be set for Kubernetes session isolation"))?;
+    if !home.is_absolute() || home.parent().is_none() {
+        return Err(anyhow!(
+            "HOME must be an absolute, non-root directory for Kubernetes session isolation"
+        ));
+    }
+    let metadata = std::fs::metadata(&home)
+        .map_err(|error| anyhow!("failed to inspect HOME {}: {error}", home.display()))?;
+    if !metadata.is_dir() {
+        return Err(anyhow!(
+            "HOME {} is not a directory for Kubernetes session isolation",
+            home.display()
+        ));
+    }
+    let home = std::fs::canonicalize(&home)
+        .map_err(|error| anyhow!("failed to resolve HOME {}: {error}", home.display()))?;
+    if !home.is_absolute() || home.parent().is_none() {
+        return Err(anyhow!(
+            "resolved HOME must be an absolute, non-root directory for Kubernetes session isolation"
+        ));
+    }
+    Ok(home.join(".openab"))
+}
+
+fn reject_unsafe_mapping_entry(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(anyhow!(
+            "Kubernetes session mapping {} must not be a symbolic link",
+            path.display()
+        )),
+        Ok(metadata) if !metadata.is_file() => Err(anyhow!(
+            "Kubernetes session mapping {} is not a regular file",
+            path.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(anyhow!(
+            "failed to inspect Kubernetes session mapping {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn reject_symlinked_runtime_path(root: &Path, target: &Path) -> Result<()> {
+    let relative = target.strip_prefix(root).map_err(|_| {
+        anyhow!(
+            "Kubernetes session state path {} escapes {}",
+            target.display(),
+            root.display()
+        )
+    })?;
+    let mut current = root.to_path_buf();
+    for component in std::iter::once(root.as_os_str()).chain(relative.iter()) {
+        if component != root.as_os_str() {
+            current.push(component);
+        }
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(anyhow!(
+                    "Kubernetes session state path {} must not contain symbolic links",
+                    current.display()
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(anyhow!(
+                    "Kubernetes session state path {} is not a directory",
+                    current.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(anyhow!(
+                    "failed to inspect Kubernetes session state path {}: {error}",
+                    current.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn create_private_runtime_directory(root: &Path, path: &Path) -> Result<()> {
+    reject_symlinked_runtime_path(root, path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700).create(path)?;
+        reject_symlinked_runtime_path(root, path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)?;
+        reject_symlinked_runtime_path(root, path)?;
+    }
+
+    Ok(())
+}
 
 /// Combined state protected by a single lock to prevent deadlocks.
 /// Lock ordering: never await a per-connection mutex while holding `state`.
@@ -22,6 +162,9 @@ struct PoolState {
     /// Lock-free cancel handles: thread_key → (stdin, session_id).
     /// Stored separately so cancel can work without locking the connection.
     cancel_handles: HashMap<String, CancelHandle>,
+    /// Acknowledged lifecycle controls exist only for explicitly configured
+    /// isolated-session bridges.
+    lifecycle_handles: HashMap<String, LifecycleHandle>,
     /// Lock-free facade tokens: thread_key → the exact `OPENAB_SESSION_TOKEN` minted for the
     /// connection currently under that key. Stored here, not just inside the connection, so hung
     /// eviction can revoke the exact token **synchronously** — the `AcpConnection` DropGuard that
@@ -54,13 +197,18 @@ struct PoolState {
 pub struct SessionPool {
     state: RwLock<PoolState>,
     config: AgentConfig,
+    session_context: SessionContextMode,
     max_sessions: usize,
     /// Force-evict sessions stuck in-flight longer than this threshold
     /// (`prompt_hard_timeout_secs + hung_grace_secs`, wired in main.rs).
     hung_threshold_secs: u64,
     mapping_path: PathBuf,
     meta_path: PathBuf,
+    mapping_load_error: Option<String>,
     default_config_options: HashMap<String, String>,
+    /// Strict-runtime capacity includes workers that are still provisioning;
+    /// default local/AgentCore behavior never consults it.
+    strict_capacity: isolated::StrictCapacity,
     #[cfg(feature = "acp-mcp")]
     session_registrar: Option<Arc<dyn crate::acp_mcp::SessionTokenRegistrar>>,
     #[cfg(feature = "acp-mcp")]
@@ -68,6 +216,7 @@ pub struct SessionPool {
 }
 
 type CancelHandle = (Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>, String);
+type SessionGate = Arc<Mutex<()>>;
 type ActiveSnapshot = Vec<(String, Arc<Mutex<AcpConnection>>)>;
 type EvictionCandidate = (String, Arc<Mutex<AcpConnection>>, Instant, Option<String>);
 
@@ -90,6 +239,30 @@ fn get_or_insert_gate(map: &mut HashMap<String, Arc<Mutex<()>>>, key: &str) -> A
     map.entry(key.to_string())
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone()
+}
+
+fn durable_mapping_expectation(
+    expected_persisted_session_id: Option<&str>,
+) -> BrokerMappingExpectation {
+    if expected_persisted_session_id.is_some() {
+        BrokerMappingExpectation::Present
+    } else {
+        BrokerMappingExpectation::Absent
+    }
+}
+
+fn resolve_effective_workdir(
+    mode: SessionContextMode,
+    stored: Option<&str>,
+    requested: Option<&str>,
+    default: &str,
+) -> Result<String> {
+    if mode == SessionContextMode::OpenabV1 && (stored.is_some() || requested.is_some()) {
+        return Err(anyhow!(
+            "Kubernetes session mode does not accept broker workspace paths"
+        ));
+    }
+    Ok(stored.or(requested).unwrap_or(default).to_string())
 }
 
 /// Returns true when a session should be treated as stale during idle cleanup.
@@ -175,6 +348,7 @@ async fn setup_facade_session(
 /// the old process still owns an in-flight turn.
 fn purge_session_entries(state: &mut PoolState, key: &str) {
     state.cancel_handles.remove(key);
+    state.lifecycle_handles.remove(key);
     state.activity.remove(key);
     state.pgids.remove(key);
     state.suspended.remove(key);
@@ -285,12 +459,110 @@ impl SessionPool {
         let _ = std::fs::create_dir_all(&openab_dir);
         let mapping_path = openab_dir.join("thread_map.json");
         let meta_path = openab_dir.join("session_meta.json");
-        let suspended = Self::load_mapping(&mapping_path);
-        let session_workdirs = Self::load_mapping(&meta_path);
+        Self::new_with_paths(
+            config,
+            max_sessions,
+            hung_threshold_secs,
+            default_config_options,
+            mapping_path,
+            meta_path,
+        )
+    }
+
+    /// Construct the explicitly enabled Kubernetes session runtime without
+    /// reading or writing the local-process runtime's mapping or workspace
+    /// metadata. Each configured scope owns a domain-separated state path.
+    pub fn try_new_with_kubernetes_session_isolation(
+        config: AgentConfig,
+        max_sessions: usize,
+        hung_threshold_secs: u64,
+        default_config_options: HashMap<String, String>,
+        scope: &str,
+    ) -> Result<Self> {
+        let openab_dir = kubernetes_openab_dir_from_home(std::env::var_os("HOME"))?;
+        Self::try_new_kubernetes_with_root(
+            config,
+            max_sessions,
+            hung_threshold_secs,
+            default_config_options,
+            &openab_dir,
+            scope,
+        )
+    }
+
+    fn try_new_kubernetes_with_root(
+        config: AgentConfig,
+        max_sessions: usize,
+        hung_threshold_secs: u64,
+        default_config_options: HashMap<String, String>,
+        openab_dir: &Path,
+        scope: &str,
+    ) -> Result<Self> {
+        validate_kubernetes_scope(scope)?;
+        let runtime_directory = openab_dir
+            .join("session-runtimes")
+            .join(KUBERNETES_RUNTIME_STATE_VERSION)
+            .join(kubernetes_scope_partition(scope));
+        create_private_runtime_directory(openab_dir, &runtime_directory).map_err(|error| {
+            anyhow!(
+                "failed to create Kubernetes session state directory {}: {error}",
+                runtime_directory.display()
+            )
+        })?;
+        let mapping_path = runtime_directory.join("thread_map.json");
+        reject_unsafe_mapping_entry(&mapping_path)?;
+
+        Self::new_with_runtime_paths(
+            config,
+            max_sessions,
+            hung_threshold_secs,
+            default_config_options,
+            mapping_path,
+            runtime_directory.join("session_meta.json"),
+            false,
+        )
+        .try_with_session_context(SessionContextMode::OpenabV1)
+    }
+
+    fn new_with_paths(
+        config: AgentConfig,
+        max_sessions: usize,
+        hung_threshold_secs: u64,
+        default_config_options: HashMap<String, String>,
+        mapping_path: PathBuf,
+        meta_path: PathBuf,
+    ) -> Self {
+        Self::new_with_runtime_paths(
+            config,
+            max_sessions,
+            hung_threshold_secs,
+            default_config_options,
+            mapping_path,
+            meta_path,
+            true,
+        )
+    }
+
+    fn new_with_runtime_paths(
+        config: AgentConfig,
+        max_sessions: usize,
+        hung_threshold_secs: u64,
+        default_config_options: HashMap<String, String>,
+        mapping_path: PathBuf,
+        meta_path: PathBuf,
+        load_session_workdirs: bool,
+    ) -> Self {
+        let (suspended, mapping_load_error) = Self::load_mapping(&mapping_path);
+        let session_workdirs = if load_session_workdirs {
+            Self::load_mapping(&meta_path).0
+        } else {
+            HashMap::new()
+        };
         Self {
             state: RwLock::new(PoolState {
                 active: HashMap::new(),
                 cancel_handles: HashMap::new(),
+                lifecycle_handles: HashMap::new(),
                 #[cfg(feature = "acp-mcp")]
                 facade_tokens: HashMap::new(),
                 activity: HashMap::new(),
@@ -301,11 +573,14 @@ impl SessionPool {
                 session_workdirs,
             }),
             config,
+            session_context: SessionContextMode::None,
             max_sessions,
             hung_threshold_secs,
             mapping_path,
             meta_path,
+            mapping_load_error,
             default_config_options,
+            strict_capacity: isolated::StrictCapacity::new(max_sessions),
             #[cfg(feature = "acp-mcp")]
             session_registrar: None,
             #[cfg(feature = "acp-mcp")]
@@ -329,50 +604,107 @@ impl SessionPool {
         registrar: Option<Arc<dyn crate::acp_mcp::SessionTokenRegistrar>>,
         facade_url: Option<String>,
     ) -> Self {
+        if self.session_context != SessionContextMode::None {
+            // The facade entry and token target a broker-local process and
+            // loopback listener. A strict worker runs in another Pod, so keep
+            // both credentials out of that runtime even if a future caller
+            // accidentally attempts to compose the two modes.
+            if registrar.is_some() || facade_url.is_some() {
+                warn!(
+                    "ignoring broker-local MCP facade wiring for isolated Kubernetes sessions"
+                );
+            }
+            self.session_registrar = None;
+            self.facade_url = None;
+            return self;
+        }
         self.session_registrar = registrar;
         self.facade_url = facade_url;
         self
     }
 
-    fn load_mapping(path: &Path) -> HashMap<String, String> {
+    /// Enable broker-owned context for an explicitly configured session
+    /// runtime bridge. The default constructor remains behavior-compatible
+    /// with local ACP and AgentCore agents.
+    fn try_with_session_context(mut self, mode: SessionContextMode) -> Result<Self> {
+        if mode == SessionContextMode::OpenabV1 {
+            if let Some(error) = self.mapping_load_error.as_deref() {
+                return Err(anyhow!(
+                    "cannot enable Kubernetes session isolation: {error}"
+                ));
+            }
+            // Broker workspace metadata belongs to the local-process runtime.
+            // In isolated mode the controller-owned worker profile chooses all
+            // writable paths, so stale local metadata is intentionally ignored.
+            self.state.get_mut().session_workdirs.clear();
+            #[cfg(feature = "acp-mcp")]
+            {
+                self.session_registrar = None;
+                self.facade_url = None;
+            }
+        }
+        self.session_context = mode;
+        Ok(self)
+    }
+
+    pub(crate) fn allows_workspace_directives(&self) -> bool {
+        self.session_context == SessionContextMode::None
+    }
+
+    fn load_mapping(path: &Path) -> (HashMap<String, String>, Option<String>) {
         match std::fs::read_to_string(path) {
-            Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {
-                warn!(path = %path.display(), error = %e, "corrupt mapping file, starting fresh");
-                HashMap::new()
-            }),
-            Err(_) => HashMap::new(),
+            Ok(data) => match serde_json::from_str(&data) {
+                Ok(mapping) => (mapping, None),
+                Err(error) => {
+                    let message = format!(
+                        "failed to parse persisted mapping {}: {error}",
+                        path.display()
+                    );
+                    warn!(%message, "corrupt mapping file, starting fresh");
+                    (HashMap::new(), Some(message))
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (HashMap::new(), None),
+            Err(error) => {
+                let message = format!(
+                    "failed to read persisted mapping {}: {error}",
+                    path.display()
+                );
+                warn!(%message, "unreadable mapping file, starting fresh");
+                (HashMap::new(), Some(message))
+            }
         }
     }
 
     fn save_mapping(&self, persisted: &HashMap<String, String>) {
         let data = match serde_json::to_string_pretty(persisted) {
-            Ok(d) => d,
-            Err(e) => {
-                warn!(error = %e, "failed to serialize thread mapping");
+            Ok(data) => data,
+            Err(error) => {
+                warn!(%error, "failed to serialize thread mapping");
                 return;
             }
         };
-        let tmp = self.mapping_path.with_extension("json.tmp");
-        if let Err(e) =
-            std::fs::write(&tmp, &data).and_then(|_| std::fs::rename(&tmp, &self.mapping_path))
+        let temporary = self.mapping_path.with_extension("json.tmp");
+        if let Err(error) = std::fs::write(&temporary, &data)
+            .and_then(|_| std::fs::rename(&temporary, &self.mapping_path))
         {
-            warn!(path = %self.mapping_path.display(), error = %e, "failed to persist thread mapping");
+            warn!(path = %self.mapping_path.display(), %error, "failed to persist thread mapping");
         }
     }
 
     fn save_meta(&self, workdirs: &HashMap<String, String>) {
         let data = match serde_json::to_string_pretty(workdirs) {
-            Ok(d) => d,
-            Err(e) => {
-                warn!(error = %e, "failed to serialize session metadata");
+            Ok(data) => data,
+            Err(error) => {
+                warn!(%error, "failed to serialize session metadata");
                 return;
             }
         };
-        let tmp = self.meta_path.with_extension("json.tmp");
-        if let Err(e) =
-            std::fs::write(&tmp, &data).and_then(|_| std::fs::rename(&tmp, &self.meta_path))
+        let temporary = self.meta_path.with_extension("json.tmp");
+        if let Err(error) = std::fs::write(&temporary, &data)
+            .and_then(|_| std::fs::rename(&temporary, &self.meta_path))
         {
-            warn!(path = %self.meta_path.display(), error = %e, "failed to persist session metadata");
+            warn!(path = %self.meta_path.display(), %error, "failed to persist session metadata");
         }
     }
 
@@ -398,17 +730,58 @@ impl SessionPool {
         thread_id: &str,
         working_dir_override: Option<&str>,
     ) -> Result<bool> {
+        if self.session_context == SessionContextMode::OpenabV1 {
+            self.strict_capacity
+                .ensure_session_admission_open(thread_id)?;
+        }
         let create_gate = {
             let mut state = self.state.write().await;
+            // Linearize gate installation with strict reset admission. A
+            // creator that passed the fast check above cannot install a new
+            // provisioning gate after reset has fenced this key.
+            if self.session_context == SessionContextMode::OpenabV1 {
+                self.strict_capacity
+                    .ensure_session_admission_open(thread_id)?;
+            }
             get_or_insert_gate(&mut state.creating, thread_id)
         };
         let _create_guard = create_gate.lock().await;
 
-        let (existing, saved_session_id) = {
+        if self.session_context == SessionContextMode::OpenabV1 {
+            self.strict_capacity
+                .ensure_session_admission_open(thread_id)?;
+        }
+
+        let (
+            existing,
+            saved_session_id,
+            expected_persisted_session_id,
+            broker_mapping_expectation,
+            mut strict_session_snapshot,
+        ) = {
             let state = self.state.read().await;
+            let expected_persisted_session_id = state.persisted.get(thread_id).cloned();
+            let suspended_session_id = state.suspended.get(thread_id).cloned();
+            let saved_session_id = if self.session_context == SessionContextMode::OpenabV1 {
+                if suspended_session_id.as_ref().is_some_and(|suspended| {
+                    Some(suspended) != expected_persisted_session_id.as_ref()
+                }) {
+                    return Err(anyhow!(
+                        "isolated suspended session does not match its durable mapping"
+                    ));
+                }
+                expected_persisted_session_id.clone()
+            } else {
+                suspended_session_id
+            };
+            let strict_session_snapshot = (self.session_context == SessionContextMode::OpenabV1)
+                .then(|| isolated::strict_session_snapshot(&state, thread_id));
             (
                 state.active.get(thread_id).cloned(),
-                state.suspended.get(thread_id).cloned(),
+                saved_session_id,
+                expected_persisted_session_id.clone(),
+                durable_mapping_expectation(expected_persisted_session_id.as_deref()),
+                strict_session_snapshot,
             )
         };
 
@@ -426,45 +799,52 @@ impl SessionPool {
             if conn.alive() {
                 return Ok(false);
             }
-            if saved_session_id.is_none() {
+            if self.session_context == SessionContextMode::None && saved_session_id.is_none() {
                 saved_session_id = conn.acp_session_id.clone();
             }
         }
 
-        // Snapshot active handles so we can inspect them outside the state lock.
-        let snapshot: Vec<(String, Arc<Mutex<AcpConnection>>)> = {
-            let state = self.state.read().await;
-            state
-                .active
-                .iter()
-                .map(|(k, v)| (k.clone(), Arc::clone(v)))
-                .collect()
-        };
+        let (eviction_candidate, skipped_locked_candidates, mut strict_reservation) =
+            if self.session_context == SessionContextMode::None {
+                // Snapshot active handles so we can inspect them outside the state lock.
+                let snapshot: Vec<(String, Arc<Mutex<AcpConnection>>)> = {
+                    let state = self.state.read().await;
+                    state
+                        .active
+                        .iter()
+                        .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                        .collect()
+                };
 
-        let mut eviction_candidate: Option<EvictionCandidate> = None;
-        let mut skipped_locked_candidates = 0usize;
-        for (key, conn) in snapshot {
-            if key == thread_id {
-                continue;
-            }
-            let conn_handle = Arc::clone(&conn);
-            let Ok(conn) = conn.try_lock() else {
-                skipped_locked_candidates += 1;
-                continue;
+                let mut eviction_candidate: Option<EvictionCandidate> = None;
+                let mut skipped_locked_candidates = 0usize;
+                for (key, conn) in snapshot {
+                    if key == thread_id {
+                        continue;
+                    }
+                    let conn_handle = Arc::clone(&conn);
+                    let Ok(conn) = conn.try_lock() else {
+                        skipped_locked_candidates += 1;
+                        continue;
+                    };
+                    let candidate = (
+                        key,
+                        conn_handle,
+                        conn.last_active,
+                        conn.acp_session_id.clone(),
+                    );
+                    if better_candidate(
+                        eviction_candidate.as_ref().map(|(_, _, t, _)| *t),
+                        candidate.2,
+                    ) {
+                        eviction_candidate = Some(candidate);
+                    }
+                }
+                (eviction_candidate, skipped_locked_candidates, None)
+            } else {
+                let reservation = isolated::reserve_for_provisioning(self, thread_id).await?;
+                (None, 0, Some(reservation))
             };
-            let candidate = (
-                key,
-                conn_handle,
-                conn.last_active,
-                conn.acp_session_id.clone(),
-            );
-            if better_candidate(
-                eviction_candidate.as_ref().map(|(_, _, t, _)| *t),
-                candidate.2,
-            ) {
-                eviction_candidate = Some(candidate);
-            }
-        }
 
         // Resolve effective working directory: stored per-session > explicit override > global config.
         // Stored value has highest priority to enforce immutability (ADR §4.5).
@@ -473,13 +853,12 @@ impl SessionPool {
             state.session_workdirs.get(thread_id).cloned()
         };
 
-        let effective_workdir = if let Some(stored) = stored_workdir {
-            stored
-        } else if let Some(wd) = working_dir_override {
-            wd.to_string()
-        } else {
-            self.config.working_dir.clone()
-        };
+        let effective_workdir = resolve_effective_workdir(
+            self.session_context,
+            stored_workdir.as_deref(),
+            working_dir_override,
+            &self.config.working_dir,
+        )?;
 
         // Browser capabilities for an `acp:` session come from the OAB MCP Facade and nowhere
         // else: mint a per-session token (it rides the agent spawn below as OPENAB_SESSION_TOKEN)
@@ -493,11 +872,17 @@ impl SessionPool {
         let mut session_token: Option<String> = None;
         #[cfg(feature = "acp-mcp")]
         let facade_token_guard: Option<tokio_util::sync::DropGuard> = match (
+            self.session_context,
             thread_id.strip_prefix("acp:"),
             self.session_registrar.as_ref(),
             self.facade_url.as_ref(),
         ) {
-            (Some(channel_id), Some(registrar), Some(facade_url)) => {
+            (
+                SessionContextMode::None,
+                Some(channel_id),
+                Some(registrar),
+                Some(facade_url),
+            ) => {
                 match setup_facade_session(&effective_workdir, facade_url, channel_id, registrar)
                     .await
                 {
@@ -533,26 +918,82 @@ impl SessionPool {
             let mut env = self.config.env.clone();
             if let Some(tok) = &session_token {
                 // The static facade MCP entry references ${OPENAB_SESSION_TOKEN};
-                // the value lives only in this agent process's environment.
-                env.insert("OPENAB_SESSION_TOKEN".to_string(), tok.clone());
+                // the value lives only in this local agent process's environment.
+                env.insert(crate::acp::SESSION_TOKEN_ENV.to_string(), tok.clone());
             }
             env
         };
         #[cfg(not(feature = "acp-mcp"))]
         let spawn_env = self.config.env.clone();
-        let mut new_conn = AcpConnection::spawn(
-            &self.config.command,
-            &self.config.args,
-            &effective_workdir,
-            &spawn_env,
-            &self.config.inherit_env,
-        )
-        .await?;
 
-        new_conn.initialize().await?;
+        let mut broker_mapping_expectation = broker_mapping_expectation;
+        let mut mapping_was_repaired = false;
+        // This loop can spawn at most twice. The only retry flips both the
+        // expectation to Absent and the repair marker before the next spawn.
+        let mut new_conn = loop {
+            let session_spawn_context = isolated::session_spawn_context(
+                self.session_context,
+                thread_id,
+                broker_mapping_expectation,
+            );
+            let mut candidate = AcpConnection::spawn_with_context(
+                &self.config.command,
+                &self.config.args,
+                &effective_workdir,
+                &spawn_env,
+                &self.config.inherit_env,
+                session_spawn_context.as_ref(),
+            )
+            .await?;
+
+            // Once the bridge process has started, a worker may exist even if ACP
+            // initialization fails. Keep the strict slot occupied until a later
+            // controller-acknowledged release proves that capacity is free.
+            if let Some(reservation) = strict_reservation.as_mut() {
+                reservation.mark_uncertain();
+            }
+
+            match candidate.initialize().await {
+                Ok(()) => break candidate,
+                Err(error)
+                    if self.session_context == SessionContextMode::OpenabV1
+                        && !mapping_was_repaired
+                        && broker_mapping_expectation == BrokerMappingExpectation::Present
+                        && error
+                            .downcast_ref::<MappingAbsentInitialization>()
+                            .is_some() =>
+                {
+                    // The typed response proves this activation did not attach
+                    // to the broker's retained outer session. Drop the bridge
+                    // before repairing broker state and starting a fresh,
+                    // independently fenced activation attempt.
+                    drop(candidate);
+                    let expected_session_id = expected_persisted_session_id
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("mapping repair requires a captured durable ID"))?;
+                    let mut state = self.state.write().await;
+                    let repaired_snapshot = isolated::repair_absent_mapping(
+                        &mut state,
+                        &self.mapping_path,
+                        thread_id,
+                        expected_session_id,
+                        strict_session_snapshot
+                            .as_ref()
+                            .expect("strict sessions capture a mapping repair snapshot"),
+                    )?;
+                    strict_session_snapshot = Some(repaired_snapshot);
+                    drop(state);
+
+                    saved_session_id = None;
+                    broker_mapping_expectation = BrokerMappingExpectation::Absent;
+                    mapping_was_repaired = true;
+                }
+                Err(error) => return Err(error),
+            }
+        };
 
         let mut resumed = false;
-        let mut load_failed: Option<&str> = None;
+        let mut load_failed: Option<String> = None;
         if let Some(ref sid) = saved_session_id {
             if new_conn.supports_load_session {
                 match new_conn.session_load(sid, &effective_workdir).await {
@@ -564,13 +1005,13 @@ impl SessionPool {
                         let err_str = e.to_string();
                         let is_transient =
                             TRANSIENT_LOAD_ERRORS.iter().any(|s| err_str.contains(s));
-                        if is_transient {
+                        if self.session_context == SessionContextMode::OpenabV1 || is_transient {
                             warn!(thread_id = %crate::redact::redact_session_ids(thread_id), session_id = %crate::redact::redact_session_ids(sid), error = %e,
-                                "session/load failed transiently, preserving session ID for retry");
+                                "session/load failed, preserving session ID for retry");
                             load_failed = Some(if err_str.contains("timeout waiting for") {
-                                "timeout"
+                                "timeout".to_string()
                             } else {
-                                "connection lost"
+                                err_str
                             });
                         } else {
                             warn!(thread_id = %crate::redact::redact_session_ids(thread_id), session_id = %crate::redact::redact_session_ids(sid), error = %e,
@@ -582,10 +1023,10 @@ impl SessionPool {
         }
 
         if let Some(reason) = load_failed {
-            // session/load failed transiently. The original session ID is already
-            // in state.persisted (we haven't touched it), so the next message will
-            // retry session/load automatically. Return an error so the current message
-            // is not processed against a context-free session.
+            // The original session ID is already in state.persisted, so the
+            // next message retries session/load. Strict mode never falls back
+            // to session/new for a retained outer ID: that would bypass the
+            // controller's continuity and deletion fences.
             return Err(anyhow!(
                 "session load {reason}: could not restore previous session"
             ));
@@ -605,12 +1046,25 @@ impl SessionPool {
             // live entries that died before we could recover a resumable
             // session id. In both cases the caller is continuing after an
             // unexpected session loss.
-            if had_existing || saved_session_id.is_some() {
+            if had_existing || saved_session_id.is_some() || mapping_was_repaired {
                 new_conn.session_reset = true;
             }
         }
 
         let cancel_handle = new_conn.cancel_handle();
+        let lifecycle_handle = match self.session_context {
+            SessionContextMode::None => None,
+            SessionContextMode::OpenabV1 => Some(
+                new_conn
+                    .lifecycle_handle()
+                    .ok_or_else(|| anyhow!("isolated session bridge has no ACP session ID"))?,
+            ),
+        };
+        let uncommitted_provenance = if resumed {
+            isolated::UncommittedSessionProvenance::ResumedBorrowed
+        } else {
+            isolated::UncommittedSessionProvenance::FreshOwned
+        };
         let activity_handle = new_conn.activity_handle();
         let child_pgid = new_conn.child_pgid();
         let cancel_session_id = new_conn.acp_session_id.clone().unwrap_or_default();
@@ -620,24 +1074,98 @@ impl SessionPool {
 
         let mut state = self.state.write().await;
 
+        if self.session_context == SessionContextMode::OpenabV1 {
+            let snapshot = strict_session_snapshot
+                .as_ref()
+                .expect("strict sessions capture a publication snapshot");
+            if let Err(error) =
+                isolated::ensure_strict_session_snapshot(&state, thread_id, snapshot)
+            {
+                drop(state);
+                let lifecycle = lifecycle_handle
+                    .as_ref()
+                    .expect("strict sessions always have a lifecycle handle");
+                // A competing state may own this thread's worker. Release only
+                // our unpublished candidate and retain the uncertain slot.
+                return Err(isolated::rollback_uncommitted_session(
+                    lifecycle,
+                    error,
+                    None,
+                    uncommitted_provenance,
+                )
+                .await);
+            }
+        }
+
+        // This check and the active-map publish are linearized by the state
+        // write lock. Shutdown closes strict admission before taking its
+        // snapshot: a publish accepted here is therefore visible to that
+        // snapshot, while a later publish is rolled back and never installed.
+        if self.session_context == SessionContextMode::OpenabV1 {
+            if let Err(error) = self
+                .strict_capacity
+                .ensure_session_admission_open(thread_id)
+            {
+                drop(state);
+                let lifecycle = lifecycle_handle
+                    .as_ref()
+                    .expect("strict sessions always have a lifecycle handle");
+                return Err(isolated::rollback_uncommitted_session(
+                    lifecycle,
+                    error,
+                    strict_reservation,
+                    uncommitted_provenance,
+                )
+                .await);
+            }
+        }
+
         // Another task may have created a healthy connection while we were
         // initializing this one.
         if let Some(existing) = state.active.get(thread_id).cloned() {
             let Ok(existing) = existing.try_lock() else {
+                if let Some(lifecycle) = lifecycle_handle.as_ref() {
+                    drop(state);
+                    return Err(isolated::rollback_uncommitted_session(
+                        lifecycle,
+                        anyhow!(
+                            "isolated session became active while a replacement was provisioning"
+                        ),
+                        strict_reservation,
+                        uncommitted_provenance,
+                    )
+                    .await);
+                }
                 return Ok(false);
             };
             if existing.alive() {
+                if let Some(lifecycle) = lifecycle_handle.as_ref() {
+                    drop(existing);
+                    drop(state);
+                    return Err(isolated::rollback_uncommitted_session(
+                        lifecycle,
+                        anyhow!(
+                            "isolated session became active while a replacement was provisioning"
+                        ),
+                        strict_reservation,
+                        uncommitted_provenance,
+                    )
+                    .await);
+                }
                 return Ok(false);
             }
             warn!(thread_id = %crate::redact::redact_session_ids(thread_id), "stale connection, rebuilding");
             drop(existing);
             state.active.remove(thread_id);
             state.cancel_handles.remove(thread_id);
+            state.lifecycle_handles.remove(thread_id);
             state.activity.remove(thread_id);
             state.pgids.remove(thread_id);
         }
 
-        if state.active.len() >= self.max_sessions {
+        if self.session_context == SessionContextMode::None
+            && state.active.len() >= self.max_sessions
+        {
             if let Some((key, expected_conn, _, sid)) = eviction_candidate {
                 if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
                     state.cancel_handles.remove(&key);
@@ -665,10 +1193,44 @@ impl SessionPool {
         }
 
         if state.active.len() >= self.max_sessions {
-            return Err(anyhow!("pool exhausted ({} sessions)", self.max_sessions));
+            let error = anyhow!("pool exhausted ({} sessions)", self.max_sessions);
+            if let Some(lifecycle) = lifecycle_handle.as_ref() {
+                drop(state);
+                return Err(isolated::rollback_uncommitted_session(
+                    lifecycle,
+                    error,
+                    strict_reservation,
+                    uncommitted_provenance,
+                )
+                .await);
+            }
+            return Err(error);
         }
 
-        if cancel_session_id.is_empty() {
+        if self.session_context == SessionContextMode::OpenabV1 {
+            let mut persisted = state.persisted.clone();
+            if cancel_session_id.is_empty() {
+                persisted.remove(thread_id);
+            } else {
+                persisted.insert(thread_id.to_string(), cancel_session_id.clone());
+            }
+            if persisted != state.persisted {
+                if let Err(error) = isolated::write_mapping_file(&self.mapping_path, &persisted) {
+                    drop(state);
+                    let lifecycle = lifecycle_handle
+                        .as_ref()
+                        .expect("strict sessions always have a lifecycle handle");
+                    return Err(isolated::rollback_uncommitted_session(
+                        lifecycle,
+                        error,
+                        strict_reservation,
+                        uncommitted_provenance,
+                    )
+                    .await);
+                }
+            }
+            state.persisted = persisted;
+        } else if cancel_session_id.is_empty() {
             state.persisted.remove(thread_id);
         } else {
             state
@@ -677,6 +1239,11 @@ impl SessionPool {
         }
         state.suspended.remove(thread_id);
         state.active.insert(thread_id.to_string(), new_conn);
+        if let Some(lifecycle_handle) = lifecycle_handle {
+            state
+                .lifecycle_handles
+                .insert(thread_id.to_string(), lifecycle_handle);
+        }
         state
             .activity
             .insert(thread_id.to_string(), activity_handle);
@@ -688,13 +1255,21 @@ impl SessionPool {
                 .cancel_handles
                 .insert(thread_id.to_string(), (cancel_handle, cancel_session_id));
         }
-        // Record this connection's exact token lock-free, revoking any predecessor token it
-        // supersedes under the same key (its guard cannot fire if that predecessor is hung). F3.
+        // Record this local connection's exact token lock-free, revoking any
+        // predecessor token it supersedes under the same key (its guard cannot
+        // fire if that predecessor is hung). Strict sessions never produce a
+        // token because facade setup is local-only above.
         #[cfg(feature = "acp-mcp")]
         if let Some(token) = session_token {
             install_facade_token(&mut state, thread_id, token, self.session_registrar.as_ref());
         }
-        self.save_mapping(&state.persisted);
+        if self.session_context == SessionContextMode::None {
+            self.save_mapping(&state.persisted);
+        }
+
+        if let Some(reservation) = strict_reservation {
+            reservation.commit();
+        }
 
         // Persist workspace override only after session spawn succeeded (口渡 F2).
         if working_dir_override.is_some() {
@@ -706,9 +1281,10 @@ impl SessionPool {
         }
 
         // Return true only for genuinely new sessions — not resumed or reconnected ones.
-        // A session with prior state (saved_session_id or had_existing) is a resume,
-        // even if we had to spawn a new ACP process. ADR §2.2: directives are first-message-only.
-        let is_fresh = !had_existing && saved_session_id.is_none();
+        // A session with prior state (saved_session_id, had_existing, or a
+        // repaired durable mapping) is a continuation even if a replacement
+        // ACP session was created. ADR §2.2: directives are first-message-only.
+        let is_fresh = !had_existing && saved_session_id.is_none() && !mapping_was_repaired;
         Ok(is_fresh)
     }
 
@@ -725,17 +1301,53 @@ impl SessionPool {
             Box<dyn std::future::Future<Output = Result<R>> + Send + 'a>,
         >,
     {
-        let conn = {
+        if self.session_context == SessionContextMode::OpenabV1 {
+            self.strict_capacity
+                .ensure_session_admission_open(thread_id)?;
+        }
+        let (connection, lifecycle_gate) = {
             let state = self.state.read().await;
-            state
+            let connection = state
                 .active
                 .get(thread_id)
                 .cloned()
-                .ok_or_else(|| anyhow!("no connection for thread {}", crate::redact::redact_session_ids(thread_id)))?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "no connection for thread {}",
+                        crate::redact::redact_session_ids(thread_id)
+                    )
+                })?;
+            let gate = if self.session_context == SessionContextMode::OpenabV1 {
+                Some(state.creating.get(thread_id).cloned().ok_or_else(|| {
+                    anyhow!(
+                        "isolated session for thread {} has no lifecycle gate",
+                        crate::redact::redact_session_ids(thread_id)
+                    )
+                })?)
+            } else {
+                None
+            };
+            (connection, gate)
         };
 
-        let mut conn = conn.lock().await;
-        f(&mut conn).await
+        let mut connection_guard = connection.lock().await;
+        if let Some(gate) = lifecycle_gate {
+            let _gate_guard = gate.lock().await;
+            self.strict_capacity
+                .ensure_session_admission_open(thread_id)?;
+            let state = self.state.read().await;
+            let is_current = state
+                .active
+                .get(thread_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &connection));
+            if !is_current {
+                return Err(anyhow!(
+                    "session for thread {} changed before prompt dispatch",
+                    crate::redact::redact_session_ids(thread_id)
+                ));
+            }
+        }
+        f(&mut connection_guard).await
     }
 
     /// Get cached configOptions for a session (e.g. available models).
@@ -757,6 +1369,15 @@ impl SessionPool {
         config_id: &str,
         value: &str,
     ) -> Result<Vec<ConfigOption>> {
+        if self.session_context == SessionContextMode::OpenabV1 {
+            let config_id = config_id.to_string();
+            let value = value.to_string();
+            return self
+                .with_connection(thread_id, move |connection| {
+                    Box::pin(async move { connection.set_config_option(&config_id, &value).await })
+                })
+                .await;
+        }
         let conn = {
             let state = self.state.read().await;
             state
@@ -773,6 +1394,11 @@ impl SessionPool {
     /// (kiro-cli extension). Fails when there is no active session for the
     /// thread or the backend does not support usage queries.
     pub async fn get_usage(&self, thread_id: &str) -> Result<crate::acp::protocol::UsageReport> {
+        if self.session_context == SessionContextMode::OpenabV1 {
+            return self
+                .with_connection(thread_id, |connection| Box::pin(connection.get_usage()))
+                .await;
+        }
         let conn = {
             let state = self.state.read().await;
             state
@@ -788,6 +1414,23 @@ impl SessionPool {
     /// Cancel the current in-flight operation for a session.
     /// Uses pre-stored cancel handles to avoid locking the connection (which is held during streaming).
     pub async fn cancel_session(&self, thread_id: &str) -> Result<()> {
+        if self.session_context == SessionContextMode::OpenabV1 {
+            let lifecycle = {
+                let state = self.state.read().await;
+                state
+                    .lifecycle_handles
+                    .get(thread_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "no isolated session for thread {}",
+                            crate::redact::redact_session_ids(thread_id)
+                        )
+                    })?
+            };
+            return lifecycle.cancel().await;
+        }
+
         let (stdin, session_id) = {
             let state = self.state.read().await;
             state
@@ -815,6 +1458,13 @@ impl SessionPool {
     /// Arc reference is dropped (after streaming finishes). The next message will
     /// trigger a fresh `get_or_create` with a new ACP session.
     pub async fn reset_session(&self, thread_id: &str) -> Result<()> {
+        if self.session_context == SessionContextMode::OpenabV1 {
+            isolated::reset_strict_session(self, thread_id, isolated::STRICT_RESET_BUDGET).await?;
+
+            info!(thread_id = %crate::redact::redact_session_ids(thread_id), "isolated session released");
+            return Ok(());
+        }
+
         // Send session/cancel via the lock-free stdin handle first.
         // This stops in-flight streaming even while with_connection() holds the
         // connection mutex, so the old process finishes promptly.
@@ -857,6 +1507,11 @@ impl SessionPool {
     }
 
     pub async fn cleanup_idle(&self, ttl_secs: u64) {
+        if self.session_context == SessionContextMode::OpenabV1 {
+            self.cleanup_idle_strict(ttl_secs).await;
+            return;
+        }
+
         let cutoff = Instant::now() - std::time::Duration::from_secs(ttl_secs);
         let hung_threshold = std::time::Duration::from_secs(self.hung_threshold_secs);
 
@@ -983,6 +1638,11 @@ impl SessionPool {
     }
 
     pub async fn shutdown(&self) {
+        if self.session_context == SessionContextMode::OpenabV1 {
+            isolated::shutdown_strict(self).await;
+            return;
+        }
+
         // Snapshot active handles, then drop state lock before awaiting
         // per-connection mutexes (lock ordering: never hold state while
         // awaiting a connection lock).
@@ -1012,6 +1672,7 @@ impl SessionPool {
         let count = state.active.len();
         state.active.clear();
         state.cancel_handles.clear();
+        state.lifecycle_handles.clear();
         state.activity.clear();
         state.pgids.clear();
         info!(count, "pool shutdown complete");
@@ -1021,14 +1682,416 @@ impl SessionPool {
 #[cfg(test)]
 mod tests {
     use super::{
-        better_candidate, classify_hung, classify_idle, get_or_insert_gate, purge_session_entries,
-        remove_if_same_handle, PoolState,
+        better_candidate, classify_hung, classify_idle, durable_mapping_expectation,
+        get_or_insert_gate, purge_session_entries, remove_if_same_handle,
+        resolve_effective_workdir, PoolState, SessionPool,
     };
-    use crate::acp::connection::SessionActivity;
+    use crate::acp::connection::{BrokerMappingExpectation, SessionActivity};
+    use crate::acp::SessionContextMode;
+    use crate::config::AgentConfig;
     use std::collections::HashMap;
+    use std::path::Path;
     use std::sync::Arc;
     use tokio::sync::Mutex;
     use tokio::time::Instant;
+
+    #[cfg(unix)]
+    fn default_test_pool(temp: &std::path::Path, max_sessions: usize) -> SessionPool {
+        let script = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}'
+      ;;
+    *'"method":"session/new"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"local-session"}}'
+      ;;
+    *'"method":"session/load"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
+      ;;
+  esac
+done
+"#;
+        let config = AgentConfig {
+            command: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            working_dir: temp.display().to_string(),
+            ..AgentConfig::default()
+        };
+        SessionPool::new_with_paths(
+            config,
+            max_sessions,
+            60,
+            HashMap::new(),
+            temp.join("thread_map.json"),
+            temp.join("session_meta.json"),
+        )
+    }
+
+    fn kubernetes_test_pool(root: &Path, scope: &str) -> anyhow::Result<SessionPool> {
+        SessionPool::try_new_kubernetes_with_root(
+            AgentConfig::default(),
+            2,
+            60,
+            HashMap::new(),
+            root,
+            scope,
+        )
+    }
+
+    #[test]
+    fn kubernetes_scope_partition_matches_the_controller_identity_vector() {
+        assert_eq!(
+            super::kubernetes_scope_partition("team-a"),
+            "c7d126d05da76b40b912226a894e8acdc3c4f80d9b0f14f8f24a782ab0e61d67"
+        );
+    }
+
+    #[test]
+    fn mapping_expectation_uses_only_the_durable_broker_mapping() {
+        let mut persisted = HashMap::new();
+        assert_eq!(
+            durable_mapping_expectation(persisted.get("discord:thread").map(String::as_str)),
+            BrokerMappingExpectation::Absent
+        );
+
+        persisted.insert(
+            "discord:thread".to_string(),
+            "durable-outer-session".to_string(),
+        );
+        assert_eq!(
+            durable_mapping_expectation(persisted.get("discord:thread").map(String::as_str)),
+            BrokerMappingExpectation::Present
+        );
+        assert_eq!(
+            durable_mapping_expectation(persisted.get("discord:other-thread").map(String::as_str)),
+            BrokerMappingExpectation::Absent
+        );
+    }
+
+    #[test]
+    fn kubernetes_state_root_requires_a_real_absolute_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let regular_file = temp.path().join("not-a-home");
+        std::fs::write(&regular_file, "file").unwrap();
+
+        for home in [
+            None,
+            Some(std::ffi::OsString::new()),
+            Some(std::ffi::OsString::from("relative/home")),
+            Some(std::ffi::OsString::from("/")),
+            Some(regular_file.into_os_string()),
+            Some(temp.path().join("missing").into_os_string()),
+        ] {
+            assert!(super::kubernetes_openab_dir_from_home(home).is_err());
+        }
+
+        assert_eq!(
+            super::kubernetes_openab_dir_from_home(Some(temp.path().as_os_str().to_owned()))
+                .unwrap(),
+            temp.path().canonicalize().unwrap().join(".openab")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kubernetes_state_root_rejects_a_home_symlink_resolving_to_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let linked_home = temp.path().join("linked-home");
+        symlink("/", &linked_home).unwrap();
+
+        assert!(
+            super::kubernetes_openab_dir_from_home(Some(linked_home.into_os_string())).is_err()
+        );
+    }
+
+    #[test]
+    fn kubernetes_mapping_never_reads_the_local_runtime_mapping() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_mapping = temp.path().join("thread_map.json");
+        std::fs::write(&local_mapping, r#"{"discord:local":"local-session"}"#).unwrap();
+
+        let pool = kubernetes_test_pool(temp.path(), "team-a").unwrap();
+        let state = pool.state.try_read().unwrap();
+
+        assert!(state.persisted.is_empty());
+        assert!(state.suspended.is_empty());
+        assert_eq!(
+            pool.mapping_path,
+            temp.path()
+                .join("session-runtimes/kubernetes-v1")
+                .join(super::kubernetes_scope_partition("team-a"))
+                .join("thread_map.json")
+        );
+        assert!(!pool.mapping_path.to_string_lossy().contains("team-a"));
+        assert_eq!(
+            std::fs::read_to_string(local_mapping).unwrap(),
+            r#"{"discord:local":"local-session"}"#
+        );
+    }
+
+    #[test]
+    fn local_mapping_never_reads_a_kubernetes_scope_partition() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope_directory = temp
+            .path()
+            .join("session-runtimes/kubernetes-v1")
+            .join(super::kubernetes_scope_partition("team-a"));
+        std::fs::create_dir_all(&scope_directory).unwrap();
+        std::fs::write(
+            scope_directory.join("thread_map.json"),
+            r#"{"discord:strict":"strict-session"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("thread_map.json"),
+            r#"{"discord:local":"local-session"}"#,
+        )
+        .unwrap();
+
+        let pool = SessionPool::new_with_paths(
+            AgentConfig::default(),
+            2,
+            60,
+            HashMap::new(),
+            temp.path().join("thread_map.json"),
+            temp.path().join("session_meta.json"),
+        );
+        let state = pool.state.try_read().unwrap();
+
+        assert_eq!(
+            state.persisted.get("discord:local").map(String::as_str),
+            Some("local-session")
+        );
+        assert!(!state.persisted.contains_key("discord:strict"));
+    }
+
+    #[test]
+    fn kubernetes_mapping_rejects_invalid_scopes_before_touching_disk() {
+        let temp = tempfile::tempdir().unwrap();
+        for scope in ["", " team-a", "team-a ", &"x".repeat(254)] {
+            assert!(kubernetes_test_pool(temp.path(), scope).is_err());
+        }
+        assert!(!temp.path().join("session-runtimes").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kubernetes_scope_directory_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let pool = kubernetes_test_pool(temp.path(), "team-a").unwrap();
+        let mode = pool
+            .mapping_path
+            .parent()
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+
+        assert_eq!(mode, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kubernetes_state_path_rejects_preexisting_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let foreign = tempfile::tempdir().unwrap();
+        symlink(foreign.path(), temp.path().join("session-runtimes")).unwrap();
+
+        let error = kubernetes_test_pool(temp.path(), "team-a")
+            .err()
+            .expect("symlinked state parent must be rejected");
+
+        assert!(error.to_string().contains("symbolic links"));
+        assert!(foreign.path().read_dir().unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kubernetes_mapping_rejects_a_preexisting_file_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let foreign = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(foreign.path(), r#"{"discord:foreign":"session"}"#).unwrap();
+        let scope_directory = temp
+            .path()
+            .join("session-runtimes/kubernetes-v1")
+            .join(super::kubernetes_scope_partition("team-a"));
+        std::fs::create_dir_all(&scope_directory).unwrap();
+        symlink(foreign.path(), scope_directory.join("thread_map.json")).unwrap();
+
+        let error = kubernetes_test_pool(temp.path(), "team-a")
+            .err()
+            .expect("symlinked mapping must be rejected");
+
+        assert!(error.to_string().contains("must not be a symbolic link"));
+        assert_eq!(
+            std::fs::read_to_string(foreign.path()).unwrap(),
+            r#"{"discord:foreign":"session"}"#
+        );
+    }
+
+    #[test]
+    fn kubernetes_mapping_is_partitioned_between_scopes() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope_a_directory = temp
+            .path()
+            .join("session-runtimes/kubernetes-v1")
+            .join(super::kubernetes_scope_partition("team-a"));
+        std::fs::create_dir_all(&scope_a_directory).unwrap();
+        std::fs::write(
+            scope_a_directory.join("thread_map.json"),
+            r#"{"discord:thread":"scope-a-session"}"#,
+        )
+        .unwrap();
+
+        let scope_a = kubernetes_test_pool(temp.path(), "team-a").unwrap();
+        let scope_b = kubernetes_test_pool(temp.path(), "team-b").unwrap();
+
+        assert_eq!(
+            scope_a
+                .state
+                .try_read()
+                .unwrap()
+                .persisted
+                .get("discord:thread")
+                .map(String::as_str),
+            Some("scope-a-session")
+        );
+        assert!(scope_b.state.try_read().unwrap().persisted.is_empty());
+        assert_ne!(scope_a.mapping_path, scope_b.mapping_path);
+    }
+
+    #[test]
+    fn corrupt_local_mapping_cannot_block_kubernetes_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("thread_map.json"), "{not-json").unwrap();
+
+        let pool = kubernetes_test_pool(temp.path(), "team-a").unwrap();
+
+        assert!(pool.mapping_load_error.is_none());
+        assert!(pool.state.try_read().unwrap().persisted.is_empty());
+    }
+
+    #[test]
+    fn corrupt_kubernetes_mapping_blocks_only_its_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope_a_directory = temp
+            .path()
+            .join("session-runtimes/kubernetes-v1")
+            .join(super::kubernetes_scope_partition("team-a"));
+        std::fs::create_dir_all(&scope_a_directory).unwrap();
+        std::fs::write(scope_a_directory.join("thread_map.json"), "{not-json").unwrap();
+
+        let error = kubernetes_test_pool(temp.path(), "team-a")
+            .err()
+            .expect("scope A must reject its corrupt mapping");
+        let scope_b = kubernetes_test_pool(temp.path(), "team-b").unwrap();
+
+        assert!(error
+            .to_string()
+            .contains("cannot enable Kubernetes session isolation"));
+        assert!(scope_b.state.try_read().unwrap().persisted.is_empty());
+    }
+
+    #[test]
+    fn kubernetes_mode_does_not_load_session_workdir_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope_directory = temp
+            .path()
+            .join("session-runtimes/kubernetes-v1")
+            .join(super::kubernetes_scope_partition("team-a"));
+        std::fs::create_dir_all(&scope_directory).unwrap();
+        std::fs::write(
+            scope_directory.join("session_meta.json"),
+            r#"{"discord:thread":"/broker/worktree"}"#,
+        )
+        .unwrap();
+
+        let pool = kubernetes_test_pool(temp.path(), "team-a").unwrap();
+
+        assert!(pool.state.try_read().unwrap().session_workdirs.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn default_capacity_eviction_ignores_held_lifecycle_gate() {
+        let temp = tempfile::tempdir().unwrap();
+        let pool = default_test_pool(temp.path(), 1);
+        assert_eq!(pool.session_context, SessionContextMode::None);
+        assert!(pool.get_or_create("thread-a", None).await.unwrap());
+        let gate = {
+            let state = pool.state.read().await;
+            Arc::clone(state.creating.get("thread-a").unwrap())
+        };
+        let _gate_guard = gate.lock().await;
+
+        assert!(pool.get_or_create("thread-b", None).await.unwrap());
+
+        let state = pool.state.read().await;
+        assert!(!state.active.contains_key("thread-a"));
+        assert!(state.active.contains_key("thread-b"));
+        assert_eq!(
+            state.suspended.get("thread-a"),
+            Some(&"local-session".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn default_idle_cleanup_ignores_held_lifecycle_gate() {
+        let temp = tempfile::tempdir().unwrap();
+        let pool = default_test_pool(temp.path(), 1);
+        assert_eq!(pool.session_context, SessionContextMode::None);
+        assert!(pool.get_or_create("thread-a", None).await.unwrap());
+        let gate = {
+            let state = pool.state.read().await;
+            Arc::clone(state.creating.get("thread-a").unwrap())
+        };
+        let _gate_guard = gate.lock().await;
+
+        pool.cleanup_idle(0).await;
+
+        let state = pool.state.read().await;
+        assert!(!state.active.contains_key("thread-a"));
+        assert_eq!(
+            state.suspended.get("thread-a"),
+            Some(&"local-session".to_string())
+        );
+    }
+
+    #[test]
+    fn local_workdir_resolution_preserves_existing_precedence() {
+        assert_eq!(
+            resolve_effective_workdir(
+                SessionContextMode::None,
+                Some("/stored"),
+                Some("/requested"),
+                "/default",
+            )
+            .unwrap(),
+            "/stored"
+        );
+        assert_eq!(
+            resolve_effective_workdir(
+                SessionContextMode::None,
+                None,
+                Some("/requested"),
+                "/default",
+            )
+            .unwrap(),
+            "/requested"
+        );
+    }
 
     /// Registrar double that records every mint, so a test can assert one never happened.
     #[cfg(feature = "acp-mcp")]
@@ -1062,6 +2125,7 @@ mod tests {
         super::PoolState {
             active: HashMap::new(),
             cancel_handles: HashMap::new(),
+            lifecycle_handles: HashMap::new(),
             facade_tokens: HashMap::new(),
             activity: HashMap::new(),
             pgids: HashMap::new(),
@@ -1170,6 +2234,68 @@ mod tests {
 
         assert_eq!(token.as_deref(), Some("token-xyz"));
         assert_eq!(counting.minted.lock().unwrap().as_slice(), ["acp_x"]);
+    }
+
+    #[cfg(all(unix, feature = "acp-mcp"))]
+    #[tokio::test]
+    async fn kubernetes_pool_refuses_broker_local_facade_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let token_log = temp.path().join("token.log");
+        let script = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' "${OPENAB_SESSION_TOKEN-unset}" > "$TOKEN_LOG"
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"sessionCapabilities":{"close":{},"_meta":{"openab.dev":{"sessionRelease":{"version":1}}}}}}}'
+      ;;
+    *'"method":"session/new"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"outer-session"}}'
+      ;;
+    *'"method":"session/close"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{}}'
+      ;;
+    *'"method":"_openab/session/release"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{}}'
+      ;;
+  esac
+done
+"#;
+        let config = AgentConfig {
+            command: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            working_dir: temp.path().display().to_string(),
+            env: HashMap::from([(
+                "TOKEN_LOG".to_string(),
+                token_log.display().to_string(),
+            )]),
+            ..AgentConfig::default()
+        };
+        let counting = Arc::new(CountingRegistrar::default());
+        let registrar: Arc<dyn crate::acp_mcp::SessionTokenRegistrar> = counting.clone();
+
+        let pool = SessionPool::try_new_kubernetes_with_root(
+            config,
+            2,
+            60,
+            HashMap::new(),
+            temp.path(),
+            "team-a",
+        )
+            .unwrap()
+            .with_facade_sessions(
+                Some(registrar),
+                Some("http://127.0.0.1:8848/mcp".to_string()),
+            );
+
+        assert!(pool.session_registrar.is_none());
+        assert!(pool.facade_url.is_none());
+        assert!(pool.get_or_create("acp:strict", None).await.unwrap());
+        assert!(counting.minted.lock().unwrap().is_empty());
+        assert!(!temp.path().join(".openab/mcp-facade.json").exists());
+        assert_eq!(std::fs::read_to_string(&token_log).unwrap().trim(), "unset");
+        assert!(pool.state.read().await.facade_tokens.is_empty());
+
+        pool.reset_session("acp:strict").await.unwrap();
     }
 
     #[test]
@@ -1331,6 +2457,7 @@ mod tests {
         let mut state = PoolState {
             active: HashMap::new(),
             cancel_handles: HashMap::new(),
+            lifecycle_handles: HashMap::new(),
             #[cfg(feature = "acp-mcp")]
             facade_tokens: HashMap::new(),
             activity: HashMap::from([

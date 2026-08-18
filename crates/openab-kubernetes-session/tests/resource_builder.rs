@@ -1,0 +1,2186 @@
+#![cfg(feature = "controller")]
+
+use chrono::{Duration, TimeZone, Utc};
+use k8s_openapi::api::core::v1::{
+    ConfigMap, Container, ContainerResizePolicy, HostPathVolumeSource,
+};
+use k8s_openapi::api::node::v1::{Overhead, RuntimeClass, Scheduling};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+use k8s_openapi::ByteString;
+use openab_kubernetes_session::bridge::SessionBinding;
+use openab_kubernetes_session::identity::{ResourceNames, ScopeId, SessionId};
+use openab_kubernetes_session::profile_config::{
+    ResolvedClusterReferences, TrustedControllerConfigV1,
+};
+use openab_kubernetes_session::resources::{
+    AllowedRuntimeClass, DesiredGeneration, EgressPort, EgressProtocol, GenerationContext,
+    MvpWorkerProfile, PersistentWorkspace, PinnedSkillsConfigMap, PinnedWorkerRelayCaConfigMap,
+    PvcAccessMode, ResourceValidationError, RunAsIdentity, RuntimeClassSelection,
+    TrustedEgressRule, WorkerResources,
+};
+use openab_kubernetes_session::state::{ProfileRef, SessionAnchorV1, SessionPhase};
+use openab_kubernetes_session::wire::WorkerRegistrationV1;
+use rcgen::{generate_simple_self_signed, CertifiedKey};
+use std::collections::BTreeMap;
+use std::sync::OnceLock;
+use uuid::Uuid;
+
+const NAMESPACE: &str = "team-a-workers";
+const ANCHOR_UID: &str = "f6d6f3dd-1274-4a17-83dd-d14be72edb86";
+const PROFILE_NAME: &str = "codex-strict";
+const PROFILE_VERSION: &str = "2026-08-01";
+const IMAGE: &str = "ghcr.io/example/openab-worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const RELAY_URL: &str = "wss://openab-session-controller.openab-system.svc:8443/v1/worker";
+const RELAY_CA_NAME: &str = "openab-session-controller-ca-2026-08";
+const RELAY_CA_UID: &str = "relay-ca-uid-2026-08";
+const RELAY_CA_RESOURCE_VERSION: &str = "relay-ca-rv-42";
+const SKILLS_NAME: &str = "team-skills-2026-08-01";
+const SKILLS_UID: &str = "team-skills-uid";
+const SKILLS_RESOURCE_VERSION: &str = "team-skills-rv-42";
+const CONTROLLER_CA_DIRECTORY: &str = "/var/run/openab-controller-ca";
+const CONTROLLER_CA_FILE: &str = "/var/run/openab-controller-ca/ca.crt";
+const CONTROLLER_CA_VOLUME: &str = "controller-ca";
+
+const TRANSPORT_PROFILE_CONFIG: &str = r#"
+schema_version = 1
+
+[policy]
+compute_idle_seconds = 900
+storage_retention_seconds = 259200
+max_active_workers = 20
+
+[profiles.codex-strict]
+current_version = "2026-08-01"
+
+[profiles.codex-strict.revisions."2026-08-01"]
+image = "ghcr.io/example/openab-worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+image_pull_secrets = ["ghcr-pull-primary", "ghcr-pull-secondary"]
+
+[profiles.codex-strict.revisions."2026-08-01".relay]
+url = "wss://openab-session-controller.openab-system.svc:8443/v1/worker"
+ca_config_map_name = "openab-session-controller-ca-2026-08"
+
+[profiles.codex-strict.revisions."2026-08-01".supervisor]
+executable = "/usr/local/bin/openab-session-supervisor"
+args = ["serve"]
+
+[profiles.codex-strict.revisions."2026-08-01".workspace]
+size = "20Gi"
+storage_class = "encrypted-rwo"
+access_mode = "read_write_once_pod"
+
+[profiles.codex-strict.revisions."2026-08-01".resources.requests]
+cpu = "250m"
+memory = "256Mi"
+ephemeral_storage = "1Gi"
+
+[profiles.codex-strict.revisions."2026-08-01".resources.limits]
+cpu = "1"
+memory = "2Gi"
+ephemeral_storage = "8Gi"
+
+[profiles.codex-strict.revisions."2026-08-01".run_as]
+uid = 10001
+gid = 10001
+
+[[profiles.codex-strict.revisions."2026-08-01".egress]]
+target = "selectors"
+namespace_labels = { "kubernetes.io/metadata.name" = "openab-system" }
+pod_labels = { "app.kubernetes.io/name" = "session-relay" }
+
+[[profiles.codex-strict.revisions."2026-08-01".egress.ports]]
+protocol = "tcp"
+port = 8443
+
+[profiles.codex-strict.revisions."2026-08-01".skills]
+config_map_name = "team-skills-2026-08-01"
+"#;
+
+fn anchor() -> SessionAnchorV1 {
+    let now = Utc.with_ymd_and_hms(2026, 8, 1, 8, 0, 0).unwrap();
+    SessionAnchorV1::new(
+        SessionId::derive("private-team-scope", "discord:private-thread-123"),
+        ScopeId::derive("private-team-scope"),
+        ProfileRef::new(PROFILE_NAME, PROFILE_VERSION).unwrap(),
+        Uuid::from_u128(0x10),
+        Uuid::from_u128(0x20),
+        now,
+        now + Duration::minutes(15),
+        now + Duration::hours(72),
+    )
+    .unwrap()
+}
+
+fn context() -> GenerationContext {
+    let anchor = anchor();
+    let names = ResourceNames::new(anchor.session_id());
+    GenerationContext::from_anchor(NAMESPACE, names.anchor(), ANCHOR_UID, &anchor, names).unwrap()
+}
+
+fn profile(
+    access_mode: PvcAccessMode,
+    runtime_class: Option<RuntimeClassSelection>,
+    skills: Option<PinnedSkillsConfigMap>,
+) -> MvpWorkerProfile {
+    MvpWorkerProfile::new(
+        ProfileRef::new(PROFILE_NAME, PROFILE_VERSION).unwrap(),
+        IMAGE,
+        ["/usr/local/bin/openab-session-supervisor"],
+        ["serve"],
+        PersistentWorkspace::new("20Gi", "encrypted-rwo", access_mode).unwrap(),
+        WorkerResources::new("250m", "1", "256Mi", "2Gi", "1Gi", "8Gi").unwrap(),
+        trusted_egress(),
+        RunAsIdentity::new(10001, 10001).unwrap(),
+        runtime_class,
+        skills,
+    )
+    .unwrap()
+}
+
+fn trusted_egress() -> Vec<TrustedEgressRule> {
+    vec![
+        TrustedEgressRule::for_selectors(
+            BTreeMap::from([(
+                "kubernetes.io/metadata.name".to_string(),
+                "openab-system".to_string(),
+            )]),
+            BTreeMap::from([(
+                "app.kubernetes.io/name".to_string(),
+                "session-relay".to_string(),
+            )]),
+            [EgressPort::new(EgressProtocol::Tcp, 443).unwrap()],
+        )
+        .unwrap(),
+        TrustedEgressRule::for_cidr(
+            "10.96.0.10/32",
+            [
+                EgressPort::new(EgressProtocol::Udp, 53).unwrap(),
+                EgressPort::new(EgressProtocol::Tcp, 53).unwrap(),
+            ],
+        )
+        .unwrap(),
+    ]
+}
+
+fn runtime_class(name: &str, handler: &str) -> RuntimeClass {
+    RuntimeClass {
+        handler: handler.into(),
+        metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+            name: Some(name.into()),
+            uid: Some(format!("{name}-uid")),
+            resource_version: Some("rv-11".into()),
+            ..Default::default()
+        },
+        overhead: None,
+        scheduling: None,
+    }
+}
+
+fn selected_runtime(name: &str, handler: &str) -> RuntimeClassSelection {
+    let observed = runtime_class(name, handler);
+    RuntimeClassSelection::from_observed(
+        &observed,
+        [AllowedRuntimeClass::new(name, handler).unwrap()],
+    )
+    .unwrap()
+}
+
+fn selected_skills(name: &str, uid: &str, resource_version: &str) -> PinnedSkillsConfigMap {
+    let observed = ConfigMap {
+        immutable: Some(true),
+        metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+            name: Some(name.into()),
+            namespace: Some(NAMESPACE.into()),
+            uid: Some(uid.into()),
+            resource_version: Some(resource_version.into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    PinnedSkillsConfigMap::from_observed(NAMESPACE, &observed).unwrap()
+}
+
+fn observed_transport_skills() -> ConfigMap {
+    ConfigMap {
+        data: Some(BTreeMap::from([(
+            "review.skill.md".to_owned(),
+            "centrally managed and read-only".to_owned(),
+        )])),
+        immutable: Some(true),
+        metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+            name: Some(SKILLS_NAME.into()),
+            namespace: Some(NAMESPACE.into()),
+            uid: Some(SKILLS_UID.into()),
+            resource_version: Some(SKILLS_RESOURCE_VERSION.into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+fn relay_ca_pem() -> &'static str {
+    static PEM: OnceLock<String> = OnceLock::new();
+    PEM.get_or_init(|| {
+        let CertifiedKey { cert, .. } =
+            generate_simple_self_signed(vec!["controller.example.test".to_owned()])
+                .expect("test relay CA certificate");
+        cert.pem()
+    })
+}
+
+fn observed_relay_ca() -> ConfigMap {
+    ConfigMap {
+        data: Some(BTreeMap::from([(
+            "ca.crt".to_owned(),
+            relay_ca_pem().to_owned(),
+        )])),
+        immutable: Some(true),
+        metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+            name: Some(RELAY_CA_NAME.into()),
+            namespace: Some(NAMESPACE.into()),
+            uid: Some(RELAY_CA_UID.into()),
+            resource_version: Some(RELAY_CA_RESOURCE_VERSION.into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+fn transport_profile(observed_skills: &ConfigMap, observed_ca: &ConfigMap) -> MvpWorkerProfile {
+    transport_profile_from_config(TRANSPORT_PROFILE_CONFIG, observed_skills, observed_ca)
+}
+
+fn transport_profile_from_config(
+    profile_config: &str,
+    observed_skills: &ConfigMap,
+    observed_ca: &ConfigMap,
+) -> MvpWorkerProfile {
+    let config = TrustedControllerConfigV1::from_toml(profile_config).unwrap();
+    let loaded = config.profile(PROFILE_NAME).unwrap().clone();
+    let skills = loaded
+        .skills_intent()
+        .unwrap()
+        .resolve_observed(NAMESPACE, observed_skills)
+        .unwrap();
+    let relay_ca: PinnedWorkerRelayCaConfigMap = loaded
+        .relay()
+        .ca_config_map()
+        .resolve_observed(NAMESPACE, observed_ca)
+        .unwrap();
+
+    loaded
+        .resolve_cluster_references(ResolvedClusterReferences::new(None, Some(skills), relay_ca))
+        .unwrap()
+        .into_worker_profile()
+}
+
+fn transport_desired() -> DesiredGeneration {
+    DesiredGeneration::build(
+        context(),
+        transport_profile(&observed_transport_skills(), &observed_relay_ca()),
+        [0x5a; 32],
+    )
+    .unwrap()
+}
+
+fn desired() -> DesiredGeneration {
+    DesiredGeneration::build(
+        context(),
+        profile(PvcAccessMode::default(), None, None),
+        [0x5a; 32],
+    )
+    .unwrap()
+}
+
+fn annotations(
+    object: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta,
+) -> &BTreeMap<String, String> {
+    object.annotations.as_ref().unwrap()
+}
+
+fn metadata_name(object: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta) -> &str {
+    object.name.as_deref().unwrap()
+}
+
+fn mark_observed(
+    metadata: &mut k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta,
+    uid: &str,
+) {
+    metadata.uid = Some(uid.into());
+    metadata.resource_version = Some("rv-observed".into());
+}
+
+#[test]
+fn context_rejects_untrusted_or_mismatched_anchor_metadata() {
+    let anchor = anchor();
+    let names = ResourceNames::new(anchor.session_id());
+
+    assert!(GenerationContext::from_anchor(
+        "INVALID_NAMESPACE",
+        names.anchor(),
+        ANCHOR_UID,
+        &anchor,
+        names,
+    )
+    .is_err());
+    assert!(GenerationContext::from_anchor(
+        NAMESPACE,
+        "oab-session-foreign",
+        ANCHOR_UID,
+        &anchor,
+        names,
+    )
+    .is_err());
+    assert!(
+        GenerationContext::from_anchor(NAMESPACE, names.anchor(), "", &anchor, names,).is_err()
+    );
+    assert!(GenerationContext::from_anchor(
+        NAMESPACE,
+        names.anchor(),
+        ANCHOR_UID,
+        &anchor,
+        ResourceNames::new(SessionId::derive("another", "session")),
+    )
+    .is_err());
+}
+
+#[test]
+fn default_generation_is_hardened_and_fully_bound() {
+    let desired = desired();
+    assert!(desired.relay_ca_config_map().is_none());
+    let context = context();
+    let expected_owner_uid = context.anchor_uid();
+
+    for metadata in [
+        &desired.persistent_volume_claim().metadata,
+        &desired.registration_secret().metadata,
+        &desired.service_account().metadata,
+        &desired.pod().metadata,
+        &desired.network_policy().metadata,
+    ] {
+        assert_eq!(metadata.namespace.as_deref(), Some(NAMESPACE));
+        let owners = metadata.owner_references.as_ref().unwrap();
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].uid, expected_owner_uid);
+        assert_eq!(owners[0].name, context.anchor_name());
+        assert_eq!(owners[0].kind, "ConfigMap");
+        assert_eq!(owners[0].controller, Some(true));
+        assert_eq!(owners[0].block_owner_deletion, Some(true));
+
+        let annotations = annotations(metadata);
+        assert_eq!(
+            annotations.get("openab.dev/scope-id").map(String::as_str),
+            Some(context.scope_id().as_hex().as_str())
+        );
+        assert_eq!(
+            annotations.get("openab.dev/session-id").map(String::as_str),
+            Some(context.session_id().as_hex().as_str())
+        );
+        assert_eq!(
+            annotations
+                .get("openab.dev/incarnation-id")
+                .map(String::as_str),
+            Some(context.incarnation_id().to_string().as_str())
+        );
+        assert_eq!(
+            annotations
+                .get("openab.dev/profile-name")
+                .map(String::as_str),
+            Some(PROFILE_NAME)
+        );
+        assert_eq!(
+            annotations
+                .get("openab.dev/profile-version")
+                .map(String::as_str),
+            Some(PROFILE_VERSION)
+        );
+        assert_eq!(
+            annotations.get("openab.dev/anchor-uid").map(String::as_str),
+            Some(ANCHOR_UID)
+        );
+    }
+
+    for metadata in [
+        &desired.registration_secret().metadata,
+        &desired.service_account().metadata,
+        &desired.pod().metadata,
+        &desired.network_policy().metadata,
+    ] {
+        let annotations = annotations(metadata);
+        assert_eq!(
+            annotations.get("openab.dev/generation").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            annotations.get("openab.dev/attempt-id").map(String::as_str),
+            Some(context.fence().attempt_id().to_string().as_str())
+        );
+        assert_eq!(
+            annotations
+                .get("openab.dev/worker-image-contract")
+                .map(String::as_str),
+            Some("session-layout-v1")
+        );
+        for key in [
+            "openab.dev/worker-relay-ca-config-map-name",
+            "openab.dev/worker-relay-ca-config-map-uid",
+            "openab.dev/worker-relay-ca-config-map-resource-version",
+        ] {
+            assert!(!annotations.contains_key(key));
+        }
+    }
+
+    let claim_metadata = &desired.persistent_volume_claim().metadata;
+    let claim_annotations = annotations(claim_metadata);
+    assert!(!claim_annotations.contains_key("openab.dev/generation"));
+    assert!(!claim_annotations.contains_key("openab.dev/attempt-id"));
+    assert!(!claim_annotations.contains_key("openab.dev/worker-image-contract"));
+    assert!(!claim_annotations.contains_key("openab.dev/skills-config-map-name"));
+    assert!(!claim_annotations.contains_key("openab.dev/runtime-class-name"));
+    assert!(!claim_metadata
+        .labels
+        .as_ref()
+        .unwrap()
+        .contains_key("openab.dev/generation"));
+
+    let claim = desired.persistent_volume_claim();
+    let claim_spec = claim.spec.as_ref().unwrap();
+    assert_eq!(
+        claim_spec.access_modes.as_deref(),
+        Some(&["ReadWriteOncePod".to_string()][..])
+    );
+    assert_eq!(
+        claim_spec.storage_class_name.as_deref(),
+        Some("encrypted-rwo")
+    );
+    assert_eq!(claim_spec.volume_mode.as_deref(), Some("Filesystem"));
+    assert_eq!(
+        claim_spec
+            .resources
+            .as_ref()
+            .unwrap()
+            .requests
+            .as_ref()
+            .unwrap()
+            .get("storage")
+            .unwrap()
+            .0,
+        "20Gi"
+    );
+
+    let secret = desired.registration_secret();
+    assert_eq!(secret.immutable, Some(true));
+    assert_eq!(secret.type_.as_deref(), Some("Opaque"));
+    assert_eq!(secret.data.as_ref().unwrap().len(), 2);
+    assert_eq!(
+        secret.data.as_ref().unwrap().get("token"),
+        Some(&ByteString(vec![0x5a; 32]))
+    );
+    assert!(secret.string_data.is_none());
+    let binding_json = &secret.data.as_ref().unwrap().get("binding.json").unwrap().0;
+    assert!(binding_json.len() <= 4 * 1024);
+    let registration: WorkerRegistrationV1 = serde_json::from_slice(binding_json).unwrap();
+    let expected_binding = SessionBinding::new(
+        context.scope_id(),
+        context.session_id(),
+        context.fence().clone(),
+        context.incarnation_id(),
+    )
+    .unwrap();
+    assert_eq!(
+        registration
+            .into_validated_binding(&expected_binding)
+            .unwrap(),
+        expected_binding
+    );
+
+    assert_eq!(
+        desired.service_account().automount_service_account_token,
+        Some(false)
+    );
+
+    let pod_spec = desired.pod().spec.as_ref().unwrap();
+    assert!(pod_spec.image_pull_secrets.is_none());
+    assert!(pod_spec
+        .volumes
+        .as_ref()
+        .unwrap()
+        .iter()
+        .all(|volume| volume.name != CONTROLLER_CA_VOLUME));
+    assert_eq!(pod_spec.restart_policy.as_deref(), Some("Never"));
+    assert_eq!(pod_spec.enable_service_links, Some(false));
+    assert_eq!(pod_spec.automount_service_account_token, Some(false));
+    assert!(pod_spec.host_network.is_none());
+    assert!(pod_spec.host_pid.is_none());
+    assert!(pod_spec.host_ipc.is_none());
+    assert_eq!(pod_spec.os.as_ref().unwrap().name, "linux");
+    assert_eq!(
+        pod_spec
+            .node_selector
+            .as_ref()
+            .unwrap()
+            .get("kubernetes.io/os")
+            .map(String::as_str),
+        Some("linux")
+    );
+    assert_eq!(pod_spec.share_process_namespace, Some(false));
+    assert_eq!(pod_spec.tolerations.as_ref().unwrap().len(), 2);
+    for (toleration, key) in pod_spec.tolerations.as_ref().unwrap().iter().zip([
+        "node.kubernetes.io/not-ready",
+        "node.kubernetes.io/unreachable",
+    ]) {
+        assert_eq!(toleration.key.as_deref(), Some(key));
+        assert_eq!(toleration.operator.as_deref(), Some("Exists"));
+        assert_eq!(toleration.effect.as_deref(), Some("NoExecute"));
+        assert_eq!(toleration.toleration_seconds, Some(300));
+        assert!(toleration.value.is_none());
+    }
+    assert_eq!(
+        pod_spec.service_account_name.as_deref(),
+        Some(
+            context
+                .resource_names()
+                .service_account(1)
+                .unwrap()
+                .as_str()
+        )
+    );
+    assert_eq!(pod_spec.service_account, pod_spec.service_account_name);
+
+    let session_volume = pod_spec
+        .volumes
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|volume| volume.name == "session")
+        .unwrap();
+    assert!(session_volume
+        .persistent_volume_claim
+        .as_ref()
+        .unwrap()
+        .read_only
+        .is_none());
+
+    let pod_security = pod_spec.security_context.as_ref().unwrap();
+    assert_eq!(pod_security.run_as_non_root, Some(true));
+    assert_eq!(pod_security.run_as_user, Some(10001));
+    assert_eq!(pod_security.run_as_group, Some(10001));
+    assert_eq!(pod_security.fs_group, Some(10001));
+    assert_eq!(
+        pod_security.seccomp_profile.as_ref().unwrap().type_,
+        "RuntimeDefault"
+    );
+
+    let container = &pod_spec.containers[0];
+    let env = container.env.as_ref().unwrap();
+    assert_eq!(env.len(), 6);
+    assert_eq!(
+        env.iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "HOME",
+            "OPENAB_WORKSPACE",
+            "OPENAB_SESSION_ROOT",
+            "OPENAB_REGISTRATION_TOKEN_FILE",
+            "OPENAB_REGISTRATION_BINDING_FILE",
+            "OPENAB_WORKER_POD_UID",
+        ]
+    );
+    assert!(env.iter().all(|entry| !matches!(
+        entry.name.as_str(),
+        "OPENAB_SESSION_CONTROLLER_URL" | "OPENAB_SESSION_CONTROLLER_CA_FILE"
+    )));
+    assert_eq!(container.working_dir.as_deref(), Some("/session"));
+    assert_eq!(
+        container.command.as_deref(),
+        Some(&["/usr/bin/tini".to_string(), "--".to_string()][..])
+    );
+    assert_eq!(
+        container.args.as_deref(),
+        Some(
+            &[
+                "/usr/local/bin/openab-session-supervisor".to_string(),
+                "serve".to_string(),
+            ][..]
+        )
+    );
+    assert!(container
+        .volume_mounts
+        .as_ref()
+        .unwrap()
+        .iter()
+        .filter(|mount| mount.name != "registration" && mount.name != "skills")
+        .all(|mount| mount.read_only.is_none()));
+    let security = container.security_context.as_ref().unwrap();
+    assert_eq!(security.allow_privilege_escalation, Some(false));
+    assert_eq!(security.privileged, Some(false));
+    assert_eq!(security.read_only_root_filesystem, Some(true));
+    assert_eq!(security.run_as_non_root, Some(true));
+    assert_eq!(
+        security.capabilities.as_ref().unwrap().drop.as_deref(),
+        Some(&["ALL".to_string()][..])
+    );
+
+    let resources = container.resources.as_ref().unwrap();
+    for name in ["cpu", "memory", "ephemeral-storage"] {
+        assert!(resources.requests.as_ref().unwrap().contains_key(name));
+        assert!(resources.limits.as_ref().unwrap().contains_key(name));
+    }
+}
+
+#[test]
+fn resolved_transport_profile_renders_exact_pod_inputs_and_minimal_secret() {
+    let desired = transport_desired();
+    let relay_ca_pin = desired
+        .relay_ca_config_map()
+        .expect("resolved transport retains only the CA identity pin");
+    assert_eq!(relay_ca_pin.name(), RELAY_CA_NAME);
+    assert_eq!(relay_ca_pin.uid(), RELAY_CA_UID);
+    assert_eq!(relay_ca_pin.resource_version(), RELAY_CA_RESOURCE_VERSION);
+    let pod_spec = desired.pod().spec.as_ref().unwrap();
+    let worker = &pod_spec.containers[0];
+
+    let env = worker.env.as_ref().unwrap();
+    assert_eq!(env.len(), 8);
+    assert_eq!(
+        env.iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "OPENAB_SESSION_CONTROLLER_URL",
+            "OPENAB_SESSION_CONTROLLER_CA_FILE",
+            "OPENAB_REGISTRATION_TOKEN_FILE",
+            "OPENAB_REGISTRATION_BINDING_FILE",
+            "OPENAB_WORKER_POD_UID",
+            "OPENAB_SESSION_ROOT",
+            "OPENAB_WORKSPACE",
+            "HOME",
+        ]
+    );
+    let literal_env = env
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .value
+                .as_deref()
+                .map(|value| (entry.name.as_str(), value))
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        literal_env,
+        BTreeMap::from([
+            ("HOME", "/session/home"),
+            (
+                "OPENAB_REGISTRATION_BINDING_FILE",
+                "/var/run/openab-registration/binding.json",
+            ),
+            (
+                "OPENAB_REGISTRATION_TOKEN_FILE",
+                "/var/run/openab-registration/token",
+            ),
+            ("OPENAB_SESSION_CONTROLLER_CA_FILE", CONTROLLER_CA_FILE,),
+            ("OPENAB_SESSION_CONTROLLER_URL", RELAY_URL),
+            ("OPENAB_SESSION_ROOT", "/session"),
+            ("OPENAB_WORKSPACE", "/session/workspace"),
+        ])
+    );
+    let pod_uid = env
+        .iter()
+        .find(|entry| entry.name == "OPENAB_WORKER_POD_UID")
+        .unwrap();
+    assert!(pod_uid.value.is_none());
+    let field_ref = pod_uid
+        .value_from
+        .as_ref()
+        .unwrap()
+        .field_ref
+        .as_ref()
+        .unwrap();
+    assert_eq!(field_ref.api_version.as_deref(), Some("v1"));
+    assert_eq!(field_ref.field_path, "metadata.uid");
+
+    let volumes = pod_spec.volumes.as_ref().unwrap();
+    let relay_ca_volume = volumes
+        .iter()
+        .find(|volume| volume.name == CONTROLLER_CA_VOLUME)
+        .unwrap();
+    let relay_ca_source = relay_ca_volume.config_map.as_ref().unwrap();
+    assert_eq!(relay_ca_source.name, RELAY_CA_NAME);
+    assert_eq!(relay_ca_source.default_mode, Some(0o444));
+    assert_eq!(relay_ca_source.optional, Some(false));
+    let relay_ca_items = relay_ca_source.items.as_ref().unwrap();
+    assert_eq!(relay_ca_items.len(), 1);
+    assert_eq!(relay_ca_items[0].key, "ca.crt");
+    assert_eq!(relay_ca_items[0].path, "ca.crt");
+    assert_eq!(relay_ca_items[0].mode, None);
+    let relay_ca_mount = worker
+        .volume_mounts
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|mount| mount.name == CONTROLLER_CA_VOLUME)
+        .unwrap();
+    assert_eq!(relay_ca_mount.mount_path, CONTROLLER_CA_DIRECTORY);
+    assert_eq!(relay_ca_mount.read_only, Some(true));
+    assert!(relay_ca_mount.sub_path.is_none());
+
+    let image_pull_secrets = pod_spec.image_pull_secrets.as_ref().unwrap();
+    assert_eq!(
+        image_pull_secrets
+            .iter()
+            .map(|reference| reference.name.as_str())
+            .collect::<Vec<_>>(),
+        ["ghcr-pull-primary", "ghcr-pull-secondary"]
+    );
+    assert!(desired.service_account().image_pull_secrets.is_none());
+    assert!(desired.service_account().secrets.is_none());
+    assert!(volumes.iter().all(|volume| {
+        volume.secret.as_ref().is_none_or(|secret| {
+            secret.secret_name.as_deref() == desired.registration_secret().metadata.name.as_deref()
+        })
+    }));
+
+    let expected_relay_ca_annotations = [
+        ("openab.dev/worker-relay-ca-config-map-name", RELAY_CA_NAME),
+        ("openab.dev/worker-relay-ca-config-map-uid", RELAY_CA_UID),
+        (
+            "openab.dev/worker-relay-ca-config-map-resource-version",
+            RELAY_CA_RESOURCE_VERSION,
+        ),
+    ];
+    for metadata in [
+        &desired.registration_secret().metadata,
+        &desired.service_account().metadata,
+        &desired.pod().metadata,
+        &desired.network_policy().metadata,
+    ] {
+        let annotations = annotations(metadata);
+        for (key, expected) in expected_relay_ca_annotations {
+            assert_eq!(annotations.get(key).map(String::as_str), Some(expected));
+        }
+    }
+    let pvc_annotations = annotations(&desired.persistent_volume_claim().metadata);
+    for (key, _) in expected_relay_ca_annotations {
+        assert!(!pvc_annotations.contains_key(key));
+    }
+
+    let secret = desired.registration_secret();
+    let data = secret.data.as_ref().unwrap();
+    assert_eq!(
+        data.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["binding.json", "token"]
+    );
+    assert!(secret.string_data.is_none());
+    const CERTIFICATE_MARKER: &[u8] = b"-----BEGIN CERTIFICATE-----";
+    assert!(data.values().all(|value| !value
+        .0
+        .windows(CERTIFICATE_MARKER.len())
+        .any(|window| window == CERTIFICATE_MARKER)));
+}
+
+#[test]
+fn resolved_transport_without_pull_secrets_keeps_both_pod_and_account_empty() {
+    let profile_config = TRANSPORT_PROFILE_CONFIG.replacen(
+        "image_pull_secrets = [\"ghcr-pull-primary\", \"ghcr-pull-secondary\"]",
+        "image_pull_secrets = []",
+        1,
+    );
+    let desired = DesiredGeneration::build(
+        context(),
+        transport_profile_from_config(
+            &profile_config,
+            &observed_transport_skills(),
+            &observed_relay_ca(),
+        ),
+        [0x5a; 32],
+    )
+    .unwrap();
+
+    let pod_spec = desired.pod().spec.as_ref().unwrap();
+    assert!(pod_spec.image_pull_secrets.is_none());
+    assert!(desired.service_account().image_pull_secrets.is_none());
+    assert!(pod_spec
+        .volumes
+        .as_ref()
+        .unwrap()
+        .iter()
+        .any(|volume| volume.name == CONTROLLER_CA_VOLUME));
+}
+
+#[test]
+fn transport_env_ca_mount_annotations_and_pull_refs_are_adoption_protected() {
+    let desired = transport_desired();
+    let observed = || {
+        let mut pod = desired.pod().clone();
+        mark_observed(&mut pod.metadata, "transport-pod-uid");
+        pod
+    };
+
+    let exact = observed();
+    desired.validate_pod(&exact).unwrap();
+
+    let mut changed_url = observed();
+    changed_url.spec.as_mut().unwrap().containers[0]
+        .env
+        .as_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|entry| entry.name == "OPENAB_SESSION_CONTROLLER_URL")
+        .unwrap()
+        .value = Some("wss://different.example/v1/worker".into());
+
+    let mut changed_ca_mode = observed();
+    changed_ca_mode
+        .spec
+        .as_mut()
+        .unwrap()
+        .volumes
+        .as_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|volume| volume.name == CONTROLLER_CA_VOLUME)
+        .unwrap()
+        .config_map
+        .as_mut()
+        .unwrap()
+        .default_mode = None;
+
+    let mut writable_ca_mount = observed();
+    writable_ca_mount.spec.as_mut().unwrap().containers[0]
+        .volume_mounts
+        .as_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|mount| mount.name == CONTROLLER_CA_VOLUME)
+        .unwrap()
+        .read_only = None;
+
+    let mut reordered_pull_secrets = observed();
+    reordered_pull_secrets
+        .spec
+        .as_mut()
+        .unwrap()
+        .image_pull_secrets
+        .as_mut()
+        .unwrap()
+        .reverse();
+
+    for mutated in [
+        changed_url,
+        changed_ca_mode,
+        writable_ca_mount,
+        reordered_pull_secrets,
+    ] {
+        assert_eq!(
+            desired.validate_pod(&mutated),
+            Err(ResourceValidationError::SpecMismatch { resource: "Pod" })
+        );
+    }
+
+    let mut changed_pin = observed();
+    changed_pin.metadata.annotations.as_mut().unwrap().insert(
+        "openab.dev/worker-relay-ca-config-map-uid".into(),
+        "replacement-ca-uid".into(),
+    );
+    assert_eq!(
+        desired.validate_pod(&changed_pin),
+        Err(ResourceValidationError::MetadataMismatch {
+            resource: "Pod",
+            field: "metadata.annotations",
+        })
+    );
+}
+
+#[test]
+fn two_session_generation_contract_is_private_by_construction() {
+    // This test proves the desired Kubernetes manifest contract. Actual mount
+    // namespace and filesystem enforcement remains a cluster smoke-test
+    // responsibility.
+    let shared_skills = observed_transport_skills();
+    let shared_relay_ca = observed_relay_ca();
+    let build_session = |logical_session_key: &str,
+                         attempt_id: u128,
+                         incarnation_id: u128,
+                         anchor_uid: &str,
+                         token| {
+        let now = Utc.with_ymd_and_hms(2026, 8, 1, 8, 0, 0).unwrap();
+        let anchor = SessionAnchorV1::new(
+            SessionId::derive("private-team-scope", logical_session_key),
+            ScopeId::derive("private-team-scope"),
+            ProfileRef::new(PROFILE_NAME, PROFILE_VERSION).unwrap(),
+            Uuid::from_u128(attempt_id),
+            Uuid::from_u128(incarnation_id),
+            now,
+            now + Duration::minutes(15),
+            now + Duration::hours(72),
+        )
+        .unwrap();
+        let names = ResourceNames::new(anchor.session_id());
+        let context =
+            GenerationContext::from_anchor(NAMESPACE, names.anchor(), anchor_uid, &anchor, names)
+                .unwrap();
+        DesiredGeneration::build(
+            context,
+            transport_profile(&shared_skills, &shared_relay_ca),
+            token,
+        )
+        .unwrap()
+    };
+    let session_a = build_session(
+        "discord:private-thread-a",
+        0xa1,
+        0xa2,
+        "anchor-uid-session-a",
+        [0xa5; 32],
+    );
+    let session_b = build_session(
+        "discord:private-thread-b",
+        0xb1,
+        0xb2,
+        "anchor-uid-session-b",
+        [0xb5; 32],
+    );
+
+    assert_eq!(
+        session_a.context().scope_id(),
+        session_b.context().scope_id()
+    );
+    assert_ne!(
+        session_a.context().session_id(),
+        session_b.context().session_id()
+    );
+    let private_names_a = [
+        session_a.context().anchor_name(),
+        metadata_name(&session_a.persistent_volume_claim().metadata),
+        metadata_name(&session_a.registration_secret().metadata),
+        metadata_name(&session_a.service_account().metadata),
+        metadata_name(&session_a.pod().metadata),
+        metadata_name(&session_a.network_policy().metadata),
+    ];
+    let private_names_b = [
+        session_b.context().anchor_name(),
+        metadata_name(&session_b.persistent_volume_claim().metadata),
+        metadata_name(&session_b.registration_secret().metadata),
+        metadata_name(&session_b.service_account().metadata),
+        metadata_name(&session_b.pod().metadata),
+        metadata_name(&session_b.network_policy().metadata),
+    ];
+    for (private_a, private_b) in private_names_a.iter().zip(private_names_b.iter()) {
+        assert_ne!(private_a, private_b);
+    }
+
+    for (desired, other) in [(&session_a, &session_b), (&session_b, &session_a)] {
+        let pod_spec = desired.pod().spec.as_ref().unwrap();
+        let own_pvc_name = metadata_name(&desired.persistent_volume_claim().metadata);
+        let other_pvc_name = metadata_name(&other.persistent_volume_claim().metadata);
+        let own_registration_secret = metadata_name(&desired.registration_secret().metadata);
+        let other_registration_secret = metadata_name(&other.registration_secret().metadata);
+        let own_service_account = metadata_name(&desired.service_account().metadata);
+        let other_service_account = metadata_name(&other.service_account().metadata);
+        let volumes = pod_spec.volumes.as_ref().unwrap();
+        let mounts = pod_spec.containers[0].volume_mounts.as_ref().unwrap();
+
+        assert_eq!(
+            pod_spec.service_account_name.as_deref(),
+            Some(own_service_account)
+        );
+        assert_ne!(
+            pod_spec.service_account_name.as_deref(),
+            Some(other_service_account)
+        );
+        assert_eq!(pod_spec.service_account, pod_spec.service_account_name);
+        assert_eq!(pod_spec.automount_service_account_token, Some(false));
+        assert_eq!(
+            desired.service_account().automount_service_account_token,
+            Some(false)
+        );
+        assert!(desired.service_account().secrets.is_none());
+
+        let session_volume = volumes
+            .iter()
+            .find(|volume| volume.name == "session")
+            .unwrap();
+        assert_eq!(
+            session_volume
+                .persistent_volume_claim
+                .as_ref()
+                .unwrap()
+                .claim_name,
+            own_pvc_name
+        );
+        assert_ne!(
+            session_volume
+                .persistent_volume_claim
+                .as_ref()
+                .unwrap()
+                .claim_name,
+            other_pvc_name
+        );
+        assert_eq!(
+            volumes
+                .iter()
+                .filter(|volume| volume.persistent_volume_claim.is_some())
+                .count(),
+            1
+        );
+        let registration_volume = volumes
+            .iter()
+            .find(|volume| volume.name == "registration")
+            .unwrap();
+        assert_eq!(
+            registration_volume
+                .secret
+                .as_ref()
+                .unwrap()
+                .secret_name
+                .as_deref(),
+            Some(own_registration_secret)
+        );
+        assert_ne!(
+            registration_volume
+                .secret
+                .as_ref()
+                .unwrap()
+                .secret_name
+                .as_deref(),
+            Some(other_registration_secret)
+        );
+        assert_eq!(
+            volumes
+                .iter()
+                .filter(|volume| volume.secret.is_some())
+                .count(),
+            1
+        );
+        assert!(volumes.iter().all(|volume| {
+            volume.host_path.is_none() && volume.nfs.is_none() && volume.projected.is_none()
+        }));
+        assert_eq!(
+            mounts
+                .iter()
+                .filter(|mount| mount.read_only != Some(true))
+                .map(|mount| mount.name.as_str())
+                .collect::<Vec<_>>(),
+            ["session", "tmp", "var-tmp", "openab-run"]
+        );
+        assert!(mounts
+            .iter()
+            .filter(|mount| {
+                matches!(
+                    mount.name.as_str(),
+                    "registration" | "skills" | CONTROLLER_CA_VOLUME
+                )
+            })
+            .all(|mount| mount.read_only == Some(true)));
+        assert_eq!(
+            pod_spec.containers[0]
+                .security_context
+                .as_ref()
+                .unwrap()
+                .read_only_root_filesystem,
+            Some(true)
+        );
+        let env = pod_spec.containers[0].env.as_ref().unwrap();
+        assert_eq!(
+            env.iter()
+                .find(|entry| entry.name == "HOME")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("/session/home")
+        );
+        assert_eq!(
+            env.iter()
+                .find(|entry| entry.name == "OPENAB_WORKSPACE")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("/session/workspace")
+        );
+
+        let skills_volume = volumes
+            .iter()
+            .find(|volume| volume.name == "skills")
+            .unwrap();
+        assert_eq!(
+            skills_volume.config_map.as_ref().unwrap().name,
+            "team-skills-2026-08-01"
+        );
+        assert_eq!(
+            skills_volume.config_map.as_ref().unwrap().default_mode,
+            Some(0o444)
+        );
+        let skills_mount = mounts.iter().find(|mount| mount.name == "skills").unwrap();
+        assert_eq!(skills_mount.mount_path, "/opt/openab/skills");
+        assert_eq!(skills_mount.read_only, Some(true));
+        desired.validate_skills_config_map(&shared_skills).unwrap();
+
+        let relay_ca_volume = volumes
+            .iter()
+            .find(|volume| volume.name == CONTROLLER_CA_VOLUME)
+            .unwrap();
+        let relay_ca_source = relay_ca_volume.config_map.as_ref().unwrap();
+        assert_eq!(relay_ca_source.name, RELAY_CA_NAME);
+        assert_eq!(relay_ca_source.default_mode, Some(0o444));
+        assert_eq!(relay_ca_source.items.as_ref().unwrap().len(), 1);
+        let relay_ca_mount = mounts
+            .iter()
+            .find(|mount| mount.name == CONTROLLER_CA_VOLUME)
+            .unwrap();
+        assert_eq!(relay_ca_mount.mount_path, CONTROLLER_CA_DIRECTORY);
+        assert_eq!(relay_ca_mount.read_only, Some(true));
+        assert_eq!(
+            volumes
+                .iter()
+                .filter(|volume| volume.config_map.is_some())
+                .count(),
+            2
+        );
+
+        assert_eq!(
+            pod_spec
+                .image_pull_secrets
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|reference| reference.name.as_str())
+                .collect::<Vec<_>>(),
+            ["ghcr-pull-primary", "ghcr-pull-secondary"]
+        );
+        assert!(desired.service_account().image_pull_secrets.is_none());
+        let generation_annotations = annotations(&desired.pod().metadata);
+        assert_eq!(
+            generation_annotations
+                .get("openab.dev/worker-relay-ca-config-map-name")
+                .map(String::as_str),
+            Some(RELAY_CA_NAME)
+        );
+        assert_eq!(
+            generation_annotations
+                .get("openab.dev/worker-relay-ca-config-map-uid")
+                .map(String::as_str),
+            Some(RELAY_CA_UID)
+        );
+        assert_eq!(
+            generation_annotations
+                .get("openab.dev/worker-relay-ca-config-map-resource-version")
+                .map(String::as_str),
+            Some(RELAY_CA_RESOURCE_VERSION)
+        );
+
+        let policy = desired.network_policy().spec.as_ref().unwrap();
+        let other_policy = other.network_policy().spec.as_ref().unwrap();
+        assert!(policy.ingress.is_none());
+        assert_ne!(policy.pod_selector, other_policy.pod_selector);
+        assert_eq!(policy.egress, other_policy.egress);
+    }
+
+    assert_ne!(
+        session_a
+            .registration_secret()
+            .data
+            .as_ref()
+            .unwrap()
+            .get("token"),
+        session_b
+            .registration_secret()
+            .data
+            .as_ref()
+            .unwrap()
+            .get("token")
+    );
+
+    let mut observed_b_pvc = session_b.persistent_volume_claim().clone();
+    mark_observed(&mut observed_b_pvc.metadata, "session-b-pvc-uid");
+    assert!(session_a
+        .validate_persistent_volume_claim(&observed_b_pvc)
+        .is_err());
+    let mut observed_b_secret = session_b.registration_secret().clone();
+    mark_observed(&mut observed_b_secret.metadata, "session-b-secret-uid");
+    assert!(session_a
+        .validate_registration_secret(&observed_b_secret)
+        .is_err());
+    let mut observed_b_account = session_b.service_account().clone();
+    mark_observed(&mut observed_b_account.metadata, "session-b-account-uid");
+    assert!(session_a
+        .validate_service_account(&observed_b_account)
+        .is_err());
+    let mut observed_b_pod = session_b.pod().clone();
+    mark_observed(&mut observed_b_pod.metadata, "session-b-pod-uid");
+    assert!(session_a.validate_pod(&observed_b_pod).is_err());
+    let mut observed_b_policy = session_b.network_policy().clone();
+    mark_observed(&mut observed_b_policy.metadata, "session-b-policy-uid");
+    assert!(session_a
+        .validate_network_policy(&observed_b_policy)
+        .is_err());
+}
+
+#[test]
+fn replacement_generation_reuses_the_exact_session_workspace_claim() {
+    let first_anchor = anchor();
+    let first_names = ResourceNames::new(first_anchor.session_id());
+    let first_context = GenerationContext::from_anchor(
+        NAMESPACE,
+        first_names.anchor(),
+        ANCHOR_UID,
+        &first_anchor,
+        first_names,
+    )
+    .unwrap();
+    let first = DesiredGeneration::build(
+        first_context,
+        profile(PvcAccessMode::default(), None, None),
+        [0x11; 32],
+    )
+    .unwrap();
+
+    let mut second_anchor = first_anchor;
+    let first_fence = second_anchor.fence().clone();
+    second_anchor
+        .observe_pod(&first_fence, "first-pod-uid")
+        .unwrap();
+    second_anchor
+        .transition(&first_fence, SessionPhase::Ready)
+        .unwrap();
+    second_anchor
+        .transition(&first_fence, SessionPhase::Suspending)
+        .unwrap();
+    second_anchor
+        .confirm_pod_deleted(&first_fence, "first-pod-uid")
+        .unwrap();
+    second_anchor
+        .transition(&first_fence, SessionPhase::Suspended)
+        .unwrap();
+    let resumed_at = second_anchor.last_activity_at() + Duration::minutes(20);
+    second_anchor
+        .advance_generation(
+            &first_fence,
+            Uuid::from_u128(0x30),
+            resumed_at,
+            resumed_at + Duration::minutes(15),
+            resumed_at + Duration::hours(72),
+        )
+        .unwrap();
+    let second_names = ResourceNames::new(second_anchor.session_id());
+    let second_context = GenerationContext::from_anchor(
+        NAMESPACE,
+        second_names.anchor(),
+        ANCHOR_UID,
+        &second_anchor,
+        second_names,
+    )
+    .unwrap();
+    let second = DesiredGeneration::build(
+        second_context,
+        profile(PvcAccessMode::default(), None, None),
+        [0x22; 32],
+    )
+    .unwrap();
+
+    assert_eq!(
+        first.persistent_volume_claim(),
+        second.persistent_volume_claim()
+    );
+    assert_ne!(
+        first.pod().metadata.name,
+        second.pod().metadata.name,
+        "worker resources remain generation-scoped"
+    );
+    let mut observed = first.persistent_volume_claim().clone();
+    mark_observed(&mut observed.metadata, "workspace-pvc-uid");
+    second.validate_persistent_volume_claim(&observed).unwrap();
+}
+
+#[test]
+fn token_is_only_a_read_only_secret_file_and_no_host_path_is_present() {
+    let desired = desired();
+    let pod_spec = desired.pod().spec.as_ref().unwrap();
+    assert!(pod_spec
+        .volumes
+        .as_ref()
+        .unwrap()
+        .iter()
+        .all(|volume| volume.host_path.is_none()));
+
+    let container = &pod_spec.containers[0];
+    let env = container.env.as_ref().unwrap();
+    assert!(env
+        .iter()
+        .all(|entry| entry.value.as_deref() != Some(&"Z".repeat(32))));
+    let pod_uid = env
+        .iter()
+        .find(|entry| entry.name == "OPENAB_WORKER_POD_UID")
+        .expect("worker Pod UID from the Downward API");
+    assert!(pod_uid.value.is_none());
+    let field_ref = pod_uid
+        .value_from
+        .as_ref()
+        .and_then(|source| source.field_ref.as_ref())
+        .expect("metadata.uid fieldRef");
+    assert_eq!(field_ref.api_version.as_deref(), Some("v1"));
+    assert_eq!(field_ref.field_path, "metadata.uid");
+    assert!(env
+        .iter()
+        .filter(|entry| entry.name != "OPENAB_WORKER_POD_UID")
+        .all(|entry| entry.value_from.is_none()));
+    assert_eq!(
+        env.iter()
+            .find(|entry| entry.name == "OPENAB_REGISTRATION_TOKEN_FILE")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("/var/run/openab-registration/token")
+    );
+    assert_eq!(
+        env.iter()
+            .find(|entry| entry.name == "OPENAB_REGISTRATION_BINDING_FILE")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("/var/run/openab-registration/binding.json")
+    );
+    assert_eq!(
+        env.iter()
+            .find(|entry| entry.name == "OPENAB_SESSION_ROOT")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("/session")
+    );
+
+    let token_mount = container
+        .volume_mounts
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|mount| mount.name == "registration")
+        .unwrap();
+    assert_eq!(token_mount.mount_path, "/var/run/openab-registration");
+    assert_eq!(token_mount.read_only, Some(true));
+    let registration_volume = pod_spec
+        .volumes
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|volume| volume.name == "registration")
+        .unwrap();
+    let secret_source = registration_volume.secret.as_ref().unwrap();
+    assert_eq!(secret_source.default_mode, Some(0o400));
+    let projected_items = secret_source.items.as_ref().unwrap();
+    assert!(projected_items.iter().all(|item| item.mode == Some(0o400)));
+    assert_eq!(
+        pod_spec.security_context.as_ref().unwrap().fs_group,
+        Some(10001)
+    );
+    assert_eq!(
+        container.security_context.as_ref().unwrap().run_as_group,
+        Some(10001)
+    );
+    let projected_keys: Vec<&str> = projected_items
+        .iter()
+        .map(|item| item.key.as_str())
+        .collect();
+    assert_eq!(projected_keys, ["token", "binding.json"]);
+
+    for path in ["/tmp", "/var/tmp", "/run/openab"] {
+        assert!(container
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|mount| mount.mount_path == path));
+    }
+}
+
+#[test]
+fn runtime_and_pinned_immutable_skills_are_opt_in() {
+    let runtime = selected_runtime("kata-qemu", "kata-qemu");
+    let skills = selected_skills("skills-2026-08-01", "skills-uid", "rv-42");
+    let desired = DesiredGeneration::build(
+        context(),
+        profile(PvcAccessMode::ReadWriteOnce, Some(runtime), Some(skills)),
+        [7; 32],
+    )
+    .unwrap();
+
+    let pod_spec = desired.pod().spec.as_ref().unwrap();
+    assert_eq!(pod_spec.runtime_class_name.as_deref(), Some("kata-qemu"));
+    desired
+        .validate_runtime_class(&runtime_class("kata-qemu", "kata-qemu"))
+        .unwrap();
+    assert_eq!(
+        desired
+            .persistent_volume_claim()
+            .spec
+            .as_ref()
+            .unwrap()
+            .access_modes
+            .as_deref(),
+        Some(&["ReadWriteOnce".to_string()][..])
+    );
+    let skills_volume = pod_spec
+        .volumes
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|volume| volume.name == "skills")
+        .unwrap();
+    assert_eq!(
+        skills_volume.config_map.as_ref().unwrap().name,
+        "skills-2026-08-01"
+    );
+    let skills_mount = pod_spec.containers[0]
+        .volume_mounts
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|mount| mount.name == "skills")
+        .unwrap();
+    assert_eq!(skills_mount.mount_path, "/opt/openab/skills");
+    assert_eq!(skills_mount.read_only, Some(true));
+
+    let observed = ConfigMap {
+        immutable: Some(true),
+        metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+            name: Some("skills-2026-08-01".into()),
+            namespace: Some(NAMESPACE.into()),
+            uid: Some("skills-uid".into()),
+            resource_version: Some("rv-42".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    desired.validate_skills_config_map(&observed).unwrap();
+
+    let mut mutable = observed;
+    mutable.immutable = Some(false);
+    assert!(desired.validate_skills_config_map(&mutable).is_err());
+}
+
+#[test]
+fn observed_validation_rejects_foreign_owner_and_stale_fence() {
+    let desired = desired();
+
+    let mut foreign = desired.pod().clone();
+    mark_observed(&mut foreign.metadata, "pod-uid");
+    foreign.metadata.owner_references.as_mut().unwrap()[0].uid = "foreign-uid".into();
+    assert!(matches!(
+        desired.validate_pod(&foreign),
+        Err(ResourceValidationError::MetadataMismatch { .. })
+    ));
+
+    let mut stale = desired.pod().clone();
+    mark_observed(&mut stale.metadata, "pod-uid");
+    stale.metadata.annotations.as_mut().unwrap().insert(
+        "openab.dev/attempt-id".into(),
+        Uuid::from_u128(0x99).to_string(),
+    );
+    assert!(matches!(
+        desired.validate_pod(&stale),
+        Err(ResourceValidationError::MetadataMismatch { .. })
+    ));
+
+    let mut wrong_generation = desired.pod().clone();
+    mark_observed(&mut wrong_generation.metadata, "pod-uid");
+    wrong_generation
+        .metadata
+        .annotations
+        .as_mut()
+        .unwrap()
+        .insert("openab.dev/generation".into(), "2".into());
+    assert!(matches!(
+        desired.validate_pod(&wrong_generation),
+        Err(ResourceValidationError::MetadataMismatch { .. })
+    ));
+
+    let mut wrong_name = desired.pod().clone();
+    mark_observed(&mut wrong_name.metadata, "pod-uid");
+    wrong_name.metadata.name = Some("oab-worker-foreign-g2".into());
+    assert!(matches!(
+        desired.validate_pod(&wrong_name),
+        Err(ResourceValidationError::MetadataMismatch { .. })
+    ));
+
+    let mut foreign_binding = desired.pod().clone();
+    mark_observed(&mut foreign_binding.metadata, "pod-uid");
+    foreign_binding
+        .metadata
+        .annotations
+        .as_mut()
+        .unwrap()
+        .insert("openab.dev/foreign-binding".into(), "true".into());
+    assert!(matches!(
+        desired.validate_pod(&foreign_binding),
+        Err(ResourceValidationError::MetadataMismatch { .. })
+    ));
+
+    let mut injected_label = desired.pod().clone();
+    mark_observed(&mut injected_label.metadata, "pod-uid");
+    injected_label
+        .metadata
+        .labels
+        .as_mut()
+        .unwrap()
+        .insert("mesh.example/injected".into(), "true".into());
+    assert!(matches!(
+        desired.validate_pod(&injected_label),
+        Err(ResourceValidationError::MetadataMismatch { .. })
+    ));
+}
+
+#[test]
+fn observed_validation_rejects_sidecars_host_mounts_and_weakened_security() {
+    let desired = desired();
+
+    let mut sidecar = desired.pod().clone();
+    mark_observed(&mut sidecar.metadata, "pod-uid");
+    sidecar.spec.as_mut().unwrap().containers.push(Container {
+        name: "injected-sidecar".into(),
+        image: Some("example.invalid/sidecar@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()),
+        ..Default::default()
+    });
+    assert!(matches!(
+        desired.validate_pod(&sidecar),
+        Err(ResourceValidationError::SpecMismatch { .. })
+    ));
+
+    let mut host_mount = desired.pod().clone();
+    mark_observed(&mut host_mount.metadata, "pod-uid");
+    host_mount.spec.as_mut().unwrap().volumes.as_mut().unwrap()[0].host_path =
+        Some(HostPathVolumeSource {
+            path: "/".into(),
+            type_: None,
+        });
+    assert!(matches!(
+        desired.validate_pod(&host_mount),
+        Err(ResourceValidationError::SpecMismatch { .. })
+    ));
+
+    let mut weakened = desired.pod().clone();
+    mark_observed(&mut weakened.metadata, "pod-uid");
+    weakened.spec.as_mut().unwrap().containers[0]
+        .security_context
+        .as_mut()
+        .unwrap()
+        .allow_privilege_escalation = Some(true);
+    assert!(matches!(
+        desired.validate_pod(&weakened),
+        Err(ResourceValidationError::SpecMismatch { .. })
+    ));
+
+    let mut replaced_init = desired.pod().clone();
+    mark_observed(&mut replaced_init.metadata, "pod-uid");
+    replaced_init.spec.as_mut().unwrap().containers[0].command =
+        Some(vec!["/usr/local/bin/openab-session-supervisor".into()]);
+    assert!(matches!(
+        desired.validate_pod(&replaced_init),
+        Err(ResourceValidationError::SpecMismatch { .. })
+    ));
+}
+
+#[test]
+fn observed_validation_accepts_server_metadata_and_status_only() {
+    let desired = desired();
+    let mut observed = desired.pod().clone();
+    observed.metadata.uid = Some("pod-uid".into());
+    observed.metadata.resource_version = Some("rv-5".into());
+    observed.metadata.creation_timestamp = Some(Time("2026-08-01T08:00:00Z".parse().unwrap()));
+    observed.status = Some(Default::default());
+    desired.validate_pod(&observed).unwrap();
+}
+
+#[test]
+fn observed_validation_accepts_only_known_api_server_canonicalization() {
+    let desired = desired();
+    let mut observed = desired.pod().clone();
+    mark_observed(&mut observed.metadata, "pod-uid");
+    let spec = observed.spec.as_mut().unwrap();
+
+    // Go non-pointer booleans with `omitempty` are normally absent on
+    // read-back, but accepting an explicit false is semantically identical.
+    spec.host_network = Some(false);
+    spec.host_pid = Some(false);
+    spec.host_ipc = Some(false);
+    spec.volumes
+        .as_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|volume| volume.name == "session")
+        .unwrap()
+        .persistent_volume_claim
+        .as_mut()
+        .unwrap()
+        .read_only = Some(false);
+    for mount in spec.containers[0]
+        .volume_mounts
+        .as_mut()
+        .unwrap()
+        .iter_mut()
+        .filter(|mount| mount.read_only.is_none())
+    {
+        mount.read_only = Some(false);
+    }
+    spec.containers[0].resize_policy = Some(vec![
+        ContainerResizePolicy {
+            resource_name: "memory".into(),
+            restart_policy: "NotRequired".into(),
+        },
+        ContainerResizePolicy {
+            resource_name: "cpu".into(),
+            restart_policy: "NotRequired".into(),
+        },
+    ]);
+    desired.validate_pod(&observed).unwrap();
+
+    let mut widened = observed;
+    widened.spec.as_mut().unwrap().host_network = Some(true);
+    assert!(matches!(
+        desired.validate_pod(&widened),
+        Err(ResourceValidationError::SpecMismatch { .. })
+    ));
+}
+
+#[test]
+fn observed_validation_requires_api_identity_metadata() {
+    let desired = desired();
+    assert!(matches!(
+        desired.validate_pod(desired.pod()),
+        Err(ResourceValidationError::MetadataMismatch {
+            field: "metadata.uid",
+            ..
+        })
+    ));
+    let mut observed = desired.pod().clone();
+    observed.metadata.uid = Some("pod-uid".into());
+    assert!(matches!(
+        desired.validate_pod(&observed),
+        Err(ResourceValidationError::MetadataMismatch {
+            field: "metadata.resourceVersion",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn pvc_validation_allows_only_known_binding_metadata() {
+    let desired = desired();
+    let mut bound = desired.persistent_volume_claim().clone();
+    mark_observed(&mut bound.metadata, "pvc-uid");
+    bound.spec.as_mut().unwrap().volume_name = Some("pvc-01234567".into());
+    bound.metadata.finalizers = Some(vec!["kubernetes.io/pvc-protection".into()]);
+    bound.metadata.annotations.as_mut().unwrap().extend([
+        ("pv.kubernetes.io/bind-completed".into(), "yes".into()),
+        ("pv.kubernetes.io/bound-by-controller".into(), "yes".into()),
+        (
+            "volume.kubernetes.io/selected-node".into(),
+            "worker-node-01".into(),
+        ),
+        (
+            "volume.kubernetes.io/storage-provisioner".into(),
+            "rancher.io/local-path".into(),
+        ),
+        (
+            "volume.beta.kubernetes.io/storage-provisioner".into(),
+            "rancher.io/local-path".into(),
+        ),
+        (
+            "volume.kubernetes.io/storage-resizer".into(),
+            "kubernetes.io/aws-ebs".into(),
+        ),
+    ]);
+    desired.validate_persistent_volume_claim(&bound).unwrap();
+
+    let mut foreign_finalizer = bound.clone();
+    foreign_finalizer
+        .metadata
+        .finalizers
+        .as_mut()
+        .unwrap()
+        .push("foreign.example/hold".into());
+    assert!(matches!(
+        desired.validate_persistent_volume_claim(&foreign_finalizer),
+        Err(ResourceValidationError::MetadataMismatch { .. })
+    ));
+
+    let mut foreign_annotation = bound;
+    foreign_annotation
+        .metadata
+        .annotations
+        .as_mut()
+        .unwrap()
+        .insert("foreign.example/injected".into(), "true".into());
+    assert!(matches!(
+        desired.validate_persistent_volume_claim(&foreign_annotation),
+        Err(ResourceValidationError::MetadataMismatch { .. })
+    ));
+}
+
+#[test]
+fn pvc_validation_rejects_malformed_storage_driver_names() {
+    let desired = desired();
+
+    for invalid in [
+        "rancher.io/local/path",
+        "/local-path",
+        "rancher.io/",
+        "rancher..io/local-path",
+    ] {
+        let mut observed = desired.persistent_volume_claim().clone();
+        mark_observed(&mut observed.metadata, "pvc-uid");
+        observed.metadata.annotations.as_mut().unwrap().insert(
+            "volume.kubernetes.io/storage-provisioner".into(),
+            invalid.into(),
+        );
+
+        assert!(matches!(
+            desired.validate_persistent_volume_claim(&observed),
+            Err(ResourceValidationError::MetadataMismatch {
+                field: "metadata.annotations",
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
+fn observed_validation_allows_only_known_binder_and_scheduler_fields() {
+    let desired = desired();
+
+    let mut scheduled = desired.pod().clone();
+    mark_observed(&mut scheduled.metadata, "pod-uid");
+    scheduled.spec.as_mut().unwrap().node_name = Some("worker-node-01".into());
+    scheduled.spec.as_mut().unwrap().priority = Some(0);
+    desired.validate_pod(&scheduled).unwrap();
+    scheduled.spec.as_mut().unwrap().priority = Some(1000);
+    assert!(matches!(
+        desired.validate_pod(&scheduled),
+        Err(ResourceValidationError::SpecMismatch { .. })
+    ));
+    scheduled.spec.as_mut().unwrap().priority = Some(0);
+    scheduled.spec.as_mut().unwrap().node_name = Some("INVALID_NODE".into());
+    assert!(matches!(
+        desired.validate_pod(&scheduled),
+        Err(ResourceValidationError::SpecMismatch { .. })
+    ));
+
+    let mut bound = desired.persistent_volume_claim().clone();
+    mark_observed(&mut bound.metadata, "pvc-uid");
+    bound.spec.as_mut().unwrap().volume_name = Some("pvc-01234567".into());
+    desired.validate_persistent_volume_claim(&bound).unwrap();
+    bound.spec.as_mut().unwrap().volume_name = Some("INVALID_VOLUME".into());
+    assert!(matches!(
+        desired.validate_persistent_volume_claim(&bound),
+        Err(ResourceValidationError::SpecMismatch { .. })
+    ));
+}
+
+#[test]
+fn supervisor_starts_on_the_fresh_pvc_root_before_creating_private_directories() {
+    let desired = desired();
+    let container = &desired.pod().spec.as_ref().unwrap().containers[0];
+    assert_eq!(container.working_dir.as_deref(), Some("/session"));
+    assert_eq!(
+        container.command.as_deref(),
+        Some(&["/usr/bin/tini".to_string(), "--".to_string()][..])
+    );
+    assert_eq!(
+        container.args.as_deref(),
+        Some(
+            &[
+                "/usr/local/bin/openab-session-supervisor".to_string(),
+                "serve".to_string(),
+            ][..]
+        )
+    );
+    let env = container.env.as_ref().unwrap();
+    assert_eq!(
+        env.iter()
+            .find(|entry| entry.name == "HOME")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("/session/home")
+    );
+    assert_eq!(
+        env.iter()
+            .find(|entry| entry.name == "OPENAB_WORKSPACE")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("/session/workspace")
+    );
+}
+
+#[test]
+fn pod_wraps_a_supervisor_without_profile_arguments_as_literal_tini_argv() {
+    let worker_profile = MvpWorkerProfile::new(
+        ProfileRef::new(PROFILE_NAME, PROFILE_VERSION).unwrap(),
+        IMAGE,
+        ["/usr/local/bin/openab-session-supervisor"],
+        Vec::<String>::new(),
+        PersistentWorkspace::new("20Gi", "encrypted-rwo", PvcAccessMode::default()).unwrap(),
+        WorkerResources::new("250m", "1", "256Mi", "2Gi", "1Gi", "8Gi").unwrap(),
+        trusted_egress(),
+        RunAsIdentity::new(10001, 10001).unwrap(),
+        None,
+        None,
+    )
+    .unwrap();
+    let desired = DesiredGeneration::build(context(), worker_profile, [0x5a; 32]).unwrap();
+    let container = &desired.pod().spec.as_ref().unwrap().containers[0];
+
+    assert_eq!(
+        container.command.as_deref(),
+        Some(&["/usr/bin/tini".to_string(), "--".to_string()][..])
+    );
+    assert_eq!(
+        container.args.as_deref(),
+        Some(&["/usr/local/bin/openab-session-supervisor".to_string()][..])
+    );
+}
+
+#[test]
+fn runtime_class_selection_is_observed_pinned_and_admission_stable() {
+    let allowed = AllowedRuntimeClass::new("kata-qemu", "kata-qemu").unwrap();
+    let mut observed = runtime_class("kata-qemu", "kata-qemu");
+    let selected = RuntimeClassSelection::from_observed(&observed, [allowed.clone()]).unwrap();
+
+    observed.overhead = Some(Overhead::default());
+    assert!(RuntimeClassSelection::from_observed(&observed, [allowed.clone()]).is_err());
+    observed.overhead = None;
+    observed.scheduling = Some(Scheduling::default());
+    assert!(RuntimeClassSelection::from_observed(&observed, [allowed]).is_err());
+
+    let desired = DesiredGeneration::build(
+        context(),
+        profile(PvcAccessMode::default(), Some(selected), None),
+        [9; 32],
+    )
+    .unwrap();
+    let mut replaced = runtime_class("kata-qemu", "kata-qemu");
+    replaced.metadata.uid = Some("replacement-uid".into());
+    assert!(desired.validate_runtime_class(&replaced).is_err());
+    let mut mutated = runtime_class("kata-qemu", "runc");
+    mutated.metadata.uid = Some("kata-qemu-uid".into());
+    assert!(desired.validate_runtime_class(&mutated).is_err());
+}
+
+#[test]
+fn generation_network_policy_is_default_deny_with_only_explicit_egress() {
+    let desired = desired();
+    let policy = desired.network_policy();
+    let spec = policy.spec.as_ref().unwrap();
+    assert!(spec.ingress.is_none());
+    assert_eq!(
+        spec.policy_types.as_deref(),
+        Some(&["Ingress".to_string(), "Egress".to_string()][..])
+    );
+
+    let pod_labels = desired.pod().metadata.labels.as_ref().unwrap();
+    let selected = spec
+        .pod_selector
+        .as_ref()
+        .unwrap()
+        .match_labels
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        selected.get("openab.dev/session"),
+        pod_labels.get("openab.dev/session")
+    );
+    assert_eq!(
+        selected.get("openab.dev/generation"),
+        Some(&"1".to_string())
+    );
+    assert_eq!(
+        selected.get("openab.dev/resource"),
+        Some(&"worker-pod".to_string())
+    );
+
+    let egress = spec.egress.as_ref().unwrap();
+    assert_eq!(egress.len(), 2);
+    let selector_peer = &egress[0].to.as_ref().unwrap()[0];
+    assert_eq!(
+        selector_peer
+            .namespace_selector
+            .as_ref()
+            .unwrap()
+            .match_labels
+            .as_ref()
+            .unwrap()
+            .get("kubernetes.io/metadata.name")
+            .map(String::as_str),
+        Some("openab-system")
+    );
+    assert_eq!(
+        selector_peer
+            .pod_selector
+            .as_ref()
+            .unwrap()
+            .match_labels
+            .as_ref()
+            .unwrap()
+            .get("app.kubernetes.io/name")
+            .map(String::as_str),
+        Some("session-relay")
+    );
+    assert_eq!(
+        egress[0].ports.as_ref().unwrap()[0].protocol.as_deref(),
+        Some("TCP")
+    );
+    let cidr_peer = &egress[1].to.as_ref().unwrap()[0];
+    assert_eq!(cidr_peer.ip_block.as_ref().unwrap().cidr, "10.96.0.10/32");
+    assert_eq!(egress[1].ports.as_ref().unwrap().len(), 2);
+}
+
+#[test]
+fn network_policy_observation_rejects_foreign_or_mutated_objects() {
+    let desired = desired();
+    let mut foreign = desired.network_policy().clone();
+    mark_observed(&mut foreign.metadata, "network-policy-uid");
+    foreign.metadata.owner_references.as_mut().unwrap()[0].uid = "foreign".into();
+    assert!(matches!(
+        desired.validate_network_policy(&foreign),
+        Err(ResourceValidationError::MetadataMismatch { .. })
+    ));
+
+    let mut canonical_empty = desired.network_policy().clone();
+    mark_observed(&mut canonical_empty.metadata, "network-policy-uid");
+    canonical_empty.spec.as_mut().unwrap().ingress = Some(Vec::new());
+    desired.validate_network_policy(&canonical_empty).unwrap();
+
+    let mut widened = desired.network_policy().clone();
+    mark_observed(&mut widened.metadata, "network-policy-uid");
+    widened.spec.as_mut().unwrap().ingress = Some(vec![Default::default()]);
+    assert!(matches!(
+        desired.validate_network_policy(&widened),
+        Err(ResourceValidationError::SpecMismatch { .. })
+    ));
+
+    let mut extra_egress = desired.network_policy().clone();
+    mark_observed(&mut extra_egress.metadata, "network-policy-uid");
+    extra_egress
+        .spec
+        .as_mut()
+        .unwrap()
+        .egress
+        .as_mut()
+        .unwrap()
+        .push(Default::default());
+    assert!(matches!(
+        desired.validate_network_policy(&extra_egress),
+        Err(ResourceValidationError::SpecMismatch { .. })
+    ));
+}
+
+#[test]
+fn egress_profile_rejects_unbounded_or_malformed_rules() {
+    assert!(EgressPort::new(EgressProtocol::Tcp, 0).is_err());
+    let https = EgressPort::new(EgressProtocol::Tcp, 443).unwrap();
+    assert!(TrustedEgressRule::for_cidr("10.0.0.1", [https.clone()]).is_err());
+    assert!(TrustedEgressRule::for_cidr("10.0.0.1/24", [https.clone()]).is_err());
+    assert!(TrustedEgressRule::for_cidr("0.0.0.0/0", [https.clone()]).is_err());
+    assert!(TrustedEgressRule::for_cidr("0.0.0.0/1", [https.clone()]).is_err());
+    assert!(TrustedEgressRule::for_cidr("128.0.0.0/1", [https.clone()]).is_err());
+    assert!(TrustedEgressRule::for_cidr("2001:db8::/64", [https.clone()]).is_err());
+    assert!(TrustedEgressRule::for_cidr("2001:db8::1/128", [https.clone()]).is_ok());
+    assert!(TrustedEgressRule::for_cidr("10.0.0.1/32", Vec::<EgressPort>::new()).is_err());
+    assert!(TrustedEgressRule::for_selectors(
+        BTreeMap::from([("INVALID KEY".into(), "namespace".into())]),
+        BTreeMap::from([("app".into(), "relay".into())]),
+        [https]
+    )
+    .is_err());
+
+    assert!(MvpWorkerProfile::new(
+        ProfileRef::new(PROFILE_NAME, PROFILE_VERSION).unwrap(),
+        IMAGE,
+        ["/usr/local/bin/openab-session-supervisor"],
+        ["serve"],
+        PersistentWorkspace::new("20Gi", "encrypted-rwo", PvcAccessMode::default()).unwrap(),
+        WorkerResources::new("250m", "1", "256Mi", "2Gi", "1Gi", "8Gi").unwrap(),
+        Vec::<TrustedEgressRule>::new(),
+        RunAsIdentity::new(10001, 10001).unwrap(),
+        None,
+        None,
+    )
+    .is_err());
+}
+
+#[test]
+fn every_generated_name_is_dns_safe() {
+    let desired = desired();
+    for name in [
+        desired
+            .persistent_volume_claim()
+            .metadata
+            .name
+            .as_deref()
+            .unwrap(),
+        desired
+            .registration_secret()
+            .metadata
+            .name
+            .as_deref()
+            .unwrap(),
+        desired.service_account().metadata.name.as_deref().unwrap(),
+        desired.pod().metadata.name.as_deref().unwrap(),
+        desired.network_policy().metadata.name.as_deref().unwrap(),
+    ] {
+        assert!(name.len() <= 63);
+        assert!(name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'));
+        assert!(!name.starts_with('-'));
+        assert!(!name.ends_with('-'));
+    }
+}
+
+#[test]
+fn profile_requires_digest_image_and_allowlisted_runtime() {
+    let base = || {
+        (
+            ProfileRef::new(PROFILE_NAME, PROFILE_VERSION).unwrap(),
+            PersistentWorkspace::new("20Gi", "encrypted-rwo", PvcAccessMode::default()).unwrap(),
+            WorkerResources::new("250m", "1", "256Mi", "2Gi", "1Gi", "8Gi").unwrap(),
+            RunAsIdentity::new(10001, 10001).unwrap(),
+        )
+    };
+    let (profile_ref, workspace, resources, identity) = base();
+    assert!(MvpWorkerProfile::new(
+        profile_ref,
+        "ghcr.io/example/openab-worker:latest",
+        ["worker"],
+        ["serve"],
+        workspace,
+        resources,
+        trusted_egress(),
+        identity,
+        None,
+        None,
+    )
+    .is_err());
+    assert!(RuntimeClassSelection::from_observed(
+        &runtime_class("kata-qemu", "kata-qemu"),
+        [AllowedRuntimeClass::new("gvisor", "runsc").unwrap()]
+    )
+    .is_err());
+    let (profile_ref, workspace, resources, identity) = base();
+    assert!(MvpWorkerProfile::new(
+        profile_ref,
+        IMAGE,
+        ["relative-supervisor"],
+        ["serve"],
+        workspace,
+        resources,
+        trusted_egress(),
+        identity,
+        None,
+        None,
+    )
+    .is_err());
+    assert!(WorkerResources::new("1--", "1", "256Mi", "2Gi", "1Gi", "8Gi").is_err());
+    for resources in [
+        WorkerResources::new("2", "1", "256Mi", "2Gi", "1Gi", "8Gi"),
+        WorkerResources::new("250m", "1", "3Gi", "2Gi", "1Gi", "8Gi"),
+        WorkerResources::new("250m", "1", "256Mi", "2Gi", "9Gi", "8Gi"),
+    ] {
+        assert!(resources.is_err());
+    }
+    for cpu in ["1000m", "01", "1.5", "1e3"] {
+        assert!(WorkerResources::new(cpu, "1", "256Mi", "2Gi", "1Gi", "8Gi").is_err());
+    }
+    assert!(WorkerResources::new(
+        "9223372036854775808",
+        "9223372036854775808",
+        "256Mi",
+        "2Gi",
+        "1Gi",
+        "8Gi"
+    )
+    .is_err());
+    for storage in ["1.5Gi", "1024Mi", "01Gi", "+1Gi", "1e3"] {
+        assert!(
+            PersistentWorkspace::new(storage, "encrypted-rwo", PvcAccessMode::default()).is_err()
+        );
+    }
+    assert!(PersistentWorkspace::new("0Gi", "encrypted-rwo", PvcAccessMode::default()).is_err());
+    assert!(PersistentWorkspace::new("20Gi", "", PvcAccessMode::default()).is_err());
+}
+
+#[test]
+fn observed_validation_covers_every_generated_resource() {
+    let desired = desired();
+    let mut claim = desired.persistent_volume_claim().clone();
+    mark_observed(&mut claim.metadata, "pvc-uid");
+    let mut secret = desired.registration_secret().clone();
+    mark_observed(&mut secret.metadata, "secret-uid");
+    let mut account = desired.service_account().clone();
+    mark_observed(&mut account.metadata, "service-account-uid");
+    let mut pod = desired.pod().clone();
+    mark_observed(&mut pod.metadata, "pod-uid");
+    let mut policy = desired.network_policy().clone();
+    mark_observed(&mut policy.metadata, "network-policy-uid");
+    desired.validate_persistent_volume_claim(&claim).unwrap();
+    desired.validate_registration_secret(&secret).unwrap();
+    desired.validate_service_account(&account).unwrap();
+    desired.validate_pod(&pod).unwrap();
+    desired.validate_network_policy(&policy).unwrap();
+
+    let mut changed_secret = desired.registration_secret().clone();
+    mark_observed(&mut changed_secret.metadata, "secret-uid");
+    changed_secret
+        .data
+        .as_mut()
+        .unwrap()
+        .insert("token".into(), ByteString(vec![0; 32]));
+    assert!(matches!(
+        desired.validate_registration_secret(&changed_secret),
+        Err(ResourceValidationError::SpecMismatch { .. })
+    ));
+
+    let mut changed_claim = desired.persistent_volume_claim().clone();
+    mark_observed(&mut changed_claim.metadata, "pvc-uid");
+    changed_claim.spec.as_mut().unwrap().access_modes = Some(vec!["ReadWriteMany".into()]);
+    assert!(matches!(
+        desired.validate_persistent_volume_claim(&changed_claim),
+        Err(ResourceValidationError::SpecMismatch { .. })
+    ));
+
+    let mut changed_account = desired.service_account().clone();
+    mark_observed(&mut changed_account.metadata, "service-account-uid");
+    changed_account.automount_service_account_token = Some(true);
+    assert!(matches!(
+        desired.validate_service_account(&changed_account),
+        Err(ResourceValidationError::SpecMismatch { .. })
+    ));
+}
+
+#[test]
+fn generated_resources_never_retain_raw_scope_or_thread_keys() {
+    let desired = desired();
+    let serialized = serde_json::to_string(&(
+        desired.persistent_volume_claim(),
+        desired.registration_secret(),
+        desired.service_account(),
+        desired.pod(),
+        desired.network_policy(),
+    ))
+    .unwrap();
+    assert!(!serialized.contains("private-team-scope"));
+    assert!(!serialized.contains("discord:private-thread-123"));
+}
+
+#[test]
+fn desired_generation_debug_output_redacts_registration_token() {
+    let desired = DesiredGeneration::build(
+        context(),
+        profile(PvcAccessMode::default(), None, None),
+        *b"secret-token-must-never-appear!!",
+    )
+    .unwrap();
+    let debug = format!("{desired:?}");
+    assert!(!debug.contains("secret-token-must-never-appear"));
+    assert!(debug.contains("registration_secret: <redacted>"));
+}

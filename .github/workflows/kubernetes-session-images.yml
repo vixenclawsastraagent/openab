@@ -1,0 +1,87 @@
+name: Kubernetes Session Images
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - '.github/workflows/kubernetes-session-images.yml'
+      - 'Dockerfile.kubernetes-session'
+      - 'scripts/test-kubernetes-session-images.sh'
+      - 'scripts/test-kubernetes-session-kind.sh'
+      - 'scripts/test-kubernetes-session-kind-contract.sh'
+      - 'tests/fixtures/kubernetes-session-kind/**'
+      - 'charts/openab-kubernetes-session/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'src/**'
+      - 'crates/openab-core/Cargo.toml'
+      - 'crates/openab-core/src/**'
+      - 'crates/openab-gateway/Cargo.toml'
+      - 'crates/openab-gateway/src/**'
+      - 'crates/openab-mcp/Cargo.toml'
+      - 'crates/openab-mcp/src/**'
+      - 'crates/openab-cp/Cargo.toml'
+      - 'crates/openab-cp/src/**'
+      - 'crates/openab-kubernetes-session/Cargo.toml'
+      - 'crates/openab-kubernetes-session/Cargo.lock'
+      - 'crates/openab-kubernetes-session/src/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kubernetes-session-images-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  smoke-test:
+    # This is the Linux/Docker verification gate for the add-on and therefore
+    # also runs while an architecture PR remains in draft.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          version: v3.18.5
+
+      - uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede # v4.0.1
+        with:
+          version: v1.32.11
+
+      - name: Install pinned Kind
+        env:
+          KIND_SHA256: eb244cbafcc157dff60cf68693c14c9a75c4e6e6fedaf9cd71c58117cb93e3fa
+          KIND_VERSION: v0.31.0
+        run: |
+          curl --fail --location --silent --show-error \
+            --output "$RUNNER_TEMP/kind" \
+            "https://github.com/kubernetes-sigs/kind/releases/download/$KIND_VERSION/kind-linux-amd64"
+          echo "$KIND_SHA256  $RUNNER_TEMP/kind" | sha256sum --check --strict
+          sudo install -m 0755 "$RUNNER_TEMP/kind" /usr/local/bin/kind
+
+      - name: Verify Kind harness contracts
+        run: sh scripts/test-kubernetes-session-kind-contract.sh
+
+      - name: Build and verify isolated-session images
+        run: sh scripts/test-kubernetes-session-images.sh --build
+
+      - name: Verify two isolated sessions in Kind
+        env:
+          OPENAB_KIND_EVIDENCE_FILE: ${{ runner.temp }}/kubernetes-session-isolation-evidence.json
+          OPENAB_KIND_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: sh scripts/test-kubernetes-session-kind.sh --isolation
+
+      - name: Validate isolation evidence
+        run: >-
+          jq -e -f tests/fixtures/kubernetes-session-kind/isolation-evidence.jq
+          "$RUNNER_TEMP/kubernetes-session-isolation-evidence.json" > /dev/null
+
+      - name: Upload isolation evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: kubernetes-session-isolation-evidence
+          path: ${{ runner.temp }}/kubernetes-session-isolation-evidence.json
+          if-no-files-found: error
+          retention-days: 14

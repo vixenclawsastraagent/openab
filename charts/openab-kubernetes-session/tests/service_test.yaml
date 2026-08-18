@@ -1,0 +1,30 @@
+suite: private Kubernetes session controller relay Service
+templates:
+  - templates/service.yaml
+
+tests:
+  - it: exposes only the TLS relay through a ClusterIP Service
+    set:
+      enabled: true
+      image.tag: test
+    asserts:
+      - equal:
+          path: spec.type
+          value: ClusterIP
+      - equal:
+          path: spec.ports
+          value:
+            - name: relay
+              port: 8443
+              protocol: TCP
+              targetPort: relay
+      - notExists:
+          path: spec.externalIPs
+      - notExists:
+          path: spec.externalTrafficPolicy
+      - notExists:
+          path: spec.loadBalancerClass
+      - notExists:
+          path: spec.loadBalancerIP
+      - notExists:
+          path: spec.loadBalancerSourceRanges

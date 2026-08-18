@@ -1,0 +1,147 @@
+suite: narrow namespaced Kubernetes session controller RBAC
+templates:
+  - templates/serviceaccount.yaml
+  - templates/role.yaml
+  - templates/rolebinding.yaml
+
+tests:
+  - it: enables the controller ServiceAccount token explicitly
+    template: templates/serviceaccount.yaml
+    set:
+      enabled: true
+      image.tag: test
+    asserts:
+      - equal:
+          path: metadata.name
+          value: RELEASE-NAME-openab-kubernetes-session
+      - equal:
+          path: metadata.namespace
+          value: NAMESPACE
+      - equal:
+          path: automountServiceAccountToken
+          value: true
+
+  - it: grants only the exact namespaced lifecycle and worker resource verbs
+    template: templates/role.yaml
+    set:
+      enabled: true
+      image.tag: test
+    asserts:
+      - equal:
+          path: metadata.name
+          value: RELEASE-NAME-openab-kubernetes-session
+      - equal:
+          path: metadata.namespace
+          value: openab-sessions
+      - equal:
+          path: rules
+          value:
+            - apiGroups:
+                - ""
+              resources:
+                - configmaps
+              verbs:
+                - get
+                - list
+                - create
+                - update
+                - delete
+            - apiGroups:
+                - ""
+              resources:
+                - configmaps/finalizers
+              verbs:
+                - update
+            - apiGroups:
+                - ""
+              resources:
+                - pods
+                - persistentvolumeclaims
+                - secrets
+                - serviceaccounts
+              verbs:
+                - get
+                - list
+                - create
+                - delete
+            - apiGroups:
+                - networking.k8s.io
+              resources:
+                - networkpolicies
+              verbs:
+                - get
+                - list
+                - create
+                - delete
+
+  - it: binds the worker namespace Role only to the release namespace controller
+    template: templates/rolebinding.yaml
+    set:
+      enabled: true
+      image.tag: test
+    asserts:
+      - equal:
+          path: metadata.name
+          value: RELEASE-NAME-openab-kubernetes-session
+      - equal:
+          path: metadata.namespace
+          value: openab-sessions
+      - equal:
+          path: roleRef
+          value:
+            apiGroup: rbac.authorization.k8s.io
+            kind: Role
+            name: RELEASE-NAME-openab-kubernetes-session
+      - equal:
+          path: subjects
+          value:
+            - kind: ServiceAccount
+              name: RELEASE-NAME-openab-kubernetes-session
+              namespace: NAMESPACE
+
+  - it: has no wildcard exec log port-forward namespace PV Role or RoleBinding permission
+    template: templates/role.yaml
+    set:
+      enabled: true
+      image.tag: test
+    asserts:
+      - equal:
+          path: rules
+          value:
+            - apiGroups:
+                - ""
+              resources:
+                - configmaps
+              verbs:
+                - get
+                - list
+                - create
+                - update
+                - delete
+            - apiGroups:
+                - ""
+              resources:
+                - configmaps/finalizers
+              verbs:
+                - update
+            - apiGroups:
+                - ""
+              resources:
+                - pods
+                - persistentvolumeclaims
+                - secrets
+                - serviceaccounts
+              verbs:
+                - get
+                - list
+                - create
+                - delete
+            - apiGroups:
+                - networking.k8s.io
+              resources:
+                - networkpolicies
+              verbs:
+                - get
+                - list
+                - create
+                - delete

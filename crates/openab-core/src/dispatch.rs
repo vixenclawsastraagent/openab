@@ -130,6 +130,11 @@ pub trait DispatchTarget: Send + Sync + 'static {
     /// Bot home directory (security boundary for workspace resolution).
     fn bot_home(&self) -> std::path::PathBuf;
 
+    /// Whether chat messages may select a path from the broker filesystem.
+    fn allows_workspace_directives(&self) -> bool {
+        true
+    }
+
     /// Ensure the ACP session for `session_key` exists (idempotent).
     /// Returns `true` if a new session was created, `false` if it already existed.
     async fn ensure_session(&self, session_key: &str, working_dir: Option<&str>) -> Result<bool>;
@@ -163,6 +168,10 @@ impl DispatchTarget for AdapterRouter {
 
     fn bot_home(&self) -> std::path::PathBuf {
         self.bot_home_path()
+    }
+
+    fn allows_workspace_directives(&self) -> bool {
+        self.pool().allows_workspace_directives()
     }
 
     async fn ensure_session(&self, session_key: &str, working_dir: Option<&str>) -> Result<bool> {
@@ -677,6 +686,22 @@ async fn dispatch_batch(
         .first()
         .map(|first_msg| crate::directives::parse_directives(&first_msg.prompt));
 
+    if parse_result
+        .as_ref()
+        .is_some_and(|parsed| parsed.metadata.raw.contains_key("ws"))
+        && !target.allows_workspace_directives()
+    {
+        let message = "Kubernetes session mode does not accept [[ws:...]] broker workspace paths";
+        let _ = adapter
+            .send_message(&dispatch_channel, &format!("⚠️ {message}"))
+            .await;
+        error!(
+            session_key = %crate::redact::redact_session_ids(&session_key),
+            "workspace directive rejected before provisioning"
+        );
+        return;
+    }
+
     // Tentatively resolve [[ws:...]] — if resolution fails and the session turns out to
     // be new, we abort. If the session already existed, resolution failure is irrelevant.
     let ws_resolved: Option<Result<String, String>> = parse_result.as_ref().and_then(|pr| {
@@ -729,7 +754,11 @@ async fn dispatch_batch(
                     let _ = adapter
                         .send_message(&dispatch_channel, &format!("⚠️ {e}"))
                         .await;
-                    error!(session_key, error = %e, "workspace directive rejected");
+                    error!(
+                        session_key = %crate::redact::redact_session_ids(&session_key),
+                        error = %e,
+                        "workspace directive rejected"
+                    );
                     return;
                 }
 
@@ -742,7 +771,11 @@ async fn dispatch_batch(
                 if let Some(ref title) = title_to_apply {
                     if !title.is_empty() {
                         if let Err(e) = adapter.rename_thread(&dispatch_channel, title).await {
-                            warn!(session_key, error = %e, "failed to apply title directive");
+                            warn!(
+                                session_key = %crate::redact::redact_session_ids(&session_key),
+                                error = %e,
+                                "failed to apply title directive"
+                            );
                         }
                     }
                 }
@@ -1232,6 +1265,19 @@ mod tests {
         assert_eq!(d.key("slack", "T2", "userA"), "slack:T2:userA");
     }
 
+    #[test]
+    fn session_key_is_platform_and_logical_thread_only() {
+        let channel = ChannelRef {
+            platform: "discord".into(),
+            channel_id: "parent-channel".into(),
+            thread_id: Some("thread-123".into()),
+            parent_id: Some("parent-channel".into()),
+            origin_event_id: None,
+        };
+
+        assert_eq!(Dispatcher::session_key(&channel), "discord:thread-123");
+    }
+
     fn insert_dummy_handle(d: &Dispatcher, key: &str) {
         let (tx, _rx) = tokio::sync::mpsc::channel::<BufferedMessage>(10);
         let consumer = tokio::spawn(async {});
@@ -1369,12 +1415,15 @@ mod tests {
         block_count: usize,
         other_bot_present: bool,
         dispatch_channel: ChannelRef,
+        session_key: String,
     }
 
     /// Mock `DispatchTarget` — records calls; never touches a real session pool.
     struct MockDispatchTarget {
         reactions: ReactionsConfig,
         calls: Mutex<Vec<RecordedDispatch>>,
+        ensure_calls: Mutex<usize>,
+        allows_workspace_directives: bool,
         /// If set, `ensure_session` returns this error once.
         ensure_err: Mutex<Option<String>>,
         /// If set, `stream_prompt_blocks` returns this error once.
@@ -1386,13 +1435,26 @@ mod tests {
             Self {
                 reactions: ReactionsConfig::default(),
                 calls: Mutex::new(Vec::new()),
+                ensure_calls: Mutex::new(0),
+                allows_workspace_directives: true,
                 ensure_err: Mutex::new(None),
                 stream_err: Mutex::new(None),
             }
         }
 
+        fn without_workspace_directives() -> Self {
+            Self {
+                allows_workspace_directives: false,
+                ..Self::new()
+            }
+        }
+
         fn calls(&self) -> Vec<RecordedDispatch> {
             self.calls.lock().unwrap().clone()
+        }
+
+        fn ensure_calls(&self) -> usize {
+            *self.ensure_calls.lock().unwrap()
         }
     }
 
@@ -1410,11 +1472,16 @@ mod tests {
             std::path::PathBuf::from("/tmp")
         }
 
+        fn allows_workspace_directives(&self) -> bool {
+            self.allows_workspace_directives
+        }
+
         async fn ensure_session(
             &self,
             _session_key: &str,
             _working_dir: Option<&str>,
         ) -> Result<bool> {
+            *self.ensure_calls.lock().unwrap() += 1;
             if let Some(msg) = self.ensure_err.lock().unwrap().take() {
                 return Err(anyhow::anyhow!(msg));
             }
@@ -1426,7 +1493,7 @@ mod tests {
         async fn stream_prompt_blocks(
             &self,
             _adapter: &Arc<dyn ChatAdapter>,
-            _session_key: &str,
+            session_key: &str,
             content_blocks: Vec<ContentBlock>,
             thread_channel: &ChannelRef,
             _reactions: Arc<StatusReactionController>,
@@ -1437,6 +1504,7 @@ mod tests {
                 block_count: content_blocks.len(),
                 other_bot_present,
                 dispatch_channel: thread_channel.clone(),
+                session_key: session_key.to_string(),
             });
             if let Some(msg) = self.stream_err.lock().unwrap().take() {
                 return Err(anyhow::anyhow!(msg));
@@ -1546,12 +1614,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn isolated_mode_rejects_workspace_before_ensuring_session() {
+        let mock = Arc::new(MockDispatchTarget::without_workspace_directives());
+        let target: Arc<dyn DispatchTarget> = mock.clone();
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+
+        for workspace in ["@missing", "/definitely/missing"] {
+            dispatch_batch(
+                "mock:T",
+                &make_channel("T"),
+                &target,
+                &adapter,
+                vec![make_msg(&format!("[[ws:{workspace}]]\ninspect this"), 10)],
+                false,
+            )
+            .await;
+        }
+
+        assert_eq!(mock.ensure_calls(), 0);
+        assert!(mock.calls().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn isolated_workspace_rejection_log_redacts_acp_session_key() {
+        use std::io::Write;
+        use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+        #[derive(Clone)]
+        struct Capture(StdArc<StdMutex<Vec<u8>>>);
+
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let uuid = "00000000-0000-0000-0000-000000000000";
+        let acp_id = format!("acp_{uuid}");
+        let session_key = format!("acp:{acp_id}");
+        let channel = ChannelRef {
+            platform: "acp".into(),
+            channel_id: acp_id.clone(),
+            thread_id: Some(acp_id),
+            parent_id: None,
+            origin_event_id: None,
+        };
+        let mock = Arc::new(MockDispatchTarget::without_workspace_directives());
+        let target: Arc<dyn DispatchTarget> = mock;
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+        let buffer = StdArc::new(StdMutex::new(Vec::new()));
+        let capture = Capture(StdArc::clone(&buffer));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || capture.clone())
+            .with_ansi(false)
+            .finish();
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        dispatch_batch(
+            &session_key,
+            &channel,
+            &target,
+            &adapter,
+            vec![make_msg("[[ws:@shared]]\ninspect this", 10)],
+            false,
+        )
+        .await;
+
+        let output = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("workspace directive rejected before provisioning"),
+            "the rejection must be logged: {output}"
+        );
+        assert!(
+            !output.contains(uuid),
+            "no raw UUID may reach the log: {output}"
+        );
+        assert!(
+            !output.contains("acp_"),
+            "no raw ACP id prefix may reach the log: {output}"
+        );
+        assert!(
+            output.contains("acp:#"),
+            "the platform and redaction tag must survive: {output}"
+        );
+    }
+
+    #[tokio::test]
     async fn consumer_dispatches_single_message_as_one_batch() {
         let calls = run_consumer_with_messages(vec![make_msg("hi", 10)], 10, 24_000).await;
         assert_eq!(calls.len(), 1);
         // pack_arrival_event with no extra_blocks → delimiter + prompt = 2 blocks.
         assert_eq!(calls[0].block_count, 2);
         assert!(!calls[0].other_bot_present);
+        assert_eq!(calls[0].session_key, "mock:T");
     }
 
     #[tokio::test]

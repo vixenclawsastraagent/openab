@@ -1,0 +1,314 @@
+suite: default-deny Kubernetes session network boundaries
+templates:
+  - templates/controller-networkpolicy.yaml
+  - templates/worker-default-deny-networkpolicy.yaml
+  - templates/worker-networkpolicy.yaml
+
+tests:
+  - it: renders no controller NetworkPolicy when the add-on is disabled
+    template: templates/controller-networkpolicy.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders no worker NetworkPolicy when the add-on is disabled
+    template: templates/worker-networkpolicy.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders no worker default-deny NetworkPolicy when the add-on is disabled
+    template: templates/worker-default-deny-networkpolicy.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: admits only managed workers to the controller relay by default
+    template: templates/controller-networkpolicy.yaml
+    set:
+      enabled: true
+      networkPolicy.controller.apiServerCIDRs:
+        - 10.96.0.1/32
+    asserts:
+      - isKind:
+          of: NetworkPolicy
+      - equal:
+          path: metadata.namespace
+          value: NAMESPACE
+      - equal:
+          path: spec.podSelector
+          value:
+            matchLabels:
+              app.kubernetes.io/name: openab-kubernetes-session
+              app.kubernetes.io/instance: RELEASE-NAME
+              app.kubernetes.io/component: controller
+      - equal:
+          path: spec.policyTypes
+          value:
+            - Ingress
+            - Egress
+      - equal:
+          path: spec.ingress
+          value:
+            - from:
+                - namespaceSelector:
+                    matchLabels:
+                      kubernetes.io/metadata.name: openab-sessions
+                  podSelector:
+                    matchLabels:
+                      app.kubernetes.io/managed-by: openab-session-controller
+                      openab.dev/resource: worker-pod
+              ports:
+                - port: 8443
+                  protocol: TCP
+      - equal:
+          path: spec.egress
+          value:
+            - to:
+                - ipBlock:
+                    cidr: 10.96.0.1/32
+              ports:
+                - port: 443
+                  protocol: TCP
+
+  - it: fails closed when no Kubernetes API host CIDR is configured
+    template: templates/controller-networkpolicy.yaml
+    set:
+      enabled: true
+      networkPolicy.controller.apiServerCIDRs: []
+    asserts:
+      - failedTemplate:
+          errorMessage: networkPolicy.controller.apiServerCIDRs requires at least one exact /32 or /128 host when enabled
+
+  - it: admits only exact configured broker peers and API server host CIDRs
+    template: templates/controller-networkpolicy.yaml
+    set:
+      enabled: true
+      workerNamespace: team-workers
+      networkPolicy:
+        controller:
+          apiServerPort: 6443
+          apiServerCIDRs:
+            - 10.43.0.1/32
+            - 192.0.2.10/32
+          brokerPeers:
+            - namespaceLabels:
+                kubernetes.io/metadata.name: team-brokers
+              podLabels:
+                app.kubernetes.io/name: openab
+                app.kubernetes.io/instance: team-a
+            - namespaceLabels:
+                kubernetes.io/metadata.name: recovery-brokers
+              podLabels:
+                app.kubernetes.io/name: openab-recovery
+    asserts:
+      - equal:
+          path: spec.ingress
+          value:
+            - from:
+                - namespaceSelector:
+                    matchLabels:
+                      kubernetes.io/metadata.name: team-workers
+                  podSelector:
+                    matchLabels:
+                      app.kubernetes.io/managed-by: openab-session-controller
+                      openab.dev/resource: worker-pod
+                - namespaceSelector:
+                    matchLabels:
+                      kubernetes.io/metadata.name: team-brokers
+                  podSelector:
+                    matchLabels:
+                      app.kubernetes.io/name: openab
+                      app.kubernetes.io/instance: team-a
+                - namespaceSelector:
+                    matchLabels:
+                      kubernetes.io/metadata.name: recovery-brokers
+                  podSelector:
+                    matchLabels:
+                      app.kubernetes.io/name: openab-recovery
+              ports:
+                - port: 8443
+                  protocol: TCP
+      - equal:
+          path: spec.egress
+          value:
+            - to:
+                - ipBlock:
+                    cidr: 10.43.0.1/32
+                - ipBlock:
+                    cidr: 192.0.2.10/32
+              ports:
+                - port: 6443
+                  protocol: TCP
+
+  - it: default-denies ingress and egress for every Pod in the worker namespace
+    template: templates/worker-default-deny-networkpolicy.yaml
+    set:
+      enabled: true
+      networkPolicy.controller.apiServerCIDRs:
+        - 10.96.0.1/32
+    asserts:
+      - isKind:
+          of: NetworkPolicy
+      - equal:
+          path: metadata.namespace
+          value: openab-sessions
+      - equal:
+          path: spec.podSelector
+          value: {}
+      - equal:
+          path: spec.policyTypes
+          value:
+            - Ingress
+            - Egress
+      - notExists:
+          path: spec.ingress
+      - notExists:
+          path: spec.egress
+
+  - it: gives every managed worker only DNS and controller relay baseline egress
+    template: templates/worker-networkpolicy.yaml
+    set:
+      enabled: true
+      networkPolicy.controller.apiServerCIDRs:
+        - 10.96.0.1/32
+    asserts:
+      - isKind:
+          of: NetworkPolicy
+      - equal:
+          path: metadata.namespace
+          value: openab-sessions
+      - equal:
+          path: spec.podSelector
+          value:
+            matchLabels:
+              app.kubernetes.io/managed-by: openab-session-controller
+              openab.dev/resource: worker-pod
+      - equal:
+          path: spec.policyTypes
+          value:
+            - Egress
+      - notExists:
+          path: spec.ingress
+      - equal:
+          path: spec.egress
+          value:
+            - to:
+                - namespaceSelector:
+                    matchLabels:
+                      kubernetes.io/metadata.name: kube-system
+                  podSelector:
+                    matchLabels:
+                      k8s-app: kube-dns
+              ports:
+                - port: 53
+                  protocol: UDP
+                - port: 53
+                  protocol: TCP
+            - to:
+                - namespaceSelector:
+                    matchLabels:
+                      kubernetes.io/metadata.name: NAMESPACE
+                  podSelector:
+                    matchLabels:
+                      app.kubernetes.io/name: openab-kubernetes-session
+                      app.kubernetes.io/instance: RELEASE-NAME
+                      app.kubernetes.io/component: controller
+              ports:
+                - port: 8443
+                  protocol: TCP
+
+  - it: supports exact DNS selectors and host CIDRs without adding profile service egress
+    template: templates/worker-networkpolicy.yaml
+    set:
+      enabled: true
+      workerNamespace: team-workers
+      networkPolicy:
+        controller:
+          apiServerCIDRs:
+            - 10.96.0.1/32
+        worker:
+          dns:
+            selectors:
+              - namespaceLabels:
+                  kubernetes.io/metadata.name: platform-dns
+                  environment: production
+                podLabels:
+                  app.kubernetes.io/name: node-local-dns
+            cidrs:
+              - 169.254.20.10/32
+              - 192.0.2.53/32
+    asserts:
+      - equal:
+          path: metadata.namespace
+          value: team-workers
+      - notExists:
+          path: spec.ingress
+      - equal:
+          path: spec.egress
+          value:
+            - to:
+                - namespaceSelector:
+                    matchLabels:
+                      kubernetes.io/metadata.name: platform-dns
+                      environment: production
+                  podSelector:
+                    matchLabels:
+                      app.kubernetes.io/name: node-local-dns
+                - ipBlock:
+                    cidr: 169.254.20.10/32
+                - ipBlock:
+                    cidr: 192.0.2.53/32
+              ports:
+                - port: 53
+                  protocol: UDP
+                - port: 53
+                  protocol: TCP
+            - to:
+                - namespaceSelector:
+                    matchLabels:
+                      kubernetes.io/metadata.name: NAMESPACE
+                  podSelector:
+                    matchLabels:
+                      app.kubernetes.io/name: openab-kubernetes-session
+                      app.kubernetes.io/instance: RELEASE-NAME
+                      app.kubernetes.io/component: controller
+              ports:
+                - port: 8443
+                  protocol: TCP
+
+  - it: preserves the controller policy suffix for a maximum-length fullname
+    template: templates/controller-networkpolicy.yaml
+    set:
+      enabled: true
+      fullnameOverride: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      networkPolicy.controller.apiServerCIDRs:
+        - 10.96.0.1/32
+    asserts:
+      - equal:
+          path: metadata.name
+          value: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-controller-net
+
+  - it: preserves the worker policy suffix for a maximum-length fullname
+    template: templates/worker-networkpolicy.yaml
+    set:
+      enabled: true
+      fullnameOverride: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      networkPolicy.controller.apiServerCIDRs:
+        - 10.96.0.1/32
+    asserts:
+      - equal:
+          path: metadata.name
+          value: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-worker-net
+
+  - it: preserves the deny policy suffix for a maximum-length fullname
+    template: templates/worker-default-deny-networkpolicy.yaml
+    set:
+      enabled: true
+      fullnameOverride: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      networkPolicy.controller.apiServerCIDRs:
+        - 10.96.0.1/32
+    asserts:
+      - equal:
+          path: metadata.name
+          value: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-worker-deny

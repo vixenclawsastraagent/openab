@@ -1,0 +1,50 @@
+schema_version = 1
+
+[policy]
+compute_idle_seconds = 300
+storage_retention_seconds = 3600
+max_active_workers = 2
+
+[profiles.kind-smoke]
+current_version = "v1"
+
+[profiles.kind-smoke.revisions.v1]
+image = "__WORKER_IMAGE__"
+
+[profiles.kind-smoke.revisions.v1.relay]
+url = "wss://openab-session-controller.openab-system.svc:8443/v1/worker"
+ca_config_map_name = "openab-kind-smoke-relay-ca"
+
+[profiles.kind-smoke.revisions.v1.skills]
+config_map_name = "openab-kind-smoke-skills-v1"
+
+[profiles.kind-smoke.revisions.v1.supervisor]
+executable = "/usr/local/bin/openab-kubernetes-session-worker"
+args = ["serve", "--", "/usr/local/bin/openab-kubernetes-session-fake-acp"]
+
+[profiles.kind-smoke.revisions.v1.workspace]
+size = "64Mi"
+storage_class = "standard"
+access_mode = "read_write_once"
+
+[profiles.kind-smoke.revisions.v1.resources.requests]
+cpu = "10m"
+memory = "64Mi"
+ephemeral_storage = "64Mi"
+
+[profiles.kind-smoke.revisions.v1.resources.limits]
+cpu = "250m"
+memory = "256Mi"
+ephemeral_storage = "256Mi"
+
+[profiles.kind-smoke.revisions.v1.run_as]
+uid = 1000
+gid = 1000
+
+[[profiles.kind-smoke.revisions.v1.egress]]
+target = "cidr"
+cidr = "192.0.2.1/32"
+
+[[profiles.kind-smoke.revisions.v1.egress.ports]]
+protocol = "tcp"
+port = 443

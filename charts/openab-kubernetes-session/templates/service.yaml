@@ -1,0 +1,18 @@
+{{- if .Values.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "openab-kubernetes-session.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openab-kubernetes-session.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "openab-kubernetes-session.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: relay
+      port: 8443
+      protocol: TCP
+      targetPort: relay
+{{- end }}

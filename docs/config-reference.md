@@ -308,6 +308,59 @@ Full first-class Feishu/Lark section (config-first parity, #1377) — credential
 
 ---
 
+## `[kubernetes_session]`
+
+Selects the optional Kubernetes session-isolation add-on for this configured
+agent. The entire section is optional and default-off. When absent, OpenAB uses
+the existing local ACP or AgentCore path and creates no Kubernetes session
+state.
+
+The section requires the add-on-flavoured broker image and a separately
+installed controller for the configured scope. OpenAB fails closed if the
+bridge or controller is unavailable; it never falls back to a shared local
+agent process.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `controller_url` | string | required | Authenticated controller bridge URL. Must use `wss://`, include a host, contain no URL user credentials or query, and use the exact `/v1/bridge` path. |
+| `profile` | string | required | Cluster-owned worker profile name as a lowercase Kubernetes DNS label. |
+| `scope` | string | required | Non-empty stable team/agent state-ownership scope without edge whitespace, up to 253 bytes. It is hashed before use in Kubernetes resource identity. |
+| `credential_file` | string | `/var/run/secrets/openab-session/token` | Absolute path to the projected broker-to-controller credential. The credential value is not stored in TOML. |
+| `controller_ca_file` | string | unset | Optional absolute Linux path to a PEM CA bundle mounted in the trusted broker Pod. Its certificate-only trust anchors are added to the native root store; standard hostname verification remains required. |
+
+```toml
+[kubernetes_session]
+controller_url = "wss://openab-session-controller.openab-system.svc:8443/v1/bridge"
+profile = "codex-strict"
+scope = "team-a-openab-codex"
+# Optional when the controller uses a private CA:
+# controller_ca_file = "/var/run/secrets/openab-session/ca.crt"
+```
+
+When `controller_ca_file` is absent, the bridge uses its existing native-root
+TLS connector unchanged. When present, each new bridge process reads at most
+256 KiB, accepts only valid `CERTIFICATE` PEM blocks, and adds those anchors to
+the native roots. It does not accept inline PEM, private keys, a hostname
+verification bypass, or hot reload. Use a versioned read-only ConfigMap mount
+and restart the broker when rotating the trust bundle.
+
+`[kubernetes_session]` is mutually exclusive with `[agentcore]` and an
+explicit `[agent].command`. The internal `OPENAB_SESSION_KEY` and
+`OPENAB_SESSION_ATTEMPT_ID` environment names are broker-owned in this mode
+and cannot appear in `[agent.env]` or `agent.inherit_env`.
+
+An `[agent]` section without `command` may still set `working_dir`, `env`, or
+`inherit_env`; those values configure only the trusted broker-side bridge and
+are not forwarded to the session worker Pod. Unknown keys inside
+`[kubernetes_session]` are rejected instead of being silently ignored.
+
+Broker filesystem workspace directives such as `[[ws:/path]]` are rejected in
+this mode. Worker checkout selection belongs to the administrator-owned
+Kubernetes profile; a chat message cannot mount or select an arbitrary path
+from the broker Pod.
+
+---
+
 ## `[agent]`
 
 The AI agent subprocess that OpenAB spawns to handle messages via ACP.
@@ -418,7 +471,7 @@ Session pool settings for managing concurrent agent sessions.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `max_sessions` | usize | `10` | Maximum number of concurrent agent sessions. When full, the oldest idle session is suspended (recoverable); if all sessions are busy, new requests are rejected. |
-| `session_ttl_hours` | u64 | `4` | Session time-to-live in hours. Idle sessions are reclaimed after this period. The example config uses `24`. |
+| `session_ttl_hours` | u64 | `4` | Session time-to-live in hours. Kubernetes-isolated sessions request non-destructive compute suspension and retain their mapping, anchor, and PVC; other runtimes keep their existing lifecycle behavior. The example config uses `24`. |
 | `hung_grace_secs` | u64 | `120` | Grace period after `prompt_hard_timeout_secs` before a session stuck with its connection mutex held (in-flight prompt) is force-evicted from the pool. Eviction threshold: `prompt_hard_timeout_secs + hung_grace_secs`. |
 | `default_config_options` | map | `{}` | Config options to set automatically after session creation. Keys are config option IDs (e.g. `mode`, `model`), values are the desired values (e.g. `bypass`, `swe-1-6`). Sent via ACP `session/set_config_option` after each `session/new`. |
 

@@ -1,0 +1,337 @@
+suite: hardened Kubernetes session controller Deployment
+templates:
+  - templates/deployment.yaml
+
+tests:
+  - it: rejects an enabled controller without an immutable image digest by default
+    set:
+      enabled: true
+    asserts:
+      - failedTemplate:
+          errorMessage: image.digest is required when the add-on is enabled; set image.allowMutableTag=true only for development
+
+  - it: rejects a mutable tag without explicit development opt-in
+    set:
+      enabled: true
+      image.tag: test-tag
+    asserts:
+      - failedTemplate:
+          errorMessage: image.digest is required when the add-on is enabled; set image.allowMutableTag=true only for development
+
+  - it: uses appVersion only with explicit mutable-image development opt-in
+    set:
+      enabled: true
+      image.allowMutableTag: true
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/openabdev/openab-kubernetes-session-controller:0.10.0
+
+  - it: uses an explicit tag and controller registry credentials
+    set:
+      enabled: true
+      image.tag: test-tag
+      image.allowMutableTag: true
+      image.pullPolicy: Always
+      imagePullSecrets:
+        - name: controller-pull
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/openabdev/openab-kubernetes-session-controller:test-tag
+      - equal:
+          path: spec.template.spec.containers[0].imagePullPolicy
+          value: Always
+      - equal:
+          path: spec.template.spec.imagePullSecrets
+          value:
+            - name: controller-pull
+
+  - it: runs exactly one controller with Recreate semantics
+    set:
+      enabled: true
+      image.tag: test
+      image.allowMutableTag: true
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 1
+      - equal:
+          path: spec.strategy
+          value:
+            type: Recreate
+      - equal:
+          path: spec.template.spec.enableServiceLinks
+          value: false
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 60
+      - equal:
+          path: spec.template.spec.nodeSelector
+          value:
+            kubernetes.io/os: linux
+
+  - it: invokes the controller through tini with a fixed process config path
+    set:
+      enabled: true
+      image.tag: test
+      image.allowMutableTag: true
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].command
+          value:
+            - /usr/bin/tini
+            - --
+      - equal:
+          path: spec.template.spec.containers[0].args
+          value:
+            - /usr/local/bin/openab-kubernetes-session-controller
+            - --config-file
+            - /etc/openab-kubernetes-session/process/controller.toml
+
+  - it: gives only the trusted controller a Kubernetes ServiceAccount token
+    set:
+      enabled: true
+      image.tag: test
+      image.allowMutableTag: true
+    asserts:
+      - equal:
+          path: spec.template.spec.serviceAccountName
+          value: RELEASE-NAME-openab-kubernetes-session
+      - equal:
+          path: spec.template.spec.automountServiceAccountToken
+          value: true
+
+  - it: runs as uid and gid 1000 with a runtime-default seccomp profile
+    set:
+      enabled: true
+      image.tag: test
+      image.allowMutableTag: true
+    asserts:
+      - equal:
+          path: spec.template.spec.securityContext
+          value:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            fsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+
+  - it: uses a read-only root and drops every Linux capability
+    set:
+      enabled: true
+      image.tag: test
+      image.allowMutableTag: true
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].securityContext
+          value:
+            allowPrivilegeEscalation: false
+            privileged: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+
+  - it: mounts only the four existing resources read-only plus private temporary storage
+    set:
+      enabled: true
+      image.tag: test
+      image.allowMutableTag: true
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].volumeMounts
+          value:
+            - name: controller-config
+              mountPath: /etc/openab-kubernetes-session/process
+              readOnly: true
+            - name: worker-profiles
+              mountPath: /etc/openab-kubernetes-session/profiles
+              readOnly: true
+            - name: controller-tls
+              mountPath: /var/run/openab-kubernetes-session/tls
+              readOnly: true
+            - name: controller-auth
+              mountPath: /var/run/openab-kubernetes-session/auth
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      - equal:
+          path: spec.template.spec.volumes
+          value:
+            - name: controller-config
+              configMap:
+                name: openab-kubernetes-session-controller-config
+                optional: false
+                defaultMode: 288
+                items:
+                  - key: controller.toml
+                    path: controller.toml
+            - name: worker-profiles
+              configMap:
+                name: openab-kubernetes-session-worker-profiles
+                optional: false
+                defaultMode: 288
+                items:
+                  - key: profiles.toml
+                    path: profiles.toml
+            - name: controller-tls
+              secret:
+                secretName: openab-kubernetes-session-controller-tls
+                optional: false
+                defaultMode: 288
+                items:
+                  - key: tls.crt
+                    path: tls.crt
+                  - key: tls.key
+                    path: tls.key
+            - name: controller-auth
+              secret:
+                secretName: openab-kubernetes-session-controller-auth
+                optional: false
+                defaultMode: 288
+                items:
+                  - key: token
+                    path: token
+            - name: tmp
+              emptyDir: {}
+
+  - it: exposes relay and probe ports only inside the controller Pod
+    set:
+      enabled: true
+      image.tag: test
+      image.allowMutableTag: true
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].ports
+          value:
+            - name: relay
+              containerPort: 8443
+              protocol: TCP
+            - name: probes
+              containerPort: 8080
+              protocol: TCP
+
+  - it: waits for startup containment and probes liveness and readiness separately
+    set:
+      enabled: true
+      image.tag: test
+      image.allowMutableTag: true
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].startupProbe
+          value:
+            httpGet:
+              path: /livez
+              port: probes
+              scheme: HTTP
+            failureThreshold: 60
+            periodSeconds: 5
+            timeoutSeconds: 2
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe
+          value:
+            httpGet:
+              path: /livez
+              port: probes
+              scheme: HTTP
+            failureThreshold: 3
+            periodSeconds: 10
+            timeoutSeconds: 2
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe
+          value:
+            httpGet:
+              path: /readyz
+              port: probes
+              scheme: HTTP
+            failureThreshold: 3
+            periodSeconds: 5
+            timeoutSeconds: 2
+
+  - it: passes configured resource requests and limits to the controller
+    set:
+      enabled: true
+      image.tag: test
+      image.allowMutableTag: true
+      resources.requests.cpu: 100m
+      resources.requests.memory: 128Mi
+      resources.limits.cpu: 500m
+      resources.limits.memory: 512Mi
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources
+          value:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+
+  - it: uses an immutable digest without also appending a tag
+    set:
+      enabled: true
+      image.digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/openabdev/openab-kubernetes-session-controller@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+  - it: maps custom existing-object keys onto fixed controller paths
+    set:
+      enabled: true
+      image.tag: test
+      image.allowMutableTag: true
+      controllerConfig.existingConfigMap: custom-process
+      controllerConfig.key: process-v1.toml
+      profiles.existingConfigMap: custom-profiles
+      profiles.key: profiles-v1.toml
+      tls.existingSecret: custom-tls
+      tls.certificateKey: public.pem
+      tls.privateKeyKey: private.pem
+      authentication.existingSecret: custom-auth
+      authentication.credentialKey: bearer
+    asserts:
+      - equal:
+          path: spec.template.spec.volumes[0].configMap
+          value:
+            name: custom-process
+            optional: false
+            defaultMode: 288
+            items:
+              - key: process-v1.toml
+                path: controller.toml
+      - equal:
+          path: spec.template.spec.volumes[1].configMap
+          value:
+            name: custom-profiles
+            optional: false
+            defaultMode: 288
+            items:
+              - key: profiles-v1.toml
+                path: profiles.toml
+      - equal:
+          path: spec.template.spec.volumes[2].secret
+          value:
+            secretName: custom-tls
+            optional: false
+            defaultMode: 288
+            items:
+              - key: public.pem
+                path: tls.crt
+              - key: private.pem
+                path: tls.key
+      - equal:
+          path: spec.template.spec.volumes[3].secret
+          value:
+            secretName: custom-auth
+            optional: false
+            defaultMode: 288
+            items:
+              - key: bearer
+                path: token
