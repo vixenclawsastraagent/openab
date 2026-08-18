@@ -8,6 +8,29 @@ Sources of truth:
 - [approved implementation plan](../plans/kubernetes-session-worker-runtime.md)
 - [Kubernetes session isolation ADR](../adr/kubernetes-session-isolation.md)
 
+Handoff snapshot (2026-08-18 Asia/Taipei):
+
+- Issue [#1461](https://github.com/openabdev/openab/issues/1461) was closed by
+  stale automation as `NOT_PLANNED` on 2026-08-14. Continued official
+  discussion requires a new updated issue that references #1461; reopening the
+  old issue is not permitted. Opening the replacement issue remains an Ask
+  First action.
+- The last fully published fork gate before this sync was contributor head
+  `cd6b03e08961821964a061aac1db7bf9779476d6`. Its evidence predates upstream
+  commits `6f1c530c`, `94354a75`, `2395ea1b`, and `280db4db` and must not be
+  cited as verification of those commits.
+- Upstream `280db4db9452e7e108b52720fddf18dd8c3f5181` was merged without
+  rebasing by `c7b484f012d055c38064ecc47782335f873ae88b`; the feature branch was
+  behind by zero commits immediately after that merge. Task 22 remains active
+  until the post-merge exact-head gates and evidence pass and the draft PR is
+  updated.
+- `openab-cp` does not replace the durable Kubernetes lifecycle controller;
+  its bounded registration, admission, queueing, and write patterns are future
+  reuse candidates. The proposed `openab-pty` ADR's workspace adjacency is an
+  explicitly shared trust zone and must not be adopted for per-thread workers.
+  Its contextual RWOP warning does not change this add-on's preference for one
+  RWOP claim per one-active-worker session.
+
 The tasks are ordered by dependency. Each implementation task starts with the
 listed failing behavior test where practical, makes only the smallest change
 needed to pass, runs the exact focused checks, and creates the listed atomic
@@ -468,6 +491,18 @@ release removed the PVC API object without affecting session B. The observed
 pre-release PV policy was `Delete`, while backing-volume deletion remained
 explicitly `not-asserted`. Fork CI remains the final publication gate.
 
+Latest pre-sync fork evidence (run completed 2026-08-12 UTC and recorded in the
+2026-08-18 handoff): `Kubernetes Session Images`
+[run 31579450311](https://github.com/vixenclawsastraagent/openab/actions/runs/31579450311)
+and
+[job 94058960933](https://github.com/vixenclawsastraagent/openab/actions/runs/31579450311/job/94058960933)
+passed for contributor head `cd6b03e08961821964a061aac1db7bf9779476d6`.
+GitHub tested synthetic merge `aab151e8b13def35e88c3666595ad65f97018460`
+whose parents were base `2ba5721` and contributor head `cd6b03e0`; that tested
+merge SHA is not the PR head SHA. Schema-v2 artifact `9134977349` expires on
+2026-08-26T08:56:07Z and is temporary corroboration, not a permanent source of
+truth. None of this evidence covers the later upstream merge.
+
 ## Stage F: contribution readiness
 
 - [x] **Task 20 — Document the opt-in deployment and deferred production work.**
@@ -488,7 +523,7 @@ explicitly `not-asserted`. Fork CI remains the final publication gate.
     - `helm lint charts/openab-kubernetes-session`
   - Commit: `docs(kubernetes): explain session add-on`.
 
-- [ ] **Task 21 — Run the complete release and compatibility gates.**
+- [x] **Task 21 — Run the complete release and compatibility gates.**
   - Depends on: Task 20.
   - Work: run all root and standalone add-on checks; inspect the complete diff
     for secret leakage, broad RBAC, mutable/shared mounts, default-path edits,
@@ -518,7 +553,8 @@ explicitly `not-asserted`. Fork CI remains the final publication gate.
     - `helm template test charts/openab-kubernetes-session --set enabled=true --set-string 'networkPolicy.controller.apiServerCIDRs[0]=10.96.0.1/32' --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`
     - `helm unittest charts/openab-kubernetes-session`
     - `scripts/test-kubernetes-session-kind.sh --isolation`
-  - Current evidence (updated 2026-08-12 Asia/Taipei):
+  - Historical completion evidence (published at `cd6b03e0`; it does not cover
+    the 2026-08-18 upstream merge):
     - PASS: root workspace check, test, both required clippy modes, gateway ACP
       (402 tests), ACP-MCP (5 tests), ACP pool (92 tests), root ACP (42 tests),
       and unified build.
@@ -538,12 +574,15 @@ explicitly `not-asserted`. Fork CI remains the final publication gate.
       clean exact SHA `5997edc8` with distinct PV identity and
       storage-continuity checks. Its allowlisted JSON evidence correctly limits
       release proof to PVC API-object absence. Fork CI remains the final gate.
-    - AUDIT: no release blocker remains. Production agent-flavour Git worktree
-      E2E is still deferred; the proven filesystem claim is distinct private
-      PVCs plus non-interfering fixed workspace marker state.
+    - AUDIT AT THAT HEAD: no release blocker remained. Production agent-flavour
+      Git worktree E2E was still deferred; the proven filesystem claim was
+      distinct private PVCs plus non-interfering fixed workspace marker state.
+    - The newly active Task 22 owns the complete post-merge rerun and supersedes
+      this historical completion record for handoff readiness.
   - Commit: none when clean; any correction uses its own conventional commit.
 
 - [ ] **Task 22 — Final upstream sync and fork draft handoff.**
+  - Status: active as of 2026-08-18.
   - Depends on: Task 21.
   - Work: fetch `upstream/main`; merge new changes rather than rebasing the
     feature history; rerun affected and final gates; verify Git and active `gh`
@@ -555,11 +594,31 @@ explicitly `not-asserted`. Fork CI remains the final publication gate.
   - Acceptance: the fork branch is reproducible, the upstream diff excludes
     upstream's own history, the fork PR remains draft, no upstream PR is opened,
     and no deployment or default OpenAB behavior is changed outside the opt-in
-    add-on.
+    add-on. The final schema-v2 evidence names the exact contributor head and
+    distinguishes it from any GitHub-tested synthetic merge SHA.
+  - Sync delta:
+    - The four upstream commits through `280db4db` were reviewed and merged by
+      `c7b484f0`; the only textual conflict was the root workspace member list.
+      The resolution includes `crates/openab-cp` while retaining the standalone
+      `crates/openab-kubernetes-session` workspace exclusion.
+    - The add-on image Dockerfile and clean tracked-only image/Kind contexts now
+      include the new `openab-cp` manifest and source so Cargo can parse the
+      root workspace. The workflow path filters also include those files so a
+      relevant CP change triggers add-on CI. The broker image still contains
+      only OpenAB and the Kubernetes bridge; this is build compatibility, not
+      control plane adoption.
+    - No frozen invariant or scope changed. Full post-merge Rust, Helm, shell,
+      image-build, and Kind isolation gates are still required before this task
+      can be checked.
   - Verify:
     - `git log -1 --format='%an <%ae>'`
     - `gh auth status`
     - `git diff --check upstream/main...HEAD`
+    - `scripts/test-kubernetes-session-images.sh --build`
+    - `EVIDENCE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/openab-kind-evidence.XXXXXX")`
+    - `OPENAB_KIND_HEAD_SHA=$(git rev-parse HEAD) OPENAB_KIND_EVIDENCE_FILE="$EVIDENCE_DIR/kubernetes-session-isolation-evidence.json" sh scripts/test-kubernetes-session-kind.sh --isolation`
+    - `jq -e -f tests/fixtures/kubernetes-session-kind/isolation-evidence.jq "$EVIDENCE_DIR/kubernetes-session-isolation-evidence.json"`
+    - `jq -e --arg head "$(git rev-parse HEAD)" '.schemaVersion == 2 and .result == "passed" and .mode == "isolation" and .source.headSha == $head and .source.testedSha == $head and .source.treeState == "clean"' "$EVIDENCE_DIR/kubernetes-session-isolation-evidence.json"`
     - `gh pr view 2 --repo vixenclawsastraagent/openab --json isDraft,headRefName,body,url`
   - Commit: `chore(sync): merge upstream main` only if upstream advanced;
     otherwise no commit.
@@ -568,7 +627,7 @@ explicitly `not-asserted`. Fork CI remains the final publication gate.
 
 Approval of this checklist authorizes Tasks 1–22 in order, including the
 merge-first integration, focused commits, local container/Kind mutations, push
-to the `vixenclawsastraagent` fork, and creation of an upstream **draft** PR.
-It does not authorize a deployment to an existing cluster, mutation of the
-upstream repository outside the draft PR, or any item listed under Ask First
-or Never in the approved specification.
+to the `vixenclawsastraagent` fork, and updates to fork draft PR #2. It does not
+authorize a replacement official issue, any upstream PR, deployment to an
+existing cluster, mutation of the upstream repository, or any item listed
+under Ask First or Never in the approved specification.

@@ -93,6 +93,18 @@ AgentCore runtime. A workspace directive or Git worktree remains useful
 workflow organization in that default runtime, but it is not a security
 boundary.
 
+The proposed
+[openab-pty ADR](../../docs/adr/openab-pty-runtime.md)'s opt-in
+workspace-adjacency mechanisms are not an extension point for this add-on. When
+enabled, they intentionally put an ACP runtime and human PTY in one
+shared-workspace trust zone. Do not mount a session-private worker claim into
+the broker, a PTY Pod, or a peer-session worker; separate worktrees on one
+shared volume do not satisfy this chart's cross-session non-sharing contract.
+
+This chart does not deploy or depend on
+[`openab-cp`](../../docs/control-plane.md); its controller is the Kubernetes
+session lifecycle controller, not the Agent Control Plane.
+
 ## Current MVP target
 
 - One controller replica owns one scope and one dedicated worker namespace.
@@ -378,6 +390,11 @@ recovery, and reclaim behavior before enabling a production profile. The
 current runtime does not support an `existingClaim`, controller-managed PV
 prebinding, selectors, snapshots, or clones. Do not mount one writable PVC into
 multiple session workers or divide it with `subPath`.
+
+The proposed [openab-pty ADR](../../docs/adr/openab-pty-runtime.md)'s guidance
+against RWOP applies when two separate Pods must mount one intentionally shared
+workspace. It does not apply to this chart's one-session, one-private-claim,
+at-most-one-active-worker topology; RWOP remains preferred here.
 
 The controller accepts only its expected PVC binding metadata, Kubernetes PVC
 protection, and a bounded set of standard binding, provisioner, selected-node,

@@ -43,6 +43,25 @@ contracts that are already implemented and tested.
    PostgreSQL, multi-controller coordination, and cross-cluster scheduling are
    enterprise follow-ups, not part of this change.
 
+## Upstream composition boundary
+
+The upstream CP server slice and proposed PTY ADR reviewed at baseline
+`280db4db` do not change the approved assumptions above. The
+[Agent Control Plane](../adr/agent-control-plane.md) currently ships only a
+standalone `openab-cp` agent-delegation communication server with process-local
+routing state; it is not the Kubernetes lifecycle, storage, or session-anchor
+backend, and this add-on does not depend on it. A future shared transport
+primitive or broker-local Agent CP facade integration must preserve the worker
+boundary and receive separate design and threat review.
+
+Likewise, the proposed [openab-pty ADR](../adr/openab-pty-runtime.md)'s opt-in
+adjacency mechanisms place an ACP runtime and human PTY in one shared-workspace
+trust zone. They are not a supported topology for isolated session workers:
+the broker, a PTY Pod, and peer-session workers must not mount a session's
+private claim. The PTY ADR's warning against `ReadWriteOncePod` is specific to
+two simultaneous Pods sharing one workspace and does not alter this spec's
+preference for one private claim mounted by at most one active worker Pod.
+
 ## Objective
 
 Complete the missing worker side of the default-off Kubernetes session add-on

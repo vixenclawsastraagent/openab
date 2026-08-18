@@ -252,6 +252,35 @@ separate controller is required because a short-lived bridge cannot reliably
 reconcile TTL expiry, abandoned resources, or broker restarts. Combining the
 controller and relay avoids an unnecessary extra service.
 
+At upstream baseline `280db4db`, only the standalone `openab-cp` server slice
+described by the [Agent Control Plane ADR](agent-control-plane.md) is shipped;
+its runtime client and configuration, MCP facade and CLI, and streaming support
+are not. Stock OpenAB therefore does not connect to it. `openab-cp` is a
+separate communication control plane for agent-to-agent delegation. Its
+process-local registry and router exchange registration, delegation, result,
+and cancellation messages; they do not provision
+Kubernetes resources, own private storage, or reconcile the durable session
+anchors defined here. CP namespaces, labels, registration, and admission-token
+correlation authorize and route messages, but do not prove filesystem, storage,
+or one-session/one-Pod isolation. The protocol carries no workspace or PVC
+identity, and one CP worker may accept multiple delegated sessions.
+
+The Agent CP therefore does not replace this lifecycle controller.
+Identity-bound registration, admission-token correlation, bounded queues,
+registration deadlines, and bounded writes are useful safety patterns, but the
+add-on crate and runtime artifacts take no direct dependency on the
+delegation-specific crate. Extracting a shared transport or lifecycle primitive
+requires a separately reviewed design. Any future CP client connection must
+also remain orthogonal to the selected Kubernetes path: it must not introduce
+bridge reconnect, ACP replay, or fallback to a shared local process.
+
+The Agent CP ADR's proposed broker-local MCP facade is also outside this
+boundary. A future composition must not expose the facade's Unix socket or the
+runtime-held CP bearer credential to a worker Pod. Mounting broker-local state
+into a worker, forwarding that credential, or relaxing the bridge's rejection
+of broker MCP configuration would cross the current trust boundary and
+requires a separate ADR and threat review.
+
 The controller-side bridge adapter accepts only an already-upgraded socket
 whose transport authentication has selected one scope-specific relay. Its
 first application frame must be `Activation`; the payload can never select a
@@ -889,6 +918,17 @@ MVP does not preflight the selected StorageClass or CSI driver's capabilities.
 Operators must validate provisioning, RWOP support, topology, node-loss
 recovery, and reclamation before enabling a production profile. See Kubernetes
 [PersistentVolume access modes](https://kubernetes.io/docs/concepts/storage/persistent-volumes/#access-modes).
+
+The proposed [openab-pty ADR](openab-pty-runtime.md) warns against
+`ReadWriteOncePod` for opt-in adjacency mechanisms in which two separate Pods
+intentionally mount one shared workspace. When adjacency is enabled, that
+workspace is explicitly one authority and trust zone; it is not this feature's
+isolation model. Here, one private session claim has at most one active worker
+Pod, so `ReadWriteOncePod` remains the preferred single-mounter constraint. A
+broker, PTY Pod, or peer-session worker must not mount that claim; a separate
+worktree within a shared volume would provide concurrency organization, not
+the cross-session security boundary promised here.
+
 The controller also validates observed PVC metadata fail-closed. The MVP
 recognizes its own binding metadata, Kubernetes PVC protection, and a bounded
 set of standard binding, provisioner, selected-node, and resizer annotations.
