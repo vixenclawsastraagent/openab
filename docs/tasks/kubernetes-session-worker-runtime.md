@@ -503,6 +503,18 @@ merge SHA is not the PR head SHA. Schema-v2 artifact `9134977349` expires on
 2026-08-26T08:56:07Z and is temporary corroboration, not a permanent source of
 truth. None of this evidence covers the later upstream merge.
 
+Post-merge local evidence (2026-08-18 Asia/Taipei): the complete two-session
+Kind suite passed on clean exact contributor head
+`1dccc0c643ee79867ea22f21f803f8f33a1864a6`, which contains upstream
+`280db4db` through merge commit `c7b484f0`. The schema-v2 evidence recorded
+identical `source.headSha` and `source.testedSha` values and
+`source.treeState = clean`. It proved distinct Pod, PVC, PV, and ServiceAccount
+UIDs, peer-PVC mount absence, read-only shared skills, enforced network
+boundaries, PVC/PV continuity through replacement and suspend/resume, and
+peer-safe explicit release. Release again proves only PVC API-object absence;
+backing-volume deletion remains `not-asserted`. This local temporary file is
+not a publication artifact, so fork CI must regenerate the evidence.
+
 ## Stage F: contribution readiness
 
 - [x] **Task 20 — Document the opt-in deployment and deferred production work.**
@@ -582,7 +594,8 @@ truth. None of this evidence covers the later upstream merge.
   - Commit: none when clean; any correction uses its own conventional commit.
 
 - [ ] **Task 22 — Final upstream sync and fork draft handoff.**
-  - Status: active as of 2026-08-18.
+  - Status: local post-merge verification complete on 2026-08-18; fork
+    publication, exact PR CI, and PR-body update remain active.
   - Depends on: Task 21.
   - Work: fetch `upstream/main`; merge new changes rather than rebasing the
     feature history; rerun affected and final gates; verify Git and active `gh`
@@ -607,9 +620,14 @@ truth. None of this evidence covers the later upstream merge.
       relevant CP change triggers add-on CI. The broker image still contains
       only OpenAB and the Kubernetes bridge; this is build compatibility, not
       control plane adoption.
-    - No frozen invariant or scope changed. Full post-merge Rust, Helm, shell,
-      image-build, and Kind isolation gates are still required before this task
-      can be checked.
+    - No frozen invariant or scope changed. On clean exact head `1dccc0c6`, all
+      root and standalone Rust gates passed; Helm lint, 40 root-chart tests, 37
+      add-on tests, positive and six negative renders, POSIX syntax, static and
+      offline contracts, four clean-context image builds, and the complete Kind
+      isolation gate passed. Root `cargo fmt --all -- --check` still reports the
+      same repository-wide drift reproduced on clean `upstream/main@280db4db`;
+      the standalone add-on format gate passes. Fork publication and exact PR
+      CI remain required before this task can be checked.
   - Verify:
     - `git log -1 --format='%an <%ae>'`
     - `gh auth status`
