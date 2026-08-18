@@ -1643,6 +1643,8 @@ prepare_build_context() {
         crates/openab-gateway/src \
         crates/openab-mcp/Cargo.toml \
         crates/openab-mcp/src \
+        crates/openab-cp/Cargo.toml \
+        crates/openab-cp/src \
         crates/openab-kubernetes-session/Cargo.toml \
         crates/openab-kubernetes-session/Cargo.lock \
         crates/openab-kubernetes-session/src

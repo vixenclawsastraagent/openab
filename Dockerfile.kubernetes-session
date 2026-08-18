@@ -47,18 +47,21 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/openab-core/Cargo.toml crates/openab-core/Cargo.toml
 COPY crates/openab-gateway/Cargo.toml crates/openab-gateway/Cargo.toml
 COPY crates/openab-mcp/Cargo.toml crates/openab-mcp/Cargo.toml
-RUN mkdir -p src crates/openab-core/src crates/openab-gateway/src crates/openab-mcp/src \
+COPY crates/openab-cp/Cargo.toml crates/openab-cp/Cargo.toml
+RUN mkdir -p src crates/openab-core/src crates/openab-gateway/src crates/openab-mcp/src crates/openab-cp/src \
     && printf 'fn main() {}\n' > src/main.rs \
     && printf '\n' > crates/openab-core/src/lib.rs \
     && printf '\n' > crates/openab-gateway/src/lib.rs \
     && printf '\n' > crates/openab-mcp/src/lib.rs \
+    && printf '\n' > crates/openab-cp/src/lib.rs \
     && cargo build --locked --release --bin openab \
-    && rm -rf src crates/openab-core/src crates/openab-gateway/src crates/openab-mcp/src
+    && rm -rf src crates/openab-core/src crates/openab-gateway/src crates/openab-mcp/src crates/openab-cp/src
 COPY src/ src/
 COPY crates/openab-core/ crates/openab-core/
 COPY crates/openab-gateway/ crates/openab-gateway/
 COPY crates/openab-mcp/ crates/openab-mcp/
-RUN touch src/main.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/lib.rs crates/openab-mcp/src/lib.rs \
+COPY crates/openab-cp/ crates/openab-cp/
+RUN touch src/main.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/lib.rs crates/openab-mcp/src/lib.rs crates/openab-cp/src/lib.rs \
     && cargo build --locked --release --bin openab \
     && install -D -m 0755 target/release/openab /out/openab
 
